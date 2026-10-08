@@ -1162,6 +1162,7 @@ LAB_0004814b:
 		import Main: g_RenderContext, _renderer, EnsureTextureBound;
 		import LTObjects;
 		import ModelDraw: DrawModel;
+		import WorldModelDraw: DrawWorldModel;
 		import Objects.BaseObject: BaseObject, Attachment, ObjectType;
 
 		// the client may render several scenes per frame (e.g. the view weapon through an object list), so the frame's
@@ -1179,9 +1180,9 @@ LAB_0004814b:
 				return variable ? _renderer.GetVarValueFloat(variable) : default_value;
 			}
 
-			// d3d.ren negates the object matrix's third column, but in d_ren that points extended arms backwards
-			// (measured node positions); off until verified against the original renderer
-			g_DisableModelFlip=ConsoleFloat("d_ModelFlip", 0f)==0f;
+			// d3d.ren negates the object matrix's third column; verified against d3d.ren (Caleb faces the camera in the
+			// opening cutscene only with it)
+			g_DisableModelFlip=ConsoleFloat("d_ModelFlip", 1f)==0f;
 			g_DisableVertexAnimation=ConsoleFloat("d_ModelVertexAnim", 1f)==0f;
 		}
 
@@ -1193,10 +1194,9 @@ LAB_0004814b:
 		const float[3] forward=[camera.m[0][2], camera.m[1][2], camera.m[2][2]];
 		const float[3] light_direction=Normalised([2f*up[0]-forward[0], 2f*up[1]-forward[1], 2f*up[2]-forward[2]]);
 
-		VkDescriptorSet ResolveTexture(SharedTexture* texture)
+		RenderTexture ResolveTexture(SharedTexture* texture)
 		{
-			RenderTexture render_texture=EnsureTextureBound(texture);
-			return render_texture ? render_texture.texture_descriptor : VK_NULL_ND_HANDLE;
+			return EnsureTextureBound(texture);
 		}
 
 		void Process(LTObject* object)
@@ -1212,6 +1212,10 @@ LAB_0004814b:
 			{
 				case ObjectType.Model:
 					DrawModel(_objects, object, scene_desc, world, light_direction, &ResolveTexture);
+					break;
+				case ObjectType.WorldModel:
+				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
+					DrawWorldModel(_objects, object, scene_desc, &ResolveTexture);
 					break;
 				default:
 					break; // sprites, particles, world models, ... not ported yet
@@ -2749,9 +2753,10 @@ private:
 				with(new_vert)
 				{
 					pos=(*vertex.vertex_data).xyz;
-					colour.r=vertex.colour[0]/255f;
+					// pre-lit vertex colours are stored b, g, r, a (port ABI 2.6, SPolyVertex +0x14)
+					colour.r=vertex.colour[2]/255f;
 					colour.g=vertex.colour[1]/255f;
-					colour.b=vertex.colour[2]/255f;
+					colour.b=vertex.colour[0]/255f;
 					uv=vertex.uv;
 				}
 

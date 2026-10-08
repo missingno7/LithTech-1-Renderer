@@ -157,6 +157,8 @@ class RenderTexture
 
 	SharedTexture* texture_ref;
 
+	uint width, height; // of the top mip, to normalise texel UVs
+
 	public void DumpAsBMP(TextureData* data, ubyte[] pixels_)
 	{
 		int width, height, channels;
@@ -183,6 +185,8 @@ class RenderTexture
 	{
 		texture_ref=texture;
 		texture.render_data=this;
+		width=data.header.width;
+		height=data.header.height;
 
 		import Main: _renderer_inst;
 		import VulkanRender;

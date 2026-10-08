@@ -13,7 +13,7 @@ module ModelDraw;
 import LTObjects;
 import SceneGeometry;
 import RendererTypes: SceneDesc, ModelHookData;
-import Texture: SharedTexture;
+import Texture: SharedTexture, RenderTexture;
 import WorldBsp: MainWorld;
 import erupted: VkDescriptorSet;
 
@@ -86,7 +86,7 @@ alias ModelHookFn=extern(C) void function(ModelHookData*, void*);
 
 // d3d.ren draws every model through this; geometry goes into `geometry` in world space
 void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, MainWorld* world,
-	const float[3] light_direction, scope VkDescriptorSet delegate(SharedTexture*) resolve_texture)
+	const float[3] light_direction, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	void* model=At!(void*)(object, ModelDataOffset);
 	void* prev_anim=At!(void*)(object, ModelPrevAnimOffset);
@@ -135,7 +135,8 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	// solid iff the object is fully opaque (d3d_ProcessModel)
 	const bool translucent=object.a!=0xFF;
-	geometry.Begin(resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset)), translucent);
+	RenderTexture skin=resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset));
+	geometry.Begin(skin ? skin.texture_descriptor : VkDescriptorSet.init, translucent);
 
 	foreach(face_index; 0..face_count)
 	{
@@ -168,7 +169,7 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	geometry.End();
 }
 
-// diagnostics, set every scene from the console variables d_ModelVertexAnim (default 1) and d_ModelFlip (default 0)
+// diagnostics, set every scene from the console variables d_ModelVertexAnim and d_ModelFlip (both default 1)
 __gshared bool g_DisableVertexAnimation;
 __gshared bool g_DisableModelFlip;
 
@@ -279,7 +280,7 @@ struct PoseContext
 
 		const NodeFrame* a=frames_a+frame_a;
 		const NodeFrame* b=frames_b+frame_b;
-		Mat4 local=QuatToMatrix(Slerp(a.rot, b.rot, blend));
+		Mat4 local=QuatToMatrix(KeyRotation(Slerp(a.rot, b.rot, blend)));
 		foreach(i; 0..3)
 			local.m[i][3]=a.pos[i]+(b.pos[i]-a.pos[i])*blend;
 		output[index]=parent*local;
@@ -309,6 +310,14 @@ struct PoseContext
 
 		return next;
 	}
+}
+
+// Animation keys rotate the opposite way to object rotations: blood2_recon's ours_D3DQuatToMatrix (0x3e1d0) uses
+// them as stored, but compared against d3d.ren in the opening cutscene that splays limbs and loses heads; the
+// conjugate (= transposed rotation matrix) matches. Likely the native pose uses quat_ConvertToMatrixTransposed.
+float[4] KeyRotation(const float[4] q)
+{
+	return [-q[0], -q[1], -q[2], q[3]];
 }
 
 float[4] Slerp(const float[4] a, const float[4] b_in, float t)
