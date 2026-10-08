@@ -14,7 +14,7 @@ if ($ldc) { $env:PATH = "$($ldc.FullName)\bin;$env:PATH" }
 $glslang = Join-Path $Toolchains "glslang\bin\glslang.exe"
 if (-not (Test-Path $glslang)) { $glslang = (Get-Command glslangValidator, glslang -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
 
-$shaders = @{ "shader.vert" = "vert.spv"; "shader.frag" = "frag.spv"; "overlay.vert" = "overlay_vert.spv"; "overlay.frag" = "overlay_frag.spv" }
+$shaders = @{ "shader.vert" = "vert.spv"; "shader.frag" = "frag.spv"; "overlay.vert" = "overlay_vert.spv"; "overlay.frag" = "overlay_frag.spv"; "object.vert" = "object_vert.spv"; "object.frag" = "object_frag.spv" }
 foreach ($src in $shaders.Keys) {
 	& $glslang -V $src -o $shaders[$src]; if ($LASTEXITCODE) { throw "$src failed" }
 }
@@ -36,7 +36,20 @@ if (-not (Test-Path test_texture.png)) {
 }
 
 if ($GameDir) {
-	Copy-Item d_ren.dll (Join-Path $GameDir "d_ren.ren") -Force
+	# a renderer still loaded by a running (or hung) game can't be overwritten, but it can be renamed out of the way
+	$target = Join-Path $GameDir "d_ren.ren"
+	if (Test-Path $target) {
+		try { [IO.File]::Copy((Join-Path $PSScriptRoot "d_ren.dll"), $target, $true) }
+		catch {
+			$stale = "$target.old-$(Get-Date -Format yyyyMMddHHmmss)"
+			Rename-Item $target $stale -ErrorAction Stop
+			Write-Host "d_ren.ren was in use, moved it to $stale"
+			[IO.File]::Copy((Join-Path $PSScriptRoot "d_ren.dll"), $target, $true)
+		}
+	} else {
+		[IO.File]::Copy((Join-Path $PSScriptRoot "d_ren.dll"), $target, $true)
+	}
+	if ((Get-Item $target).Length -ne (Get-Item d_ren.dll).Length) { throw "d_ren.ren was not updated" }
 	Copy-Item @($shaders.Values) $GameDir -Force -ErrorAction Stop
 	Copy-Item test_texture.png $GameDir -Force
 	# symbols for debugging the game with the renderer loaded

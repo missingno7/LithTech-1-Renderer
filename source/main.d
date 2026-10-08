@@ -266,12 +266,24 @@ void BindTexture(SharedTexture* texture, int unknown)
 	{
 		// create a new RenderTexture
 		TextureData* texture_data=_renderer.GetTexture(texture, null);
+		if (texture_data is null)
+			return;
 
 		RenderTexture r_texture=g_TextureManager.CreateTexture(texture, texture_data);
 		texture.render_data=r_texture;
 
 		_renderer.FreeTexture(texture);
 	}
+}
+
+// textures of objects are loaded on first use, like d3d_LoadTexture does from the draw code
+extern(D) RenderTexture EnsureTextureBound(SharedTexture* texture)
+{
+	if (texture is null)
+		return null;
+	if (texture.render_data is null)
+		BindTexture(texture, 0);
+	return texture.render_data;
 }
 
 void UnbindTexture(SharedTexture* texture)

@@ -19,6 +19,8 @@ import RendererTypes;
 import Texture;
 import vk.Surface: ImageSurface;
 import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
+import SceneGeometry: ObjectGeometry;
+import LTObjects: LTObject;
 
 File test_out; //import Main: test_out;
 
@@ -257,6 +259,7 @@ public:
 	{
 		vkDeviceWaitIdle(g_Device);
 		DestroyOverlay();
+		DestroyObjectRendering();
 
 		vkDestroyBuffer(g_Device, _vertex_buffer, null);
 		vkFreeMemory(g_Device, _vertex_buffer_memory.memory, null);
@@ -347,6 +350,7 @@ public:
 		CreateCommandBuffers();
 
 		CreateOverlay();
+		CreateObjectPipelines();
 
 		///
 		VkSemaphoreCreateInfo semaphore_info;
@@ -367,6 +371,8 @@ public:
 		camera_view=quat(scene_desc.camera_rotation[3], vec3(scene_desc.camera_rotation[0..3]));
 
 		fov_global=degrees(scene_desc.fov_y);
+
+		CollectObjects(scene_desc);
 
 		/+
 		uVar9 = 0;
@@ -608,6 +614,7 @@ LAB_0004814b:
 
 				//vkCmdDrawIndexed(buffer, index_count, 1, 0, 0, 0);
 
+				RecordObjectDraws(buffer, image_index);
 				RecordOverlayDraw(buffer);
 
 				vkCmdEndRenderPass(buffer);
@@ -615,6 +622,7 @@ LAB_0004814b:
 			}
 
 			UploadOverlay();
+			UploadObjects();
 			SetCommandBuffer(image_index);
 
 			VkPipelineStageFlags[] wait_stages = [ VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT ];
@@ -658,6 +666,8 @@ LAB_0004814b:
 
 		vkQueueWaitIdle(_graphics_queue);
 		_scene_rendered=false;
+		_object_vertex_count+=_objects.vertices.length;
+		_objects.Clear(); // built again by the next RenderScene
 
 		LogFrameRate();
 	}
@@ -676,8 +686,16 @@ LAB_0004814b:
 		const elapsed=now-_fps_start;
 		if (elapsed>=1.seconds)
 		{
-			test_out.writefln("fps: %.1f", _fps_frames/(elapsed.total!"usecs"/1_000_000.0));
+			// per-frame averages: scenes rendered, objects by type (model, world model, sprite, light, camera, particles,
+			// polygrid, line system, container), object vertices
+			uint[9] objects_per_frame=_object_type_counts[1..$];
+			objects_per_frame[]/=_fps_frames;
+			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
+				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames);
 			test_out.flush();
+			_object_type_counts[]=0;
+			_scene_count=0;
+			_object_vertex_count=0;
 			_fps_frames=0;
 			_fps_start=now;
 		}
@@ -1114,6 +1132,307 @@ LAB_0004814b:
 
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline_layout, 0, 1, &_overlay_descriptor, 0, null);
 		vkCmdDraw(buffer, 3, 1, 0, 0);
+	}
+
+	//// Objects (models now): world-space triangles built in RenderScene, drawn after the world
+
+	ObjectGeometry _objects;
+	bool[LTObject*] _objects_seen;
+
+	// per-second statistics for the fps log line
+	uint[10] _object_type_counts;
+	uint _scene_count;
+	size_t _object_vertex_count;
+
+	VkPipeline _object_pipeline_solid;
+	VkPipeline _object_pipeline_translucent;
+	VkShaderModule _object_vert_shader;
+	VkShaderModule _object_frag_shader;
+
+	VkBuffer _object_vertex_buffer;
+	VkMappedMemoryRange _object_vertex_memory;
+	size_t _object_vertex_capacity; // bytes
+
+	// the allocator's blocks are 64 MiB and it can't allocate past one
+	enum size_t MaxObjectVertexBytes=32*1024*1024;
+
+	// d3d.ren RenderScene: DRAWMODE_OBJECTLIST draws only the given objects, DRAWMODE_NORMAL everything visible in the world
+	void CollectObjects(SceneDesc* scene_desc)
+	{
+		import Main: g_RenderContext, _renderer, EnsureTextureBound;
+		import LTObjects;
+		import ModelDraw: DrawModel;
+		import Objects.BaseObject: BaseObject, Attachment, ObjectType;
+
+		// the client may render several scenes per frame (e.g. the view weapon through an object list), so the frame's
+		// geometry accumulates until SwapBuffers
+		_objects_seen.clear();
+		_scene_count++;
+
+		// diagnostic switches; typing e.g. "d_ModelFlip 0" in the game console creates/sets them
+		{
+			import ModelDraw: g_DisableModelFlip, g_DisableVertexAnimation;
+
+			float ConsoleFloat(const(char)* name, float default_value)
+			{
+				void* variable=_renderer.GetConsoleVar(name);
+				return variable ? _renderer.GetVarValueFloat(variable) : default_value;
+			}
+
+			// d3d.ren negates the object matrix's third column, but in d_ren that points extended arms backwards
+			// (measured node positions); off until verified against the original renderer
+			g_DisableModelFlip=ConsoleFloat("d_ModelFlip", 0f)==0f;
+			g_DisableVertexAnimation=ConsoleFloat("d_ModelVertexAnim", 1f)==0f;
+		}
+
+		MainWorld* world=g_RenderContext ? g_RenderContext.main_world : null;
+
+		// the fixed model light comes from above and behind the camera (port_notes/model.md, Lighting)
+		const Mat4 camera=QuatToMatrix(scene_desc.camera_rotation);
+		const float[3] up=[camera.m[0][1], camera.m[1][1], camera.m[2][1]];
+		const float[3] forward=[camera.m[0][2], camera.m[1][2], camera.m[2][2]];
+		const float[3] light_direction=Normalised([2f*up[0]-forward[0], 2f*up[1]-forward[1], 2f*up[2]-forward[2]]);
+
+		VkDescriptorSet ResolveTexture(SharedTexture* texture)
+		{
+			RenderTexture render_texture=EnsureTextureBound(texture);
+			return render_texture ? render_texture.texture_descriptor : VK_NULL_ND_HANDLE;
+		}
+
+		void Process(LTObject* object)
+		{
+			if (object is null || !(object.flags & ObjectFlag.Visible) || (object in _objects_seen))
+				return;
+			_objects_seen[object]=true;
+
+			if (cast(uint)object.type<_object_type_counts.length)
+				_object_type_counts[object.type]++;
+
+			switch(object.type)
+			{
+				case ObjectType.Model:
+					DrawModel(_objects, object, scene_desc, world, light_direction, &ResolveTexture);
+					break;
+				default:
+					break; // sprites, particles, world models, ... not ported yet
+			}
+		}
+
+		void ProcessWithAttachments(LTObject* object)
+		{
+			if (object is null || !(object.flags & ObjectFlag.Visible))
+				return;
+
+			Process(object);
+
+			// attached objects (weapons in hands etc.) are processed with their parent, one level deep like d3d.ren
+			for (void* attachment=object.attachments; attachment !is null; attachment=At!(void*)(attachment, AttachmentNextOffset))
+				Process(cast(LTObject*)_renderer.GetAttachmentObject(cast(BaseObject*)object, cast(Attachment*)attachment));
+		}
+
+		if (scene_desc.draw_mode==DrawMode.ObjectList)
+		{
+			if (scene_desc.obj_list_head)
+				foreach(object; (cast(LTObject**)scene_desc.obj_list_head)[0..scene_desc.obj_count])
+					Process(object);
+		}
+		else if (world && world.world_bsp)
+		{
+			ForEachWorldObject(world.world_bsp, &ProcessWithAttachments);
+		}
+	}
+
+	void CreateObjectPipelines()
+	{
+		_object_vert_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("object_vert.spv"));
+		_object_frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("object_frag.spv"));
+
+		_object_pipeline_solid=CreateObjectPipeline(false);
+		_object_pipeline_translucent=CreateObjectPipeline(true);
+	}
+
+	VkPipeline CreateObjectPipeline(bool translucent)
+	{
+		import SceneGeometry: ObjectVertex;
+
+		VkPipelineShaderStageCreateInfo[] shader_stages=[
+			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _object_vert_shader, pName: "main" },
+			{ stage: VK_SHADER_STAGE_FRAGMENT_BIT, module_: _object_frag_shader, pName: "main" }
+		];
+
+		auto binding_description=ObjectVertex.GetBindingDescription();
+		auto attribute_descriptions=ObjectVertex.GetAttributeDescriptions();
+		VkPipelineVertexInputStateCreateInfo vertex_input_info={
+			vertexBindingDescriptionCount: 1,
+			pVertexBindingDescriptions: &binding_description,
+			vertexAttributeDescriptionCount: attribute_descriptions.length,
+			pVertexAttributeDescriptions: attribute_descriptions.ptr
+		};
+
+		VkPipelineInputAssemblyStateCreateInfo input_assembly_info={
+			topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+		};
+
+		VkPipelineViewportStateCreateInfo viewport_state_info={
+			viewportCount: 1,
+			scissorCount: 1
+		};
+
+		// d3d.ren culls model faces in software by screen winding; the handedness flip makes that easy to get backwards,
+		// so leave culling off until it's verified
+		VkPipelineRasterizationStateCreateInfo rasterizer_info={
+			polygonMode: VK_POLYGON_MODE_FILL,
+			cullMode: VK_CULL_MODE_NONE,
+			frontFace: VK_FRONT_FACE_CLOCKWISE,
+			lineWidth: 1f
+		};
+
+		VkPipelineMultisampleStateCreateInfo multisampling_info={
+			rasterizationSamples: VK_SAMPLE_COUNT_1_BIT
+		};
+
+		VkPipelineDepthStencilStateCreateInfo depth_stencil_info={
+			depthTestEnable: VK_TRUE,
+			depthWriteEnable: translucent ? VK_FALSE : VK_TRUE,
+			depthCompareOp: VK_COMPARE_OP_LESS
+		};
+
+		VkPipelineColorBlendAttachmentState colour_blend_attachment={
+			blendEnable: translucent ? VK_TRUE : VK_FALSE,
+			srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
+			dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			colorBlendOp: VK_BLEND_OP_ADD,
+			srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
+			dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+			alphaBlendOp: VK_BLEND_OP_ADD,
+			colorWriteMask: VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
+		};
+
+		VkPipelineColorBlendStateCreateInfo colour_blend_info={
+			attachmentCount: 1,
+			pAttachments: &colour_blend_attachment
+		};
+
+		VkDynamicState[] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR ];
+		VkPipelineDynamicStateCreateInfo dynamic_state_info={
+			dynamicStateCount: dynamic_states.length,
+			pDynamicStates: dynamic_states.ptr
+		};
+
+		// same descriptor layout as the world: set 0 = UBO + sampler, set 1 = texture
+		VkGraphicsPipelineCreateInfo pipeline_info={
+			stageCount: shader_stages.length,
+			pStages: shader_stages.ptr,
+			pVertexInputState: &vertex_input_info,
+			pInputAssemblyState: &input_assembly_info,
+			pViewportState: &viewport_state_info,
+			pRasterizationState: &rasterizer_info,
+			pMultisampleState: &multisampling_info,
+			pDepthStencilState: &depth_stencil_info,
+			pColorBlendState: &colour_blend_info,
+			pDynamicState: &dynamic_state_info,
+			layout: _pipeline_layout,
+			renderPass: _render_pass,
+			basePipelineIndex: -1
+		};
+
+		VkPipeline pipeline;
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &pipeline),
+			translucent ? "vkCreateGraphicsPipelines (objects, translucent)" : "vkCreateGraphicsPipelines (objects, solid)");
+		return pipeline;
+	}
+
+	void DestroyObjectRendering()
+	{
+		vkDestroyPipeline(g_Device, _object_pipeline_solid, null);
+		vkDestroyPipeline(g_Device, _object_pipeline_translucent, null);
+		vkDestroyShaderModule(g_Device, _object_vert_shader, null);
+		vkDestroyShaderModule(g_Device, _object_frag_shader, null);
+		vkDestroyBuffer(g_Device, _object_vertex_buffer, null);
+	}
+
+	// called between frames (the GPU is idle), so the buffer can be replaced and rewritten
+	void UploadObjects()
+	{
+		import SceneGeometry: ObjectVertex;
+		import core.stdc.string: memcpy;
+
+		size_t bytes=_objects.vertices.length*ObjectVertex.sizeof;
+		if (bytes==0)
+			return;
+
+		if (bytes>MaxObjectVertexBytes)
+		{
+			debug test_out.writeln("Object geometry too large: ", bytes, " bytes, dropping this frame's objects");
+			_objects.Clear();
+			return;
+		}
+
+		if (bytes>_object_vertex_capacity)
+		{
+			vkDestroyBuffer(g_Device, _object_vertex_buffer, null);
+
+			size_t capacity=1024*1024;
+			while (capacity<bytes)
+				capacity*=2;
+			if (capacity>MaxObjectVertexBytes)
+				capacity=MaxObjectVertexBytes;
+
+			CreateVkBuffer(capacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, _object_vertex_buffer, _object_vertex_memory);
+			_object_vertex_capacity=capacity;
+		}
+
+		void* data;
+		if (vmaMapMemory(_object_vertex_memory, &data)!=VK_SUCCESS)
+		{
+			_objects.Clear();
+			return;
+		}
+		memcpy(data, _objects.vertices.ptr, bytes);
+		vmaUnmapMemory(_object_vertex_memory);
+	}
+
+	// recorded inside the render pass, after the world
+	void RecordObjectDraws(VkCommandBuffer buffer, uint image_index)
+	{
+		import SceneGeometry: ObjectBatch;
+
+		if (_objects.vertices.length==0 || _object_vertex_buffer==VK_NULL_ND_HANDLE)
+			return;
+
+		VkDeviceSize offset=0;
+		vkCmdBindVertexBuffers(buffer, 0, 1, &_object_vertex_buffer, &offset);
+
+		void DrawBatches(VkPipeline pipeline, ObjectBatch[] batches)
+		{
+			if (batches.length==0)
+				return;
+
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+			VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
+			vkCmdSetViewport(buffer, 0, 1, &viewport);
+			VkRect2D scissor={ { 0, 0 }, _extents };
+			vkCmdSetScissor(buffer, 0, 1, &scissor);
+
+			vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
+
+			VkDescriptorSet bound=VK_NULL_ND_HANDLE;
+			foreach(ref batch; batches)
+			{
+				VkDescriptorSet texture=batch.texture!=VK_NULL_ND_HANDLE ? batch.texture : _texture_descriptor;
+				if (texture!=bound)
+				{
+					vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture, 0, null);
+					bound=texture;
+				}
+				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
+			}
+		}
+
+		// d3d_FlushObjectQueues: solid before translucent
+		DrawBatches(_object_pipeline_solid, _objects.solid);
+		DrawBatches(_object_pipeline_translucent, _objects.translucent);
 	}
 
 private:

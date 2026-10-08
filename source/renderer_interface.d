@@ -94,24 +94,21 @@ struct SceneDesc
 	uint* ticks_render_particles;
 	uint* ticks_render_unknown;
 
-	float[3] unknown_1;
-	float[3] unknown_2;
+	float[3] model_light_add; // console "ModelAdd", added to every model's ambient light
+	float[3] model_dir_add; // console "ModelDirAdd", added to every model's directional light
 	RenderContext* render_context;
-	vec3 global_light_colour;
-	vec3 global_light_direction;
-	vec3 global_light_scale;
-	float[3] camera_unknown;
+	vec3 global_light_colour; // always zero in Blood 2, d3d.ren never reads it
+	vec3 global_light_direction; // likewise
+	vec3 global_light_scale; // 0..1 per channel
+	float[3] global_light_add; // the camera's light add (screen flashes)
 
 	// frame timing
 	float frame_delta;
-	uint frame_ticks;
+	uint frame_ticks; // only the low word (frame code) is set by the engine
 
-	// unknown, definitely 12 * 4 bytes
-	float[9] unknown_matrix;
-	float[3] unknown_vector;
-	//
-	BaseObject** unknown_array_2; // world model array? limited to max 30?
-	int unknown_count;
+	float[3][4] sky_def; // SkyDef: min, max, view min, view max
+	BaseObject** sky_objects;
+	int sky_object_count;
 
 	// camera stuff
 	Rect view_rect;
@@ -125,7 +122,7 @@ struct SceneDesc
 	int obj_count;
 
 	// model hook
-	void function(ModelHookData* pData, void* pUser) model_hook_fnc_ptr;
+	extern(C) void function(ModelHookData* pData, void* pUser) model_hook_fnc_ptr;
 	void* model_hook_user;
 
 	static assert(this.sizeof==240);
