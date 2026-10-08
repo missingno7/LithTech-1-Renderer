@@ -62,6 +62,7 @@ enum ObjectPipe
 	OpaqueNoZ, // no blend, no depth (solid sky objects)
 	Lines, // line list, blended, depth test, no depth write
 	Additive, // ONE / ONE, no depth (the light-add poly)
+	BlendDepthWrite, // blended with depth test and write (model shadows: overlapping faces darken once)
 }
 
 enum TextureMode : ubyte
@@ -79,6 +80,7 @@ struct ObjectBatch
 	uint vertex_count;
 	TextureMode mode;
 	ObjectPipe pipe;
+	bool no_fog; // drawn with fog off whatever the group (model shadows)
 }
 
 struct ObjectGeometry
@@ -117,9 +119,9 @@ struct ObjectGeometry
 			fullbright ? TextureMode.Fullbright : TextureMode.Normal);
 	}
 
-	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode)
+	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode, bool no_fog=false)
 	{
-		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe };
+		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe, no_fog: no_fog };
 		groups[group]~=batch;
 		_current=group;
 	}

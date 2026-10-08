@@ -906,6 +906,12 @@ LAB_0004814b:
 				_fog_enable, _fog_range, _fog_colour);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
+			{
+				import ModelDraw: g_ShadowStats;
+				test_out.writefln("  model shadows per frame: flagged %d, floor found %d, floor-like %d",
+					g_ShadowStats[0]/_fps_frames, g_ShadowStats[1]/_fps_frames, g_ShadowStats[2]/_fps_frames);
+				g_ShadowStats[]=0;
+			}
 			test_out.flush();
 			_object_type_counts[]=0;
 			_scene_count=0;
@@ -1452,6 +1458,17 @@ LAB_0004814b:
 		const bool draw_polygrids=ConsoleFloat("DrawPolyGrids", 1f)!=0f;
 		const bool draw_line_systems=ConsoleFloat("DrawLineSystems", 1f)!=0f;
 
+		// model shadows: d3d.ren's MaxModelShadows (Blood II's autoexec sets 1) and ShadowZRange (17)
+		import ModelDraw: ModelShadowSettings;
+		ModelShadowSettings model_shadows={
+			camera: scene_desc.camera_position.vector,
+			forward: forward,
+			bsp: world ? world.world_bsp : null,
+			max_shadows: cast(int)ConsoleFloat("MaxModelShadows", 1f),
+			z_range: ConsoleFloat("ShadowZRange", 17f),
+			near_z: 0.1f
+		};
+
 		void Process(LTObject* object)
 		{
 			if (object is null || !(object.flags & ObjectFlag.Visible) || (object in _objects_seen))
@@ -1465,7 +1482,7 @@ LAB_0004814b:
 			{
 				case ObjectType.Model:
 					_objects.Route(DrawGroup.SolidModels, ObjectPipe.Opaque, DrawGroup.TranslucentModels, ObjectPipe.Blend);
-					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &ResolveTexture);
+					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &model_shadows, &ResolveTexture);
 					break;
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
@@ -1654,9 +1671,11 @@ LAB_0004814b:
 		import SceneGeometry: ObjectVertex;
 
 		const bool additive=pipe==ObjectPipe.Additive;
-		const bool blend=pipe==ObjectPipe.Blend || pipe==ObjectPipe.BlendNoZ || pipe==ObjectPipe.Lines || additive;
-		const bool depth_test=pipe==ObjectPipe.Opaque || pipe==ObjectPipe.Blend || pipe==ObjectPipe.Lines;
-		const bool depth_write=pipe==ObjectPipe.Opaque;
+		const bool blend=pipe==ObjectPipe.Blend || pipe==ObjectPipe.BlendNoZ || pipe==ObjectPipe.Lines || additive ||
+			pipe==ObjectPipe.BlendDepthWrite;
+		const bool depth_test=pipe==ObjectPipe.Opaque || pipe==ObjectPipe.Blend || pipe==ObjectPipe.Lines ||
+			pipe==ObjectPipe.BlendDepthWrite;
+		const bool depth_write=pipe==ObjectPipe.Opaque || pipe==ObjectPipe.BlendDepthWrite;
 
 		VkPipelineShaderStageCreateInfo[] shader_stages=[
 			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _object_vert_shader, pName: "main" },
@@ -1833,7 +1852,7 @@ LAB_0004814b:
 					bound_texture=texture;
 				}
 				// lines and the light-add poly are never fogged; the sky uses the sky fog range
-				const FogKind fog=group==DrawGroup.Sky ? FogKind.Sky :
+				const FogKind fog=batch.no_fog ? FogKind.None : group==DrawGroup.Sky ? FogKind.Sky :
 					(group==DrawGroup.LineSystems || group==DrawGroup.LightAdd) ? FogKind.None : FogKind.World;
 				PushBatchConstants(buffer, cast(float)batch.mode, fog);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);

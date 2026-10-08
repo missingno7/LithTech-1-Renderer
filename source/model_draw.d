@@ -14,7 +14,7 @@ import LTObjects;
 import SceneGeometry;
 import RendererTypes: SceneDesc, ModelHookData;
 import Texture: SharedTexture, RenderTexture;
-import WorldBsp: MainWorld;
+import WorldBsp: MainWorld, WorldBsp, Node;
 import erupted: VkDescriptorSet;
 
 // ModelInstance, port ABI 4.2 (offsets from the object)
@@ -86,7 +86,8 @@ alias ModelHookFn=extern(C) void function(ModelHookData*, void*);
 
 // d3d.ren draws every model through this; geometry goes into `geometry` in world space
 void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, MainWorld* world,
-	const float[3] light_direction, const DynamicLight[] lights, scope RenderTexture delegate(SharedTexture*) resolve_texture)
+	const float[3] light_direction, const DynamicLight[] lights, const ModelShadowSettings* shadows,
+	scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	void* model=At!(void*)(object, ModelDataOffset);
 	void* prev_anim=At!(void*)(object, ModelPrevAnimOffset);
@@ -116,7 +117,8 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	debug DumpModelOnce(object, model, matrix_count);
 
 	//// light ramp
-	float[4][16] ramp=LightRamp(object, scene, world, lights);
+	uint draw_flags;
+	float[4][16] ramp=LightRamp(object, scene, world, lights, draw_flags);
 
 	//// hidden nodes (d3d_model_core.cpp ApplyHiddenNodeList)
 	_node_visible[]=true;
@@ -167,7 +169,136 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	}
 
 	geometry.End();
+
+	// FLAG_SHADOW, after the model hook (d3d.ren calls the shadow pass from the model backend when that bit is set)
+	if (draw_flags & ObjectFlag.Shadow)
+		g_ShadowStats[0]++;
+	if (shadows && (draw_flags & ObjectFlag.Shadow))
+		DrawModelShadows(geometry, object, vertices, vertex_count, faces, face_count, _pose[0..matrix_count], *shadows,
+			translucent);
 }
+
+// what the shadow pass needs from the scene
+struct ModelShadowSettings
+{
+	float[3] camera;
+	float[3] forward; // camera axis, for the depth bias
+	WorldBsp* bsp; // traced for the floor
+	int max_shadows; // console MaxModelShadows (Blood II: 1), at most 3
+	float z_range; // console ShadowZRange (17)
+	float near_z;
+}
+
+// d3d.ren model shadows (blood2_recon d3d_model_shadow_*.cpp, written-unproven; 0x28444 caller, 0x126d0 probe, 0x12740
+// plane, 0x8990 / 0x6d10 geometry): the posed mesh flattened along a fixed direction onto the floor under the model,
+// drawn black with an alpha fading out by 1000 units. Each face gets its own depth bias towards the camera (stepping
+// from -ShadowZRange to 0) and depth is written, so overlapping faces darken once and the shadow doesn't z-fight the
+// floor. No texture, no fog.
+void DrawModelShadows(ref ObjectGeometry geometry, LTObject* object, ModelVertex* vertices, uint vertex_count,
+	ModelFace* faces, uint face_count, const Mat4[] pose, const ref ModelShadowSettings settings, bool translucent)
+{
+	import std.math: sqrt;
+
+	if (settings.bsp is null || settings.bsp.root_node is null || settings.max_shadows<=0)
+		return;
+
+	// fade with the camera distance; the floor probe gives up beyond 1500 units
+	const float[3] to_model=[object.pos[0]-settings.camera[0], object.pos[1]-settings.camera[1], object.pos[2]-settings.camera[2]];
+	const float distance=sqrt(Dot(to_model, to_model));
+	if (distance>1500f)
+		return;
+	float fade=(1000f-(distance<1000f ? distance : 1000f))*0.001f*255f;
+	if (fade>110f)
+		fade=110f;
+	const float alpha=cast(int)fade/255f;
+	if (alpha<=0f)
+		return;
+
+	// the floor: a vertical 3000-unit probe down through the world; only floor-like planes take a shadow
+	float[4] plane;
+	const float[3] probe_end=[object.pos[0], object.pos[1]-3000f, object.pos[2]];
+	if (!TraceSegment(cast(Node*)settings.bsp.root_node, object.pos, probe_end, plane))
+		return;
+	g_ShadowStats[1]++;
+	if (plane[1]<=0.7f)
+		return;
+	g_ShadowStats[2]++;
+	const float[3] normal=plane[0..3];
+
+	// the fixed shadow directions (d3d.ren model PreFrame 0x12840), one per shadow
+	static immutable float[3][3] raw_directions=[[0f, -1f, -1f], [-2f, -2f, -2f], [2f, -2f, -1f]];
+	const int shadow_count=settings.max_shadows>3 ? 3 : settings.max_shadows;
+
+	uint visible_faces=0;
+	foreach(face_index; 0..face_count)
+		if (_node_visible[faces[face_index].node_visibility])
+			visible_faces++;
+	if (visible_faces==0)
+		return;
+	const float bias_step=settings.z_range/visible_faces;
+
+	foreach(shadow; 0..shadow_count)
+	{
+		const float[3] direction=Normalised(raw_directions[shadow]);
+		const float along=Dot(normal, direction);
+		if (along> -0.0001f && along<0.0001f)
+			continue;
+
+		geometry.Begin(VkDescriptorSet.init, translucent ? geometry.translucent_group : geometry.solid_group,
+			ObjectPipe.BlendDepthWrite, TextureMode.Untextured, true);
+
+		float bias=-settings.z_range;
+		foreach(face_index; 0..face_count)
+		{
+			const ModelFace* face=faces+face_index;
+			if (!_node_visible[face.node_visibility])
+				continue;
+			if (face.vertex[0]>=vertex_count || face.vertex[1]>=vertex_count || face.vertex[2]>=vertex_count)
+				continue;
+
+			ObjectVertex[3] corners;
+			bool usable=true;
+			foreach(corner; 0..3)
+			{
+				const ModelVertex* source=vertices+face.vertex[corner];
+				const float[3] posed=pose[source.node<pose.length ? source.node : 0].TransformPoint(source.pos);
+
+				// slide along the shadow direction onto the floor plane
+				const float t=(Dot(normal, posed)-plane[3])/along;
+				float[3] p=[posed[0]-direction[0]*t, posed[1]-direction[1]*t, posed[2]-direction[2]*t];
+
+				// the depth bias, as a slide along the view ray (same screen position, nearer depth)
+				const float[3] relative=[p[0]-settings.camera[0], p[1]-settings.camera[1], p[2]-settings.camera[2]];
+				const float z=Dot(relative, settings.forward);
+				if (z<=settings.near_z)
+				{
+					usable=false;
+					break;
+				}
+				float biased=z+bias;
+				if (biased<settings.near_z)
+					biased=settings.near_z;
+				foreach(axis; 0..3)
+					p[axis]=settings.camera[axis]+relative[axis]*(biased/z);
+
+				corners[corner].pos=p;
+				corners[corner].colour=[0f, 0f, 0f, alpha];
+				corners[corner].uv=[0f, 0f];
+			}
+			bias+=bias_step;
+			if (!usable)
+				continue;
+
+			foreach(ref corner; corners)
+				geometry.Add(corner);
+		}
+
+		geometry.End();
+	}
+}
+
+// model shadows for the log: models with FLAG_SHADOW, floor traces that hit, hits on a floor-like plane
+__gshared uint[3] g_ShadowStats;
 
 // diagnostics, set every scene from the console variables d_ModelVertexAnim and d_ModelFlip (both default 1)
 __gshared bool g_DisableVertexAnimation;
@@ -400,9 +531,13 @@ void BlendVertexAnimation(void* model, void* anim_a, void* anim_b, uint frame_a,
 }
 
 // d3d_model_frame_lighting.cpp ours_SetupModelFrameState + the 16-entry ramp of the vertex dispatch (0x10e7c)
-float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights)
+float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights,
+	out uint draw_flags)
 {
 	import gl3n.linalg: vec3;
+
+	// the object flags this draw uses: the model hook may change them for this frame only (FLAG_SHADOW etc.)
+	draw_flags=object.flags;
 
 	const float[3] scale=scene.global_light_scale.vector;
 	float[3] ambient=[object.r, object.g, object.b];
@@ -425,6 +560,7 @@ float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, con
 		data.light_add=&light_add;
 		hook(&data, scene.model_hook_user);
 		ambient=light_add.vector;
+		draw_flags=cast(uint)data.object_flags;
 	}
 
 	float[3] directional;

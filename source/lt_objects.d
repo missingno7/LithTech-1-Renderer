@@ -20,6 +20,7 @@ enum ObjectFlag : uint
 {
 	Visible=0x1,
 	PolyGridUnsigned=0x2, // polygrids: samples are uint8 (else int8)
+	Shadow=0x2, // models: FLAG_SHADOW, drawn with a shadow on the floor
 	ModelTint=0x4,
 	RotateableSprite=0x8,
 	GlowSprite=0x20, // sprites; on polygrids 0x20 means "environment map only"
@@ -119,6 +120,91 @@ void ForEachLeafObject(WorldBsp* bsp, scope void delegate(LTObject*) fn)
 				fn(object);
 		}
 	}
+}
+
+//// Segment query through the world BSP, ported from d3d.ren 0xC390 (blood2_recon d3d_bsp_segment_query.cpp), the
+//// probe behind model shadows. LithTech's world BSP is a solid-leaf BSP: NODE_OUT (flags & 1) is empty space and
+//// NODE_IN (flags & 2) is solid. The segment hits where it first enters solid; the hit plane is the last splitter it
+//// crossed, turned to face the start. Sides are classified with a +/-0.1 band, a segment inside the band going to
+//// side 1 first.
+
+import WorldBsp: Node;
+
+// plane of the hit: normal x, y, z and distance (n . p = distance), facing a
+bool TraceSegment(Node* root, const float[3] a, const float[3] b, out float[4] hit_plane)
+{
+	struct Deferred
+	{
+		Node* far_side;
+		Node* split_node;
+		float[3] split_point;
+		float[3] old_end;
+	}
+	Deferred[400] deferred; // the native fixed stack
+	uint deferred_count=0;
+
+	Node* node=root;
+	Node* last_crossing=null;
+	float[3] start=a, end=b;
+
+	for (uint guard=0; node !is null && guard<100_000; ++guard)
+	{
+		if (node.flags & 1) // NODE_OUT: resume the saved far-side interval
+		{
+			if (deferred_count==0)
+				return false;
+			Deferred* frame=&deferred[--deferred_count];
+			last_crossing=frame.split_node;
+			node=frame.far_side;
+			start=frame.split_point;
+			end=frame.old_end;
+			continue;
+		}
+
+		if (node.flags & 2) // NODE_IN: a hit, if a splitter was crossed on the way in
+		{
+			if (last_crossing is null || last_crossing.planes is null)
+				return false;
+			const float[3] normal=last_crossing.planes.vector.vector;
+			const float distance=last_crossing.planes.distance;
+			if (Dot(normal, a)-distance>0f)
+				hit_plane=[normal[0], normal[1], normal[2], distance];
+			else
+				hit_plane=[-normal[0], -normal[1], -normal[2], -distance];
+			return true;
+		}
+
+		if (node.planes is null)
+			return false;
+		const float[3] normal=node.planes.vector.vector;
+		const float distance=node.planes.distance;
+		const float start_distance=Dot(normal, start)-distance;
+		const float end_distance=Dot(normal, end)-distance;
+
+		if (start_distance> -0.1f && end_distance> -0.1f)
+		{
+			node=node.next[1];
+			continue;
+		}
+		if (!(start_distance>=0.1f) && !(end_distance>=0.1f))
+		{
+			node=node.next[0];
+			continue;
+		}
+
+		const float fraction=start_distance/(start_distance-end_distance);
+		const float[3] crossing=[start[0]+fraction*(end[0]-start[0]), start[1]+fraction*(end[1]-start[1]),
+			start[2]+fraction*(end[2]-start[2])];
+		const uint near_side=start_distance>0f ? 1 : 0;
+
+		if (deferred_count>=deferred.length)
+			return false;
+		deferred[deferred_count++]=Deferred(node.next[near_side^1], node, crossing, end);
+
+		node=node.next[near_side];
+		end=crossing;
+	}
+	return false;
 }
 
 //// Matrices: row-major, column vectors (translation in m[i][3]), like the LT1 DMatrix
