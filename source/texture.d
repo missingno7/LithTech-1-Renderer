@@ -247,6 +247,14 @@ class TextureManager
 
 		r_texture.Destroy();
 	}
+
+	// Term: the images belong to the device being destroyed; the engine rebinds what it still uses after Init
+	void DestroyAll()
+	{
+		foreach(r_texture; textures)
+			r_texture.Destroy();
+		textures=null;
+	}
 }
 
 __gshared TextureManager g_TextureManager=new TextureManager();

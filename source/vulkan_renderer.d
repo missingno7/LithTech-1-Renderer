@@ -263,8 +263,7 @@ public:
 		DestroyOverlay();
 		DestroyObjectRendering();
 
-		vkDestroyBuffer(g_Device, _vertex_buffer, null);
-		vkFreeMemory(g_Device, _vertex_buffer_memory.memory, null);
+		DestroyAllocBuffer(g_Allocator, _vertex_buffer);
 
 		foreach(ref buffer; _buffers)
 			vkDestroyFramebuffer(g_Device, buffer.framebuffer, null);
@@ -281,6 +280,13 @@ public:
 			vkDestroyImageView(g_Device, buffer.view, null);
 
 		vkDestroySwapchainKHR(g_Device, _swapchain, null);
+
+		// the blocks belong to this device; a later InitFrom gets a fresh allocator
+		if (g_Allocator !is null)
+		{
+			g_Allocator.ReleaseAll();
+			g_Allocator=null;
+		}
 		vkDestroyDevice(g_Device, null);
 		vkDestroySurfaceKHR(g_VkInstance, _surface, null);
 		vkDestroyInstance(g_VkInstance, null);
@@ -423,7 +429,7 @@ public:
 			vkDestroyImageView(g_Device, buffer.view, null);
 		}
 		vkDestroyImageView(g_Device, _depth_image_view, null);
-		vkDestroyImage(g_Device, _depth_image, null);
+		DestroyAllocImage(g_Allocator, _depth_image);
 		vkDestroySwapchainKHR(g_Device, _swapchain, null);
 
 		// render pass and pipelines don't depend on the size (dynamic viewport/scissor), only these do
@@ -1166,8 +1172,8 @@ LAB_0004814b:
 		vkDestroyDescriptorSetLayout(g_Device, _overlay_descriptor_layout, null);
 		vkDestroySampler(g_Device, _overlay_sampler, null);
 		vkDestroyImageView(g_Device, _overlay_image_view, null);
-		vkDestroyImage(g_Device, _overlay_image, null);
-		vkDestroyBuffer(g_Device, _overlay_staging, null);
+		DestroyAllocImage(g_Allocator, _overlay_image);
+		DestroyAllocBuffer(g_Allocator, _overlay_staging);
 	}
 
 	// 565 screen -> RGBA8 staging buffer
@@ -1463,7 +1469,7 @@ LAB_0004814b:
 		vkDestroyPipeline(g_Device, _object_pipeline_translucent, null);
 		vkDestroyShaderModule(g_Device, _object_vert_shader, null);
 		vkDestroyShaderModule(g_Device, _object_frag_shader, null);
-		vkDestroyBuffer(g_Device, _object_vertex_buffer, null);
+		DestroyAllocBuffer(g_Allocator, _object_vertex_buffer);
 	}
 
 	// called between frames (the GPU is idle), so the buffer can be replaced and rewritten
@@ -1485,7 +1491,7 @@ LAB_0004814b:
 
 		if (bytes>_object_vertex_capacity)
 		{
-			vkDestroyBuffer(g_Device, _object_vertex_buffer, null);
+			DestroyAllocBuffer(g_Allocator, _object_vertex_buffer);
 
 			size_t capacity=1024*1024;
 			while (capacity<bytes)
@@ -2167,8 +2173,7 @@ private:
 		CreateAllocBuffer(g_Allocator, buffer_info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer_out, &memory_out, null);
 		CopyVkBuffer(staging_buffer, buffer_out, size);
 
-		vkDestroyBuffer(g_Device, staging_buffer, null);
-		vkFreeMemory(g_Device, staging_memory, null);
+		DestroyAllocBuffer(g_Allocator, staging_buffer);
 	}
 
 	VkBuffer[] _uniform_buffers;
@@ -2496,7 +2501,7 @@ private:
 		TransitionImageLayout(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 		CopyBufferToImage(staging, image, width, height);
 		TransitionImageLayout(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-		vkDestroyBuffer(g_Device, staging, null);
+		DestroyAllocBuffer(g_Allocator, staging);
 
 		view=CreateImageView(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
 	}
@@ -2537,7 +2542,7 @@ private:
 		_lightmap_image_view=VK_NULL_ND_HANDLE;
 		BindLightmapAtlas();
 		vkDestroyImageView(g_Device, view, null);
-		vkDestroyImage(g_Device, _lightmap_image, null);
+		DestroyAllocImage(g_Allocator, _lightmap_image);
 		_lightmap_image=VK_NULL_ND_HANDLE;
 	}
 
@@ -2728,8 +2733,7 @@ private:
 			CopyBufferToImage(staging_buffer, _texture_image, width, height);
 			TransitionImageLayout(_texture_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-			vkDestroyBuffer(g_Device, staging_buffer, null);
-			//vkFreeMemory(g_Device, staging_memory.memory, null);
+			DestroyAllocBuffer(g_Allocator, staging_buffer);
 		}
 	}
 
@@ -2762,8 +2766,7 @@ private:
 			CopyBufferToImage(staging_buffer, texture_img, width, height);
 			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-			vkDestroyBuffer(g_Device, staging_buffer, null);
-			//vkFreeMemory(g_Device, staging_memory.memory, null);
+			DestroyAllocBuffer(g_Allocator, staging_buffer);
 		}
 	}
 
@@ -2773,7 +2776,7 @@ private:
 		if (descriptor!=VK_NULL_ND_HANDLE)
 			vkFreeDescriptorSets(g_Device, _texture_descriptor_pool, 1, &descriptor);
 		vkDestroyImageView(g_Device, image_view, null);
-		vkDestroyImage(g_Device, image, null);
+		DestroyAllocImage(g_Allocator, image);
 	}
 
 	void CreateVkImage(uint width, uint height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, out VkImage image, out VkMappedMemoryRange memory)
@@ -2988,8 +2991,8 @@ private:
 	{
 		vkDeviceWaitIdle(g_Device);
 
-		vkDestroyBuffer(g_Device, _vertex_buffer, null);
-		vkDestroyBuffer(g_Device, _vertex_index_buffer, null);
+		DestroyAllocBuffer(g_Allocator, _vertex_buffer);
+		DestroyAllocBuffer(g_Allocator, _vertex_index_buffer);
 		_vertex_buffer=VK_NULL_ND_HANDLE;
 		_vertex_index_buffer=VK_NULL_ND_HANDLE;
 		index_count=0;

@@ -80,6 +80,90 @@ __gshared File test_out;
 
 __gshared bool g_IsIn3D=false;
 
+//// Guarded entry points. The engine runs its frames inside a window procedure, and on 32-bit Windows an exception
+//// escaping a window procedure can be swallowed silently: the frame just aborts, the game keeps running and the
+//// picture freezes. These wrappers catch and log instead, and a once-per-second heartbeat in test.txt shows whether
+//// scenes and frames are still arriving.
+
+__gshared uint g_ExceptionCount;
+__gshared uint g_SceneCalls, g_SwapCalls;
+
+extern(D) void ReportThrowable(string where, Throwable t) nothrow
+{
+	try
+	{
+		++g_ExceptionCount;
+		// the first few in full, then a reminder now and then
+		if (g_ExceptionCount<=10 || g_ExceptionCount%500==0)
+		{
+			test_out.writeln("!!! exception #", g_ExceptionCount, " in ", where, ": ", t.toString());
+			test_out.flush();
+		}
+	}
+	catch (Throwable) {}
+}
+
+extern(D) void Heartbeat() nothrow
+{
+	import core.time: MonoTime, seconds;
+
+	__gshared MonoTime start, last;
+	const MonoTime now=MonoTime.currTime;
+	if (start==MonoTime.init)
+		start=last=now;
+	if (now-last<1.seconds)
+		return;
+
+	try
+	{
+		test_out.writefln("[%.1fs] scenes %d, frames %d, exceptions %d", (now-start).total!"msecs"/1000.0, g_SceneCalls, g_SwapCalls, g_ExceptionCount);
+		test_out.flush();
+	}
+	catch (Throwable) {}
+	g_SceneCalls=g_SwapCalls=0;
+	last=now;
+}
+
+int RenderSceneGuarded(SceneDesc* scene_desc)
+{
+	++g_SceneCalls;
+	Heartbeat();
+	try return RenderScene(scene_desc);
+	catch (Throwable t) { ReportThrowable("RenderScene", t); return 0; }
+}
+
+void SwapBuffersGuarded()
+{
+	++g_SwapCalls;
+	Heartbeat();
+	try SwapBuffers();
+	catch (Throwable t) ReportThrowable("SwapBuffers", t);
+}
+
+void BlitToScreenGuarded(BlitRequest* blit_request)
+{
+	try BlitToScreen(blit_request);
+	catch (Throwable t) ReportThrowable("BlitToScreen", t);
+}
+
+void ClearGuarded(Rect* rect, ClearFlags flags)
+{
+	try Clear(rect, flags);
+	catch (Throwable t) ReportThrowable("Clear", t);
+}
+
+void* CreateContextGuarded(RenderContextInit* context_init)
+{
+	try return CreateContext(context_init);
+	catch (Throwable t) { ReportThrowable("CreateContext", t); return null; }
+}
+
+void BindTextureGuarded(SharedTexture* texture, int unknown)
+{
+	try BindTexture(texture, unknown);
+	catch (Throwable t) ReportThrowable("BindTexture", t);
+}
+
 export Mode* GetSupportedModes()
 {
 	test();
@@ -151,23 +235,23 @@ export void RenderDLLSetup(RenderDLL* renderer)
 	renderer.Init=&Init;
 	renderer.Term=&Term;
 	renderer.SetSoftSky=&SetSoftSky;
-	renderer.BindTexture=&BindTexture;
+	renderer.BindTexture=&BindTextureGuarded;
 	renderer.UnbindTexture=&UnbindTexture;
 	renderer.QueryDeletePalette=&QueryDeletePalette;
 	renderer.SetMasterPalette=&SetMasterPalette;
-	renderer.CreateContext=&CreateContext;
+	renderer.CreateContext=&CreateContextGuarded;
 	renderer.DeleteContext=&DeleteContext;
-	renderer.Clear=&Clear;
+	renderer.Clear=&ClearGuarded;
 	renderer.Start3D=&Start3D;
 	renderer.End3D=&End3D;
 	renderer.IsIn3D=&IsIn3D;
 	renderer.StartOptimized2D=&StartOptimized2D;
 	renderer.EndOptimized2D=&EndOptimized2D;
 	renderer.IsInOptimized2D=&IsInOptimized2D;
-	renderer.RenderScene=&RenderScene;
+	renderer.RenderScene=&RenderSceneGuarded;
 	renderer.RenderCommand=&RenderCommand;
 	renderer.GetHook=&GetHook;
-	renderer.SwapBuffers=&SwapBuffers;
+	renderer.SwapBuffers=&SwapBuffersGuarded;
 	renderer.GetInfoFlags=&GetInfoFlags;
 	renderer.GetBufferFormat=&GetBufferFormat;
 	renderer.CreateSurface=&CreateSurface;
@@ -179,7 +263,7 @@ export void RenderDLLSetup(RenderDLL* renderer)
 	renderer.DeoptimizeSurface=&DeoptimizeSurface;
 	renderer.LockScreen=&LockScreen;
 	renderer.UnlockScreen=&UnlockScreen;
-	renderer.BlitToScreen=&BlitToScreen;
+	renderer.BlitToScreen=&BlitToScreenGuarded;
 	renderer.MakeScreenShot=&MakeScreenShot;
 	renderer.ReadConsoleVariables=&ReadConsoleVariables;
 
@@ -242,6 +326,9 @@ void Term()
 {
 	test();
 
+	import erupted: vkDeviceWaitIdle;
+	vkDeviceWaitIdle(g_Device);
+	g_TextureManager.DestroyAll();
 	_renderer_inst.Destroy();
 	_renderer_inst.destroy();
 	_renderer_inst=null;

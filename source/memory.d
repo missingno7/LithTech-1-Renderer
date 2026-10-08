@@ -15,69 +15,115 @@ struct SubAllocation
 {
 	VkDeviceSize offset;
 	VkDeviceSize size;
-
-	bool _is_free=true;
-	@property bool is_free() const { return _is_free; }
 }
 
+// one VkDeviceMemory, handed out in ranges kept sorted by offset; host-visible blocks stay mapped
 class Allocation
 {
 	VkDeviceMemory memory;
 	VkDeviceSize size;
 	uint type_index;
+	bool dedicated; // holds a single resource and is freed with it
+	void* mapped;
 
 	SubAllocation[] suballocs;
 
-	this(uint memory_type_index)
+	static Allocation Create(uint memory_type_index, VkDeviceSize block_size, bool dedicated)
 	{
 		VkMemoryAllocateInfo alloc_info={
-			allocationSize: VMA_DEFAULT_SMALL_HEAP_BLOCK_SIZE,
+			allocationSize: block_size,
 			memoryTypeIndex: memory_type_index
 		};
 
-		vkAllocateMemory(g_Device, &alloc_info, null, &memory);
-		size=alloc_info.allocationSize;
-		type_index=alloc_info.memoryTypeIndex;
+		VkDeviceMemory memory;
+		VkResult res=vkAllocateMemory(g_Device, &alloc_info, null, &memory);
+		if (res!=VK_SUCCESS)
+		{
+			test_out.writeln("vkAllocateMemory failed: ", res, ", ", block_size, " bytes, type ", memory_type_index);
+			test_out.flush();
+			return null;
+		}
 
-		debug { test_out.writeln(this); test_out.flush(); }
+		Allocation block=new Allocation();
+		block.memory=memory;
+		block.size=block_size;
+		block.type_index=memory_type_index;
+		block.dedicated=dedicated;
+
+		if (g_PhysicalMemoryProps.memoryTypes[memory_type_index].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+		{
+			if (vkMapMemory(g_Device, memory, 0, VK_WHOLE_SIZE, 0, &block.mapped)!=VK_SUCCESS)
+				block.mapped=null;
+		}
+
+		debug { test_out.writeln("New memory block: ", block_size, " bytes, type ", memory_type_index, dedicated ? " (dedicated)" : ""); test_out.flush(); }
+		return block;
 	}
 
-	~this()
+	void Release()
 	{
+		if (mapped!=null)
+			vkUnmapMemory(g_Device, memory);
 		vkFreeMemory(g_Device, memory, null);
-		debug { test_out.writeln("Free."); test_out.flush(); }
+		memory=VK_NULL_ND_HANDLE;
+		mapped=null;
+		suballocs=null;
 	}
 
-	@property VkDeviceSize AvailableMemory() const // cacheable?
+	@property bool empty() const { return suballocs.length==0; }
+
+	// first fit: the lowest aligned gap that holds size bytes
+	bool Chunk(VkDeviceSize req_size, VkDeviceSize align_, out VkMappedMemoryRange alloc_out)
 	{
-		VkDeviceSize free_mem=size;
+		if (align_==0)
+			align_=1;
 
-		foreach(alloc; suballocs)
-			free_mem-=alloc.size;
+		VkDeviceSize gap_start=0;
+		foreach(i; 0..suballocs.length+1)
+		{
+			const VkDeviceSize gap_end=(i<suballocs.length) ? suballocs[i].offset : size;
+			const VkDeviceSize offset=VmaAlignUp(gap_start, align_);
 
-		return free_mem;
+			if (offset<=gap_end && gap_end-offset>=req_size)
+			{
+				SubAllocation sub_alloc={ offset: offset, size: req_size };
+
+				import std.array: insertInPlace;
+				suballocs.insertInPlace(i, sub_alloc);
+
+				alloc_out.memory=memory;
+				alloc_out.offset=offset;
+				alloc_out.size=req_size;
+				return true;
+			}
+
+			if (i<suballocs.length)
+				gap_start=suballocs[i].offset+suballocs[i].size;
+		}
+
+		return false;
 	}
 
-	VkResult Chunk(VkDeviceSize size, VkDeviceSize align_, out VkMappedMemoryRange alloc_out)
+	bool Free(VkDeviceSize offset)
 	{
-		if (size>AvailableMemory())
-			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		foreach(i, ref sub_alloc; suballocs)
+		{
+			if (sub_alloc.offset==offset)
+			{
+				import std.algorithm: remove;
+				suballocs=suballocs.remove(i);
+				return true;
+			}
+		}
+		return false;
+	}
 
-		SubAllocation sub_alloc;
-		sub_alloc._is_free=false;
-		sub_alloc.size=size;
-		if (suballocs.length)
-			sub_alloc.offset=VmaAlignUp(suballocs[$-1].offset+suballocs[$-1].size, align_);
-
-		suballocs~=sub_alloc; // std.array: insertInPlace; std.container.array: insertBefore, insertAfter
-
-		alloc_out.memory=memory;
-		alloc_out.offset=sub_alloc.offset;
-		alloc_out.size=sub_alloc.size;
-
-		debug { test_out.writeln(alloc_out); test_out.flush(); }
-
-		return VK_SUCCESS;
+	VkDeviceSize UsedMemory() const
+	{
+		VkDeviceSize used=0;
+		foreach(ref sub_alloc; suballocs)
+			used+=sub_alloc.size;
+		return used;
 	}
 }
 
@@ -92,16 +138,6 @@ class Allocator
 
 	VkMappedMemoryRange[VkBuffer] m_BufferToMemoryMap;
 	VkMappedMemoryRange[VkImage] m_ImageToMemoryMap;
-	//bool[VK_MAX_MEMORY_TYPES] m_HasEmptyAllocation;
-
-	this()
-	{
-		foreach(ref vec; allocs)
-		{
-			vec=new Allocation[0];
-		}
-	}
-	~this() {}
 
 	static Allocator GetAllocator()
 	{
@@ -110,47 +146,114 @@ class Allocator
 		return g_Allocator;
 	}
 
-	VkResult Allocate(const VkMemoryRequirements mem_reqs, const VkMemoryPropertyFlags mem_props, ref VkMappedMemoryRange memory_range)
+	VkResult Allocate(const VkMemoryRequirements mem_reqs, const VkMemoryPropertyFlags mem_props, out VkMappedMemoryRange memory_range)
 	{
-		memory_range.size=mem_reqs.size;
-		uint mem_type_index=FindMemoryType(g_PhysicalMemoryProps, mem_reqs.memoryTypeBits, mem_props);
+		const uint mem_type_index=FindMemoryType(g_PhysicalMemoryProps, mem_reqs.memoryTypeBits, mem_props);
+		if (mem_type_index==uint.max)
+		{
+			test_out.writeln("No memory type for bits ", mem_reqs.memoryTypeBits, ", properties ", mem_props);
+			test_out.flush();
+			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		}
 
-		test_out.writeln("MemType: ", mem_type_index);
+		// linear buffers and optimal images can share a block, so keep them a granularity apart
+		VkDeviceSize alignment=mem_reqs.alignment;
+		const VkDeviceSize granularity=g_PhysicalDeviceProps.limits.bufferImageGranularity;
+		if (granularity>alignment)
+			alignment=granularity;
+
+		const VkDeviceSize block_size=GetPreferredBlockSize(mem_type_index);
+
+		if (mem_reqs.size>block_size/2)
+		{
+			Allocation dedicated=Allocation.Create(mem_type_index, mem_reqs.size, true);
+			if (dedicated is null || !dedicated.Chunk(mem_reqs.size, 1, memory_range))
+				return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+			allocs[mem_type_index]~=dedicated;
+			return VK_SUCCESS;
+		}
+
 		foreach(block; allocs[mem_type_index])
 		{
-			VkResult res=block.Chunk(memory_range.size, mem_reqs.alignment, memory_range);
-
-			debug
-			{
-				test_out.writeln(__FUNCTION__, " - ", res);
-				test_out.flush();
-			}
-
-			if (res==VK_SUCCESS) // check if able to allocate
-			{
-				// allocate
+			if (!block.dedicated && block.Chunk(mem_reqs.size, alignment, memory_range))
 				return VK_SUCCESS;
-			}
 		}
 
-		// else create new block
-		Allocation new_block=new Allocation(mem_type_index);
+		Allocation new_block=Allocation.Create(mem_type_index, block_size, false);
+		if (new_block is null || !new_block.Chunk(mem_reqs.size, alignment, memory_range))
+			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 		allocs[mem_type_index]~=new_block;
 
-		VkResult res=new_block.Chunk(memory_range.size, mem_reqs.alignment, memory_range);
-
-		debug
-		{
-			test_out.writeln(__FUNCTION__, " - ", res);
-			test_out.flush();
-		}
-
-		return res;
+		return VK_SUCCESS;
 	}
 
-	void Free(ref Allocation alloc)
+	void Free(ref const VkMappedMemoryRange memory_range)
 	{
-		vkFreeMemory(g_Device, alloc.memory, null);
+		if (memory_range.memory==VK_NULL_ND_HANDLE)
+			return;
+
+		foreach(type_index, ref blocks; allocs)
+		{
+			foreach(i, block; blocks)
+			{
+				if (block.memory!=memory_range.memory)
+					continue;
+
+				if (!block.Free(memory_range.offset))
+				{
+					test_out.writeln("Freeing an unknown range: ", memory_range);
+					test_out.flush();
+				}
+
+				// release dedicated blocks, and empty blocks beyond the first of their type
+				if (block.empty && (block.dedicated || blocks.length>1))
+				{
+					block.Release();
+					import std.algorithm: remove;
+					blocks=blocks.remove(i);
+				}
+				return;
+			}
+		}
+	}
+
+	void* Mapped(ref const VkMappedMemoryRange memory_range)
+	{
+		foreach(ref blocks; allocs)
+			foreach(block; blocks)
+				if (block.memory==memory_range.memory)
+					return (block.mapped!=null) ? block.mapped+cast(size_t)memory_range.offset : null;
+		return null;
+	}
+
+	void LogUsage()
+	{
+		foreach(type_index, ref blocks; allocs)
+		{
+			if (blocks.length==0)
+				continue;
+
+			VkDeviceSize used=0, total=0;
+			foreach(block; blocks)
+			{
+				used+=block.UsedMemory();
+				total+=block.size;
+			}
+			test_out.writeln("Memory type ", type_index, ": ", blocks.length, " blocks, ", used/1024, " / ", total/1024, " KB used");
+		}
+		test_out.flush();
+	}
+
+	void ReleaseAll()
+	{
+		foreach(ref blocks; allocs)
+		{
+			foreach(block; blocks)
+				block.Release();
+			blocks=null;
+		}
+		m_BufferToMemoryMap=null;
+		m_ImageToMemoryMap=null;
 	}
 
 	VkDeviceSize GetPreferredBlockSize(uint32_t memTypeIndex) const
@@ -187,20 +290,6 @@ uint FindMemoryType(ref const VkPhysicalDeviceMemoryProperties pMemoryProperties
 	return uint.max;
 }
 
-/+
-// Try to find an optimal memory type, or if it does not exist try fallback memory type
-// `device` is the VkDevice
-// `image` is the VkImage that requires memory to be bound
-// `memoryProperties` properties as returned by vkGetPhysicalDeviceMemoryProperties
-// `requiredProperties` are the property flags that must be present
-// `optimalProperties` are the property flags that are preferred by the application
-VkMemoryRequirements memoryRequirements;
-vkGetImageMemoryRequirements(device, image, &memoryRequirements);
-uint memoryType = findProperties(&memoryProperties, memoryRequirements.memoryTypeBits, optimalProperties);
-if (memoryType == -1) // not found; try fallback properties
-	memoryType = findProperties(&memoryProperties, memoryRequirements.memoryTypeBits, requiredProperties);
-+/
-
 // Aligns given value up to nearest multiply of align value. For example: VmaAlignUp(11, 8) = 16.
 // Use types like uint32_t, uint64_t as T.
 pragma(inline) T VmaAlignUp(T)(T val, T align_)
@@ -214,16 +303,19 @@ pragma(inline) T VmaRoundDiv(T)(T x, T y)
 	return (x + (y / cast(T)2)) / y;
 }
 
+// host-visible blocks are mapped once for their lifetime (a VkDeviceMemory can only be mapped once at a time,
+// and blocks are shared), so this hands out a pointer into that mapping and unmapping does nothing
 VkResult vmaMapMemory(ref const VkMappedMemoryRange pMemory, void** ppData)
 {
-  return vkMapMemory(g_Device, pMemory.memory, pMemory.offset, pMemory.size, 0, ppData);
+	*ppData=(g_Allocator !is null) ? g_Allocator.Mapped(pMemory) : null;
+	return (*ppData!=null) ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
 }
 
 void vmaUnmapMemory(ref const VkMappedMemoryRange pMemory)
 {
-	vkUnmapMemory(g_Device, pMemory.memory);
 }
 
+// on failure the buffer is VK_NULL_HANDLE and the failure is logged, instead of binding memory that isn't there
 void CreateAllocBuffer(
 	Allocator alloc,
 	const VkBufferCreateInfo create_info,
@@ -232,15 +324,34 @@ void CreateAllocBuffer(
 	VkMappedMemoryRange* pMemory,
 	uint* memory_type_index)
 {
-	vkCreateBuffer(g_Device, &create_info, null, &buffer);
+	if (pMemory!=null) *pMemory=VkMappedMemoryRange.init;
+
+	VkResult res=vkCreateBuffer(g_Device, &create_info, null, &buffer);
+	if (res!=VK_SUCCESS)
+	{
+		test_out.writeln("vkCreateBuffer failed: ", res, ", ", create_info.size, " bytes");
+		test_out.flush();
+		buffer=VK_NULL_ND_HANDLE;
+		return;
+	}
 
 	VkMemoryRequirements memory_reqs;
 	vkGetBufferMemoryRequirements(g_Device, buffer, &memory_reqs);
 
 	VkMappedMemoryRange buf_alloc;
-	VkResult res=alloc.Allocate(memory_reqs, properties, buf_alloc);
+	res=alloc.Allocate(memory_reqs, properties, buf_alloc);
+	if (res==VK_SUCCESS)
+		res=vkBindBufferMemory(g_Device, buffer, buf_alloc.memory, buf_alloc.offset);
 
-	vkBindBufferMemory(g_Device, buffer, buf_alloc.memory, buf_alloc.offset);
+	if (res!=VK_SUCCESS)
+	{
+		test_out.writeln("Buffer allocation failed: ", res, ", ", memory_reqs.size, " bytes, properties ", properties);
+		alloc.LogUsage();
+		alloc.Free(buf_alloc);
+		vkDestroyBuffer(g_Device, buffer, null);
+		buffer=VK_NULL_ND_HANDLE;
+		return;
+	}
 
 	if (pMemory!=null) *pMemory=buf_alloc;
 
@@ -255,17 +366,71 @@ void CreateAllocImage(
 	VkMappedMemoryRange* pMemory,
 	uint* memory_type_index)
 {
-	vkCreateImage(g_Device, &create_info, null, &image);
+	if (pMemory!=null) *pMemory=VkMappedMemoryRange.init;
+
+	VkResult res=vkCreateImage(g_Device, &create_info, null, &image);
+	if (res!=VK_SUCCESS)
+	{
+		test_out.writeln("vkCreateImage failed: ", res, ", ", create_info.extent.width, "x", create_info.extent.height);
+		test_out.flush();
+		image=VK_NULL_ND_HANDLE;
+		return;
+	}
 
 	VkMemoryRequirements memory_reqs;
 	vkGetImageMemoryRequirements(g_Device, image, &memory_reqs);
 
 	VkMappedMemoryRange buf_alloc;
-	VkResult res=alloc.Allocate(memory_reqs, properties, buf_alloc);
+	res=alloc.Allocate(memory_reqs, properties, buf_alloc);
+	if (res==VK_SUCCESS)
+		res=vkBindImageMemory(g_Device, image, buf_alloc.memory, buf_alloc.offset);
 
-	vkBindImageMemory(g_Device, image, buf_alloc.memory, buf_alloc.offset);
+	if (res!=VK_SUCCESS)
+	{
+		test_out.writeln("Image allocation failed: ", res, ", ", create_info.extent.width, "x", create_info.extent.height, ", ", memory_reqs.size, " bytes");
+		alloc.LogUsage();
+		alloc.Free(buf_alloc);
+		vkDestroyImage(g_Device, image, null);
+		image=VK_NULL_ND_HANDLE;
+		return;
+	}
 
 	if (pMemory!=null) *pMemory=buf_alloc;
 
 	alloc.m_ImageToMemoryMap[image]=buf_alloc;
+}
+
+// destroy a buffer made by CreateAllocBuffer and give its range back
+void DestroyAllocBuffer(Allocator alloc, ref VkBuffer buffer)
+{
+	if (buffer==VK_NULL_ND_HANDLE)
+		return;
+
+	vkDestroyBuffer(g_Device, buffer, null);
+	if (alloc !is null)
+	{
+		if (VkMappedMemoryRange* range=buffer in alloc.m_BufferToMemoryMap)
+		{
+			alloc.Free(*range);
+			alloc.m_BufferToMemoryMap.remove(buffer);
+		}
+	}
+	buffer=VK_NULL_ND_HANDLE;
+}
+
+void DestroyAllocImage(Allocator alloc, ref VkImage image)
+{
+	if (image==VK_NULL_ND_HANDLE)
+		return;
+
+	vkDestroyImage(g_Device, image, null);
+	if (alloc !is null)
+	{
+		if (VkMappedMemoryRange* range=image in alloc.m_ImageToMemoryMap)
+		{
+			alloc.Free(*range);
+			alloc.m_ImageToMemoryMap.remove(image);
+		}
+	}
+	image=VK_NULL_ND_HANDLE;
 }
