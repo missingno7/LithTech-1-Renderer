@@ -6,3 +6,5 @@ dependency "gl3n" version="~>1.4.1"
 dependency "dimage" version="~>0.3.0-beta.1"
 versions "SDL_205" "VK_USE_PLATFORM_WIN32_KHR"
 libs "user32"
+// LDC: make the .ren self-contained (static druntime/phobos + static MSVC CRT)
+dflags "-link-defaultlib-shared=false" "-mscrtlib=libcmt" "-fvisibility=hidden" "-dllimport=none" platform="windows-ldc"

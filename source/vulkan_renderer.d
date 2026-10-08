@@ -1,6 +1,6 @@
 module VulkanRender;
 
-import vk.Device;
+//import vk.Device; // never committed upstream
 import Memory;
 
 //import vk_mem_alloc;
@@ -17,6 +17,7 @@ import gl3n.math;
 import RendererMain;
 import RendererTypes;
 import Texture;
+import vk.Surface: ImageSurface;
 import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
 
 File test_out; //import Main: test_out;
@@ -35,6 +36,25 @@ VkBool32 DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 		test_out.writeln(callback_data.pMessage.fromStringz);
 	}
 	return VK_FALSE;
+}
+
+// Logs a Vulkan result (flushed, so it survives a crash); on failure tells the user why before bailing out
+VkResult VkCheck(VkResult result, string what)
+{
+	import std.conv: to;
+	import std.string: toStringz;
+
+	test_out.writeln(what, ": ", result);
+	test_out.flush();
+
+	if (result<VK_SUCCESS)
+	{
+		string message=what~" failed: "~result.to!string;
+		MessageBoxA(null, message.toStringz, "d_ren", MB_ICONERROR);
+		throw new Error(message);
+	}
+
+	return result;
 }
 
 enum uint MaxLightCount=40;
@@ -235,6 +255,9 @@ private:
 public:
 	override void Destroy()
 	{
+		vkDeviceWaitIdle(g_Device);
+		DestroyOverlay();
+
 		vkDestroyBuffer(g_Device, _vertex_buffer, null);
 		vkFreeMemory(g_Device, _vertex_buffer_memory.memory, null);
 
@@ -281,14 +304,14 @@ public:
 		EnumerateVkExtensions();
 		CreateVkInstance();
 		CreateVkPhysicalDevice();
-		test_out.writeln(CreateVkSurface(g_VkInstance, window, _surface));
+		VkCheck(CreateVkSurface(g_VkInstance, window, _surface), "vkCreateWin32SurfaceKHR");
 		CreateVkLogicalDevice(g_VkInstance, g_Device);
 
 		g_Allocator=Allocator.GetAllocator();
 
 		vkGetDeviceQueue(g_Device, GetQueueFamily().graphics_family, 0, &_graphics_queue);
 
-		CreateVkSwapchain(_format, _colour_space, _swapchain);
+		VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
 		CreateVkImageViews(_swapchain, _images, _buffers);
 
 		//// Render Pass
@@ -323,6 +346,8 @@ public:
 
 		CreateCommandBuffers();
 
+		CreateOverlay();
+
 		///
 		VkSemaphoreCreateInfo semaphore_info;
 		vkCreateSemaphore(g_Device, &semaphore_info, null, &_is_image_available);
@@ -336,6 +361,8 @@ public:
 	float fov_global=45f;
 	override void RenderScene(SceneDesc* scene_desc) // vkCmd*
 	{
+		_scene_rendered=true;
+
 		camera_pos=vec3(scene_desc.camera_position);
 		camera_view=quat(scene_desc.camera_rotation[3], vec3(scene_desc.camera_rotation[0..3]));
 
@@ -487,7 +514,7 @@ LAB_0004814b:
 
 			DestroyVkSwapchain();
 			//
-			CreateVkSwapchain(_format, _colour_space, _swapchain);
+			VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
 			CreateVkImageViews(_swapchain, _images, _buffers);
 			CreateRenderPass();
 			CreateGraphicsPipeline();
@@ -532,8 +559,14 @@ LAB_0004814b:
 				VkCommandBufferBeginInfo command_buffer_begin_info;
 
 				vkBeginCommandBuffer(buffer, &command_buffer_begin_info);
+				RecordOverlayCopy(buffer);
 				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+
+				// both are dynamic state of the world pipeline
+				VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
+				vkCmdSetViewport(buffer, 0, 1, &viewport);
+				vkCmdSetLineWidth(buffer, 1f);
 
 				VkBuffer[] vertex_buffers=[ _vertex_buffer ];
 				VkDeviceSize[] offsets=[ 0 ];
@@ -572,10 +605,13 @@ LAB_0004814b:
 
 				//vkCmdDrawIndexed(buffer, index_count, 1, 0, 0, 0);
 
+				RecordOverlayDraw(buffer);
+
 				vkCmdEndRenderPass(buffer);
 				vkEndCommandBuffer(buffer);
 			}
 
+			UploadOverlay();
 			SetCommandBuffer(image_index);
 
 			VkPipelineStageFlags[] wait_stages = [ VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT ];
@@ -609,7 +645,7 @@ LAB_0004814b:
 			vkDeviceWaitIdle(g_Device);
 			DestroyVkSwapchain();
 			//
-			CreateVkSwapchain(_format, _colour_space, _swapchain);
+			VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
 			CreateVkImageViews(_swapchain, _images, _buffers);
 			CreateRenderPass();
 			CreateGraphicsPipeline();
@@ -618,28 +654,92 @@ LAB_0004814b:
 		}
 
 		vkQueueWaitIdle(_graphics_queue);
+		_scene_rendered=false;
+
+		LogFrameRate();
 	}
 
-	override void Clear()
+	import core.time: MonoTime, seconds;
+	MonoTime _fps_start;
+	uint _fps_frames;
+
+	void LogFrameRate()
 	{
-		// may be incompatible with how Vulkan works
+		const MonoTime now=MonoTime.currTime;
+		if (_fps_frames==0 && _fps_start==MonoTime.init)
+			_fps_start=now;
+
+		++_fps_frames;
+		const elapsed=now-_fps_start;
+		if (elapsed>=1.seconds)
+		{
+			test_out.writefln("fps: %.1f", _fps_frames/(elapsed.total!"usecs"/1_000_000.0));
+			test_out.flush();
+			_fps_frames=0;
+			_fps_start=now;
+		}
+	}
+
+	//// 2D layer
+	/// LT1 draws menus, fonts, the console and the HUD into the same 16-bit back buffer as the 3D scene (d3d.ren: g_pOffscreen).
+	/// Here they go into a CPU-side 565 screen plus a coverage mask; SwapBuffers uploads it and composites it over the 3D scene.
+
+	ushort[] _screen;
+	ubyte[] _screen_mask; // 255 where 2D has been drawn since the last clear
+	ushort[] _screen_lock_copy;
+	uint _screen_width, _screen_height;
+	bool _screen_locked;
+	Rect _screen_lock_rect;
+	bool _scene_rendered; // RenderScene ran since the last SwapBuffers
+
+	// clips a rectangle against the screen, false if nothing is left
+	bool ClipToScreen(ref Rect rect)
+	{
+		import std.algorithm: clamp;
+
+		rect.x1=clamp(rect.x1, 0, cast(int)_screen_width);
+		rect.x2=clamp(rect.x2, 0, cast(int)_screen_width);
+		rect.y1=clamp(rect.y1, 0, cast(int)_screen_height);
+		rect.y2=clamp(rect.y2, 0, cast(int)_screen_height);
+		return rect.x1<rect.x2 && rect.y1<rect.y2;
+	}
+
+	override void Clear(Rect* rect, ClearFlags flags)
+	{
+		if (!(flags & ClearFlags.Colour))
+			return;
+
+		Rect clear_rect=rect ? *rect : Rect(0, 0, _screen_width, _screen_height);
+		if (!ClipToScreen(clear_rect))
+			return;
+
+		foreach(y; clear_rect.y1..clear_rect.y2)
+		{
+			const size_t row=y*_screen_width;
+			_screen[row+clear_rect.x1..row+clear_rect.x2]=0;
+			_screen_mask[row+clear_rect.x1..row+clear_rect.x2]=0;
+		}
 	}
 
 	override void* CreateSurface(const int width, const int height)
 	{
-		import core.stdc.stdlib: malloc;
-		return malloc((width*height) << 1);
+		if (width<=0 || height<=0)
+			return null;
+
+		return ImageSurface.Create(width, height);
 	}
 
 	override void DeleteSurface(void* surface)
 	{
-		import core.stdc.stdlib: free;
-		free(surface);
+		ImageSurface.Free(cast(ImageSurface*)surface);
 	}
 
 	override void* LockSurface(void* surface)
 	{
-		return null;
+		if (surface is null)
+			return null;
+
+		return (cast(ImageSurface*)surface).pixels.ptr;
 	}
 
 	override void UnlockSurface(void* surface)
@@ -649,42 +749,368 @@ LAB_0004814b:
 
 	override void GetSurfaceInfo(void* surface, int* width, int* height, int* pitch)
 	{
-		//
+		if (surface is null)
+			return;
+
+		ImageSurface* image=cast(ImageSurface*)surface;
+		if (width) *width=image.width;
+		if (height) *height=image.height;
+		if (pitch) *pitch=image.stride; // in bytes
 	}
 
 	override int LockScreen(int left, int top, int right, int bottom, void** pixels, int* pitch)
 	{
-		/+if (!screen_surface.is_locked)
-		{
-			void* start_byte=screen_surface.pixels.ptr;
-			start_byte+=(top*screen_surface.stride)+(left << 1);
-			if (pixels!=null)
-				*pixels=start_byte;
-			if (pitch!=null)
-				*pitch=screen_surface.stride;
-			return 1;
-		}+/
+		Rect lock_rect=Rect(left, top, right, bottom);
+		if (_screen_locked || !ClipToScreen(lock_rect))
+			return 0;
 
-		return 0;
+		// remember what was there so UnlockScreen can tell which pixels the engine drew
+		foreach(y; lock_rect.y1..lock_rect.y2)
+		{
+			const size_t row=y*_screen_width;
+			_screen_lock_copy[row+lock_rect.x1..row+lock_rect.x2]=_screen[row+lock_rect.x1..row+lock_rect.x2];
+		}
+
+		// like DirectDraw's Lock with a rect: the pointer is to the rect's first pixel
+		if (pixels) *pixels=&_screen[lock_rect.y1*_screen_width+lock_rect.x1];
+		if (pitch) *pitch=_screen_width*ushort.sizeof;
+
+		_screen_lock_rect=lock_rect;
+		_screen_locked=true;
+		return 1;
 	}
 
 	override void UnlockScreen()
 	{
-		//
+		if (!_screen_locked)
+			return;
+
+		foreach(y; _screen_lock_rect.y1.._screen_lock_rect.y2)
+		{
+			const size_t row=y*_screen_width;
+			foreach(i; row+_screen_lock_rect.x1..row+_screen_lock_rect.x2)
+				if (_screen[i]!=_screen_lock_copy[i])
+					_screen_mask[i]=255;
+		}
+
+		_screen_locked=false;
 	}
 
 	override void BlitToScreen(BlitRequest* blit_request)
 	{
-		/+auto real_surface=blit_request.surface_ptr;
+		if (blit_request is null || blit_request.surface_ptr is null || blit_request.source_rect is null || blit_request.dest_rect is null)
+			return;
 
-		SDL_Surface* conv_surf=SDL_CreateRGBSurfaceFrom(real_surface.pixels.ptr, real_surface.width, real_surface.height, 16, real_surface.stride, 0x1F, 0x7E0, 0xF800, 0x00);
-		//SDL_Surface* conv_surf=SDL_ConvertSurface(surface, screen_surface.format, 0);
-		Rect* source_rect=cast(Rect*)blit_request.source_ptr;
-		Rect* dest_rect=cast(Rect*)blit_request.dest_ptr;
-		SDL_Rect src_rect=SDL_Rect(source_rect.x1, source_rect.y1, source_rect.x2-source_rect.x1, source_rect.y2-source_rect.y1);
-		SDL_Rect dst_rect=SDL_Rect(dest_rect.x1, dest_rect.y1, dest_rect.x2-dest_rect.x1, dest_rect.y2-dest_rect.y1);
-		SDL_BlitScaled(conv_surf, &src_rect, screen_surface, &dst_rect);
-		SDL_FreeSurface(conv_surf);+/
+		ImageSurface* surface=blit_request.surface_ptr;
+		const Rect src=*blit_request.source_rect;
+		const Rect dst=*blit_request.dest_rect;
+
+		const int src_w=src.x2-src.x1, src_h=src.y2-src.y1;
+		const int dst_w=dst.x2-dst.x1, dst_h=dst.y2-dst.y1;
+		if (src_w<=0 || src_h<=0 || dst_w<=0 || dst_h<=0)
+			return;
+
+		Rect clipped=dst;
+		if (!ClipToScreen(clipped))
+			return;
+
+		const bool keyed=(blit_request.flags & BlitRequestFlags.ColourKey)!=0;
+		const ushort key=blit_request.colour_key;
+		ushort[] src_pixels=surface.Pixels16;
+		const int src_pitch=surface.stride/2;
+
+		// DirectDraw Blt semantics: stretch src onto dst, colour key only with BLIT_TRANSPARENT
+		foreach(dy; clipped.y1..clipped.y2)
+		{
+			const int sy=src.y1+(dy-dst.y1)*src_h/dst_h;
+			if (sy<0 || sy>=surface.height)
+				continue;
+
+			const size_t src_row=sy*src_pitch;
+			const size_t dst_row=dy*_screen_width;
+			foreach(dx; clipped.x1..clipped.x2)
+			{
+				const int sx=src.x1+(dx-dst.x1)*src_w/dst_w;
+				if (sx<0 || sx>=surface.width)
+					continue;
+
+				const ushort pixel=src_pixels[src_row+sx];
+				if (keyed && pixel==key)
+					continue;
+
+				_screen[dst_row+dx]=pixel;
+				_screen_mask[dst_row+dx]=255;
+			}
+		}
+	}
+
+	//// 2D layer upload and compositing
+
+	VkBuffer _overlay_staging;
+	VkMappedMemoryRange _overlay_staging_memory;
+	VkImage _overlay_image;
+	VkMappedMemoryRange _overlay_image_memory;
+	VkImageView _overlay_image_view;
+	VkSampler _overlay_sampler;
+	VkDescriptorSetLayout _overlay_descriptor_layout;
+	VkDescriptorPool _overlay_descriptor_pool;
+	VkDescriptorSet _overlay_descriptor;
+	VkPipelineLayout _overlay_pipeline_layout;
+	VkPipeline _overlay_pipeline;
+	VkShaderModule _overlay_vert_shader;
+	VkShaderModule _overlay_frag_shader;
+
+	void CreateOverlay()
+	{
+		import Main: _renderer;
+
+		_screen_width=(_renderer && _renderer.screen_width>0) ? _renderer.screen_width : Width;
+		_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
+
+		const size_t pixel_count=_screen_width*_screen_height;
+		_screen=new ushort[pixel_count];
+		_screen_mask=new ubyte[pixel_count];
+		_screen_lock_copy=new ushort[pixel_count];
+
+		CreateVkBuffer(pixel_count*uint.sizeof, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, _overlay_staging, _overlay_staging_memory);
+
+		CreateVkImage(_screen_width, _screen_height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _overlay_image, _overlay_image_memory);
+		TransitionImageLayout(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		TransitionImageLayout(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		_overlay_image_view=CreateImageView(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+
+		VkSamplerCreateInfo sampler_info={
+			magFilter: VK_FILTER_NEAREST,
+			minFilter: VK_FILTER_NEAREST,
+			mipmapMode: VK_SAMPLER_MIPMAP_MODE_NEAREST,
+			addressModeU: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			addressModeV: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			addressModeW: VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			maxLod: 0f
+		};
+		VkCheck(vkCreateSampler(g_Device, &sampler_info, null, &_overlay_sampler), "vkCreateSampler (overlay)");
+
+		VkDescriptorSetLayoutBinding binding={
+			binding: 0,
+			descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			descriptorCount: 1,
+			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT
+		};
+		VkDescriptorSetLayoutCreateInfo layout_info={
+			bindingCount: 1,
+			pBindings: &binding
+		};
+		VkCheck(vkCreateDescriptorSetLayout(g_Device, &layout_info, null, &_overlay_descriptor_layout), "vkCreateDescriptorSetLayout (overlay)");
+
+		VkDescriptorPoolSize pool_size={
+			type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			descriptorCount: 1
+		};
+		VkDescriptorPoolCreateInfo pool_info={
+			poolSizeCount: 1,
+			pPoolSizes: &pool_size,
+			maxSets: 1
+		};
+		VkCheck(vkCreateDescriptorPool(g_Device, &pool_info, null, &_overlay_descriptor_pool), "vkCreateDescriptorPool (overlay)");
+
+		VkDescriptorSetAllocateInfo alloc_info={
+			descriptorPool: _overlay_descriptor_pool,
+			descriptorSetCount: 1,
+			pSetLayouts: &_overlay_descriptor_layout
+		};
+		VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &_overlay_descriptor), "vkAllocateDescriptorSets (overlay)");
+
+		VkDescriptorImageInfo image_info={
+			sampler: _overlay_sampler,
+			imageView: _overlay_image_view,
+			imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+		};
+		VkWriteDescriptorSet descriptor_write={
+			dstSet: _overlay_descriptor,
+			dstBinding: 0,
+			descriptorCount: 1,
+			descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			pImageInfo: &image_info
+		};
+		vkUpdateDescriptorSets(g_Device, 1, &descriptor_write, 0, null);
+
+		VkPipelineLayoutCreateInfo pipeline_layout_info={
+			setLayoutCount: 1,
+			pSetLayouts: &_overlay_descriptor_layout
+		};
+		VkCheck(vkCreatePipelineLayout(g_Device, &pipeline_layout_info, null, &_overlay_pipeline_layout), "vkCreatePipelineLayout (overlay)");
+
+		CreateOverlayPipeline();
+	}
+
+	void CreateOverlayPipeline()
+	{
+		_overlay_vert_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("overlay_vert.spv"));
+		_overlay_frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("overlay_frag.spv"));
+
+		VkPipelineShaderStageCreateInfo[] shader_stages=[
+			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _overlay_vert_shader, pName: "main" },
+			{ stage: VK_SHADER_STAGE_FRAGMENT_BIT, module_: _overlay_frag_shader, pName: "main" }
+		];
+
+		VkPipelineVertexInputStateCreateInfo vertex_input_info; // fullscreen triangle comes from gl_VertexIndex
+
+		VkPipelineInputAssemblyStateCreateInfo input_assembly_info={
+			topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+		};
+
+		VkPipelineViewportStateCreateInfo viewport_state_info={
+			viewportCount: 1,
+			scissorCount: 1
+		};
+
+		VkPipelineRasterizationStateCreateInfo rasterizer_info={
+			polygonMode: VK_POLYGON_MODE_FILL,
+			cullMode: VK_CULL_MODE_NONE,
+			frontFace: VK_FRONT_FACE_CLOCKWISE,
+			lineWidth: 1f
+		};
+
+		VkPipelineMultisampleStateCreateInfo multisampling_info={
+			rasterizationSamples: VK_SAMPLE_COUNT_1_BIT
+		};
+
+		VkPipelineDepthStencilStateCreateInfo depth_stencil_info={
+			depthTestEnable: VK_FALSE,
+			depthWriteEnable: VK_FALSE
+		};
+
+		VkPipelineColorBlendAttachmentState colour_blend_attachment={
+			blendEnable: VK_TRUE,
+			srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
+			dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			colorBlendOp: VK_BLEND_OP_ADD,
+			srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
+			dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
+			alphaBlendOp: VK_BLEND_OP_ADD,
+			colorWriteMask: VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
+		};
+
+		VkPipelineColorBlendStateCreateInfo colour_blend_info={
+			attachmentCount: 1,
+			pAttachments: &colour_blend_attachment
+		};
+
+		VkDynamicState[] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR ];
+		VkPipelineDynamicStateCreateInfo dynamic_state_info={
+			dynamicStateCount: dynamic_states.length,
+			pDynamicStates: dynamic_states.ptr
+		};
+
+		VkGraphicsPipelineCreateInfo pipeline_info={
+			stageCount: shader_stages.length,
+			pStages: shader_stages.ptr,
+			pVertexInputState: &vertex_input_info,
+			pInputAssemblyState: &input_assembly_info,
+			pViewportState: &viewport_state_info,
+			pRasterizationState: &rasterizer_info,
+			pMultisampleState: &multisampling_info,
+			pDepthStencilState: &depth_stencil_info,
+			pColorBlendState: &colour_blend_info,
+			pDynamicState: &dynamic_state_info,
+			layout: _overlay_pipeline_layout,
+			renderPass: _render_pass,
+			basePipelineIndex: -1
+		};
+
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &_overlay_pipeline), "vkCreateGraphicsPipelines (overlay)");
+	}
+
+	void DestroyOverlay()
+	{
+		vkDestroyPipeline(g_Device, _overlay_pipeline, null);
+		vkDestroyPipelineLayout(g_Device, _overlay_pipeline_layout, null);
+		vkDestroyShaderModule(g_Device, _overlay_vert_shader, null);
+		vkDestroyShaderModule(g_Device, _overlay_frag_shader, null);
+		vkDestroyDescriptorPool(g_Device, _overlay_descriptor_pool, null);
+		vkDestroyDescriptorSetLayout(g_Device, _overlay_descriptor_layout, null);
+		vkDestroySampler(g_Device, _overlay_sampler, null);
+		vkDestroyImageView(g_Device, _overlay_image_view, null);
+		vkDestroyImage(g_Device, _overlay_image, null);
+		vkDestroyBuffer(g_Device, _overlay_staging, null);
+	}
+
+	// 565 screen -> RGBA8 staging buffer
+	void UploadOverlay()
+	{
+		void* data;
+		if (vmaMapMemory(_overlay_staging_memory, &data)!=VK_SUCCESS)
+			return;
+
+		uint[] rgba=(cast(uint*)data)[0.._screen.length];
+
+		// without a 3D scene the 2D layer is the whole frame, cleared areas are black like the original back buffer
+		const bool opaque=!_scene_rendered;
+
+		foreach(i, pixel; _screen)
+		{
+			uint r=(pixel >> 11) & 0x1F, g=(pixel >> 5) & 0x3F, b=pixel & 0x1F;
+			r=(r << 3) | (r >> 2);
+			g=(g << 2) | (g >> 4);
+			b=(b << 3) | (b >> 2);
+			const uint a=(opaque || _screen_mask[i]) ? 0xFF : 0;
+			rgba[i]=r | (g << 8) | (b << 16) | (a << 24);
+		}
+
+		vmaUnmapMemory(_overlay_staging_memory);
+	}
+
+	// recorded outside the render pass
+	void RecordOverlayCopy(VkCommandBuffer buffer)
+	{
+		VkImageMemoryBarrier barrier={
+			srcAccessMask: VK_ACCESS_SHADER_READ_BIT,
+			dstAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
+			oldLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			newLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+			dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+			image: _overlay_image,
+			subresourceRange: {
+				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+				baseMipLevel: 0,
+				levelCount: 1,
+				baseArrayLayer: 0,
+				layerCount: 1
+			}
+		};
+		vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &barrier);
+
+		VkBufferImageCopy image_copy={
+			imageSubresource: {
+				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+				mipLevel: 0,
+				baseArrayLayer: 0,
+				layerCount: 1
+			},
+			imageExtent: { _screen_width, _screen_height, 1 }
+		};
+		vkCmdCopyBufferToImage(buffer, _overlay_staging, _overlay_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
+
+		barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+		barrier.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		barrier.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
+	}
+
+	// recorded inside the render pass, after the 3D scene
+	void RecordOverlayDraw(VkCommandBuffer buffer)
+	{
+		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline);
+
+		VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
+		vkCmdSetViewport(buffer, 0, 1, &viewport);
+		VkRect2D scissor={ { 0, 0 }, _extents };
+		vkCmdSetScissor(buffer, 0, 1, &scissor);
+
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline_layout, 0, 1, &_overlay_descriptor, 0, null);
+		vkCmdDraw(buffer, 3, 1, 0, 0);
 	}
 
 private:
@@ -719,11 +1145,16 @@ private:
 			pUserData: null
 		};
 
-		const char*[] layers=[ "VK_LAYER_KHRONOS_validation" ];
+		// validation layer only ships with the Vulkan SDK, requesting it when missing fails instance creation
+		const(char)*[] layers;
+		debug if (HasInstanceLayer("VK_LAYER_KHRONOS_validation"))
+			layers~="VK_LAYER_KHRONOS_validation";
+		test_out.writeln("Validation layer: ", layers.length ? "enabled" : "not available");
+
 		const char*[] extensions=[ VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_EXT_DEBUG_UTILS_EXTENSION_NAME ];
 
 		VkInstanceCreateInfo create_info={
-			pNext: &debug_create_info,
+			pNext: layers.length ? &debug_create_info : null,
 			flags: 0,
 			pApplicationInfo: &app_info,
 			enabledLayerCount: layers.length,
@@ -732,10 +1163,27 @@ private:
 			ppEnabledExtensionNames: extensions.ptr
 		};
 
-		vkCreateInstance(&create_info, null, &g_VkInstance);
+		VkCheck(vkCreateInstance(&create_info, null, &g_VkInstance), "vkCreateInstance");
 		loadInstanceLevelFunctionsExt(g_VkInstance);
 
-		return vkCreateDebugUtilsMessengerEXT(g_VkInstance, &debug_create_info, null, &debug_messenger);
+		if (layers.length)
+			return vkCreateDebugUtilsMessengerEXT(g_VkInstance, &debug_create_info, null, &debug_messenger);
+		return VK_SUCCESS;
+	}
+
+	bool HasInstanceLayer(string name)
+	{
+		import std.string: fromStringz;
+
+		uint layer_count;
+		vkEnumerateInstanceLayerProperties(&layer_count, null);
+		VkLayerProperties[] layer_props=new VkLayerProperties[layer_count];
+		vkEnumerateInstanceLayerProperties(&layer_count, layer_props.ptr);
+
+		foreach(ref layer; layer_props)
+			if (layer.layerName.ptr.fromStringz==name)
+				return true;
+		return false;
 	}
 
 	auto CreateVkPhysicalDevice()
@@ -743,16 +1191,21 @@ private:
 		uint device_count;
 		vkEnumeratePhysicalDevices(g_VkInstance, &device_count, null);
 
+		if (device_count==0)
+			VkCheck(VK_ERROR_INCOMPATIBLE_DRIVER, "vkEnumeratePhysicalDevices (no 32-bit Vulkan driver found)");
+
 		VkPhysicalDevice[] devices=new VkPhysicalDevice[device_count];
 		vkEnumeratePhysicalDevices(g_VkInstance, &device_count, devices.ptr);
 
 		foreach(device; devices)
 		{
+			import std.string: fromStringz;
+
 			VkPhysicalDeviceProperties props;
 			vkGetPhysicalDeviceProperties(device, &props);
 			VkPhysicalDeviceFeatures features;
 			vkGetPhysicalDeviceFeatures(device, &features);
-			//test_out.writeln(props);
+			test_out.writeln("Physical device: ", props.deviceName.ptr.fromStringz, " (", props.deviceType, ")");
 			//test_out.writeln(features);
 		}
 
@@ -797,7 +1250,11 @@ private:
 		QueueFamily queue_family=GetQueueFamily();
 
 		VkDeviceQueueCreateInfo[] queue_create_infos=[];
-		uint[] unique_queue_families=[ queue_family.graphics_family, queue_family.present_family ];
+		test_out.writeln(queue_family);
+		// a family may only be requested once
+		uint[] unique_queue_families=[ queue_family.graphics_family ];
+		if (queue_family.present_family!=queue_family.graphics_family)
+			unique_queue_families~=queue_family.present_family;
 
 		float[] priorities=[ 1f ];
 		foreach(family; unique_queue_families)
@@ -827,7 +1284,7 @@ private:
 			pEnabledFeatures: &device_features
 		};
 
-		vkCreateDevice(g_PhysicalDevice, &create_info, null, &g_Device);
+		VkCheck(vkCreateDevice(g_PhysicalDevice, &create_info, null, &g_Device), "vkCreateDevice");
 		loadDeviceLevelFunctionsExt(g_VkInstance);
 
 		vkGetDeviceQueue(g_Device, queue_family.graphics_family, 0, &_graphics_queue);
@@ -886,8 +1343,9 @@ private:
 			imageExtent: swapchain_rect,
 			imageArrayLayers: 1,
 			imageUsage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-			imageSharingMode: VK_SHARING_MODE_CONCURRENT,
-			queueFamilyIndexCount: 2,
+			// concurrent sharing requires distinct families
+			imageSharingMode: queue_family.graphics_family==queue_family.present_family ? VK_SHARING_MODE_EXCLUSIVE : VK_SHARING_MODE_CONCURRENT,
+			queueFamilyIndexCount: queue_family.graphics_family==queue_family.present_family ? 0 : 2,
 			pQueueFamilyIndices: queue_family_indices.ptr,
 			preTransform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
 			compositeAlpha: VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1331,7 +1789,7 @@ private:
 		// iterate lights, set count
 		if (g_RenderContext !is null) // FIXME: pls kill me
 		{
-			test_out.writeln("--- Updating Light List");
+			debug(FrameTrace) test_out.writeln("--- Updating Light List");
 
 			WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
 
@@ -1367,7 +1825,7 @@ private:
 			ProcessNodeLights(bsp.root_node);
 		}
 
-		test_out.writeln(ubo);
+		debug(FrameTrace) test_out.writeln(ubo);
 
 		void* data;
 		vmaMapMemory(_light_list_ubo_memory[image_index], &data);
@@ -2008,4 +2466,4 @@ class Shader
 
 		return shader_module;
 	}
-}
+}

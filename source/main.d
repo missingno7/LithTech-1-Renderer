@@ -386,13 +386,16 @@ void DeleteContext(RenderContext* context)
 
 void Clear(Rect* rect, ClearFlags flags)
 {
-	test_out.writeln(*rect, " ", flags);
-	_renderer_inst.Clear();
+	debug(FrameTrace) test_out.writeln(*rect, " ", flags);
+	_renderer_inst.Clear(rect, flags);
 }
 
 int Start3D() // vkBeginCommandBuffer
 {
-	test();
+	debug(FrameTrace) test();
+
+	if (g_IsIn3D)
+		return false;
 
 	g_IsIn3D=true;
 	return true;
@@ -400,7 +403,10 @@ int Start3D() // vkBeginCommandBuffer
 
 int End3D() // vkEndCommandBuffer
 {
-	test();
+	debug(FrameTrace) test();
+
+	if (!g_IsIn3D)
+		return false;
 
 	g_IsIn3D=false;
 	return true;
@@ -440,6 +446,9 @@ void PrintDList(ref DLink head, void delegate(DLink*) callback=(DLink* link) { t
 int RenderScene(SceneDesc* scene_desc)
 	in(scene_desc!=null)
 {
+	// per-frame dumps of the whole world, tanks the frame rate; enable with `debugVersions "FrameTrace"` in dub.sdl
+	debug(FrameTrace)
+	{
 	test();
 
 	test_out.writeln(*_renderer);
@@ -528,6 +537,7 @@ int RenderScene(SceneDesc* scene_desc)
 			test_out.writeln("Poly.lightmap_page: ", *(cast(Buffer*)poly.lightmap_page));
 		}
 	}
+	} // debug(FrameTrace)
 
 	void ProcessNode(Node* node)
 	{
@@ -780,7 +790,7 @@ int RenderScene(SceneDesc* scene_desc)
 
 	if (_renderer.is_init!=0)
 	{
-		test_out.writeln(*scene_desc);
+		debug(FrameTrace) test_out.writeln(*scene_desc);
 
 		/+{
 			if (scene_desc.obj_count>0)
@@ -826,7 +836,7 @@ void* GetHook(const char*)
 
 void SwapBuffers()
 {
-	test();
+	debug(FrameTrace) test();
 
 	_renderer_inst.SwapBuffers();
 }
@@ -918,7 +928,7 @@ void UnlockScreen()
 
 void BlitToScreen(BlitRequest* blit_request)
 {
-	test_out.writeln(*blit_request);
+	debug(FrameTrace) test_out.writeln(*blit_request);
 	_renderer_inst.BlitToScreen(blit_request);
 
 	/+auto real_surface=blit_request.surface_ptr;

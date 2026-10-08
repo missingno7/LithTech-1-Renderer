@@ -42,7 +42,7 @@ public:
 		SDL_RenderPresent(_renderer);
 	}
 
-	void Clear()
+	void Clear(Rect* rect, ClearFlags flags)
 	{
 		SDL_RenderClear(_renderer);
 	}
