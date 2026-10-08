@@ -576,7 +576,11 @@ public:
 				fov_x=2f*atan(tan(fov_y*0.5f)*view_aspect);
 		}
 
-		CollectObjects(scene_desc);
+		{
+			const MonoTime t_collect=MonoTime.currTime;
+			CollectObjects(scene_desc);
+			_timing[Timing.Scene]+=(MonoTime.currTime-t_collect).total!"usecs";
+		}
 
 		/+
 		uVar9 = 0;
@@ -713,8 +717,21 @@ LAB_0004814b:
 	/// FIXME: move most of this into RenderScene so we don't need to use g_RenderContext and try use a null reference during loading screens
 	override void SwapBuffers() // vkQueuePresent
 	{
+		const MonoTime t_begin=MonoTime.currTime;
+		if (_t_frame_end!=MonoTime.init)
+			_timing[Timing.Game]+=(t_begin-_t_frame_end).total!"usecs"; // includes RenderScene, subtracted when logged
+
 		uint image_index;
 		VkResult res=vkAcquireNextImageKHR(g_Device, _swapchain, uint.max, _is_image_available, VK_NULL_ND_HANDLE, &image_index);
+		MonoTime t_mark=MonoTime.currTime;
+		void Mark(Timing stage)
+		{
+			const MonoTime now=MonoTime.currTime;
+			_timing[stage]+=(now-t_mark).total!"usecs";
+			t_mark=now;
+		}
+		Mark(Timing.Acquire);
+		_timing[Timing.Acquire]+=(t_mark-t_begin).total!"usecs";
 
 		// window resized/minimised: nothing was acquired, rebuild and skip this frame (suboptimal still presents)
 		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
@@ -733,6 +750,7 @@ LAB_0004814b:
 		{
 			UpdateUniformBuffer(image_index);
 			UpdateLightListUbo(image_index);
+			Mark(Timing.Uniforms);
 
 			void SetCommandBuffer(size_t image_index)
 			{
@@ -844,8 +862,11 @@ LAB_0004814b:
 			}
 
 			UploadOverlay();
+			Mark(Timing.Overlay);
 			UploadObjects();
+			Mark(Timing.ObjectUpload);
 			SetCommandBuffer(image_index);
+			Mark(Timing.Record);
 
 			VkPipelineStageFlags[] wait_stages = [ VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT ];
 			VkSubmitInfo submit_info={
@@ -859,6 +880,7 @@ LAB_0004814b:
 			};
 
 			vkQueueSubmit(_graphics_queue, 1, &submit_info, VK_NULL_ND_HANDLE);
+			Mark(Timing.Submit);
 		}
 
 		VkPresentInfoKHR present_info={
@@ -871,8 +893,10 @@ LAB_0004814b:
 		};
 
 		res=vkQueuePresentKHR(_graphics_queue, &present_info);
+		Mark(Timing.Present);
 
 		vkQueueWaitIdle(_graphics_queue);
+		Mark(Timing.GpuWait);
 
 		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
 			RecreateSwapchain();
@@ -881,7 +905,13 @@ LAB_0004814b:
 		_objects.Clear(); // built again by the next RenderScene
 
 		LogFrameRate();
+		_t_frame_end=MonoTime.currTime;
 	}
+
+	// per-second timing breakdown for the log, microseconds summed over the frames
+	enum Timing { Game, Scene, Acquire, Uniforms, Overlay, ObjectUpload, Record, Submit, Present, GpuWait }
+	long[Timing.max+1] _timing;
+	MonoTime _t_frame_end;
 
 	import core.time: MonoTime, seconds;
 	MonoTime _fps_start;
@@ -906,6 +936,13 @@ LAB_0004814b:
 				_fog_enable, _fog_range, _fog_colour);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
+			{
+				double Ms(Timing stage) { return _timing[stage]/1000.0/_fps_frames; }
+				test_out.writefln("  ms per frame: game %.2f, scene collect %.2f, acquire %.2f, uniforms %.2f, 2D convert %.2f, object upload %.2f, record %.2f, submit %.2f, present %.2f, GPU wait %.2f",
+					Ms(Timing.Game)-Ms(Timing.Scene), Ms(Timing.Scene), Ms(Timing.Acquire), Ms(Timing.Uniforms), Ms(Timing.Overlay),
+					Ms(Timing.ObjectUpload), Ms(Timing.Record), Ms(Timing.Submit), Ms(Timing.Present), Ms(Timing.GpuWait));
+				_timing[]=0;
+			}
 			{
 				import ModelDraw: g_ShadowStats;
 				test_out.writefln("  model shadows per frame: flagged %d, floor found %d, floor-like %d",
@@ -1092,6 +1129,9 @@ LAB_0004814b:
 	VkImage _overlay_image;
 	VkMappedMemoryRange _overlay_image_memory;
 	VkImageView _overlay_image_view;
+	VkImage _overlay_mask_image; // R8: 255 where 2D was drawn since the last clear
+	VkMappedMemoryRange _overlay_mask_memory;
+	VkImageView _overlay_mask_view;
 	VkSampler _overlay_sampler;
 	VkDescriptorSetLayout _overlay_descriptor_layout;
 	VkDescriptorPool _overlay_descriptor_pool;
@@ -1113,12 +1153,32 @@ LAB_0004814b:
 		_screen_mask=new ubyte[pixel_count];
 		_screen_lock_copy=new ushort[pixel_count];
 
-		CreateVkBuffer(pixel_count*uint.sizeof, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, _overlay_staging, _overlay_staging_memory);
+		// the 565 screen and its mask go to the GPU as they are (R5G6B5 has the engine's bit layout and is sampleable on
+		// every device); overlay.frag expands them. Converting on the CPU cost several ms a frame.
+		CreateVkBuffer(pixel_count*(ushort.sizeof+ubyte.sizeof), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, _overlay_staging, _overlay_staging_memory);
 
-		CreateVkImage(_screen_width, _screen_height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _overlay_image, _overlay_image_memory);
-		TransitionImageLayout(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-		TransitionImageLayout(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-		_overlay_image_view=CreateImageView(_overlay_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+		foreach(mask; 0..2)
+		{
+			const VkFormat format=mask ? VK_FORMAT_R8_UNORM : VK_FORMAT_R5G6B5_UNORM_PACK16;
+			VkImage image;
+			VkMappedMemoryRange memory;
+			CreateVkImage(_screen_width, _screen_height, format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, image, memory);
+			TransitionImageLayout(image, format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			TransitionImageLayout(image, format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			VkImageView view=CreateImageView(image, format, VK_IMAGE_ASPECT_COLOR_BIT);
+			if (mask)
+			{
+				_overlay_mask_image=image;
+				_overlay_mask_memory=memory;
+				_overlay_mask_view=view;
+			}
+			else
+			{
+				_overlay_image=image;
+				_overlay_image_memory=memory;
+				_overlay_image_view=view;
+			}
+		}
 
 		VkSamplerCreateInfo sampler_info={
 			magFilter: VK_FILTER_NEAREST,
@@ -1131,21 +1191,19 @@ LAB_0004814b:
 		};
 		VkCheck(vkCreateSampler(g_Device, &sampler_info, null, &_overlay_sampler), "vkCreateSampler (overlay)");
 
-		VkDescriptorSetLayoutBinding binding={
-			binding: 0,
-			descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			descriptorCount: 1,
-			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT
-		};
+		VkDescriptorSetLayoutBinding[2] bindings=[
+			{ binding: 0, descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: 1, stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT },
+			{ binding: 1, descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: 1, stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT }
+		];
 		VkDescriptorSetLayoutCreateInfo layout_info={
-			bindingCount: 1,
-			pBindings: &binding
+			bindingCount: bindings.length,
+			pBindings: bindings.ptr
 		};
 		VkCheck(vkCreateDescriptorSetLayout(g_Device, &layout_info, null, &_overlay_descriptor_layout), "vkCreateDescriptorSetLayout (overlay)");
 
 		VkDescriptorPoolSize pool_size={
 			type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			descriptorCount: 1
+			descriptorCount: 2
 		};
 		VkDescriptorPoolCreateInfo pool_info={
 			poolSizeCount: 1,
@@ -1161,23 +1219,31 @@ LAB_0004814b:
 		};
 		VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &_overlay_descriptor), "vkAllocateDescriptorSets (overlay)");
 
-		VkDescriptorImageInfo image_info={
-			sampler: _overlay_sampler,
-			imageView: _overlay_image_view,
-			imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-		};
-		VkWriteDescriptorSet descriptor_write={
-			dstSet: _overlay_descriptor,
-			dstBinding: 0,
-			descriptorCount: 1,
-			descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			pImageInfo: &image_info
-		};
-		vkUpdateDescriptorSets(g_Device, 1, &descriptor_write, 0, null);
+		VkDescriptorImageInfo[2] image_infos=[
+			{ sampler: _overlay_sampler, imageView: _overlay_image_view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+			{ sampler: _overlay_sampler, imageView: _overlay_mask_view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }
+		];
+		VkWriteDescriptorSet[2] descriptor_writes;
+		foreach(i; 0..2)
+		{
+			VkWriteDescriptorSet write={
+				dstSet: _overlay_descriptor,
+				dstBinding: cast(uint)i,
+				descriptorCount: 1,
+				descriptorType: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				pImageInfo: &image_infos[i]
+			};
+			descriptor_writes[i]=write;
+		}
+		vkUpdateDescriptorSets(g_Device, descriptor_writes.length, descriptor_writes.ptr, 0, null);
 
+		// push constant: 1 when there's no 3D scene this frame (the 2D layer is then the whole, opaque frame)
+		VkPushConstantRange push_range={ stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT, offset: 0, size: float.sizeof };
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: 1,
-			pSetLayouts: &_overlay_descriptor_layout
+			pSetLayouts: &_overlay_descriptor_layout,
+			pushConstantRangeCount: 1,
+			pPushConstantRanges: &push_range
 		};
 		VkCheck(vkCreatePipelineLayout(g_Device, &pipeline_layout_info, null, &_overlay_pipeline_layout), "vkCreatePipelineLayout (overlay)");
 
@@ -1273,36 +1339,34 @@ LAB_0004814b:
 		vkDestroySampler(g_Device, _overlay_sampler, null);
 		vkDestroyImageView(g_Device, _overlay_image_view, null);
 		DestroyAllocImage(g_Allocator, _overlay_image);
+		vkDestroyImageView(g_Device, _overlay_mask_view, null);
+		DestroyAllocImage(g_Allocator, _overlay_mask_image);
 		DestroyAllocBuffer(g_Allocator, _overlay_staging);
 	}
 
-	// 565 screen -> RGBA8 staging buffer
+	// the 565 screen, then its mask, into the staging buffer as they are
 	void UploadOverlay()
 	{
+		import core.stdc.string: memcpy;
+
 		void* data;
 		if (vmaMapMemory(_overlay_staging_memory, &data)!=VK_SUCCESS)
 			return;
 
-		uint[] rgba=(cast(uint*)data)[0.._screen.length];
-
-		// without a 3D scene the 2D layer is the whole frame, cleared areas are black like the original back buffer
-		const bool opaque=!_scene_rendered;
-
-		foreach(i, pixel; _screen)
-		{
-			uint r=(pixel >> 11) & 0x1F, g=(pixel >> 5) & 0x3F, b=pixel & 0x1F;
-			r=(r << 3) | (r >> 2);
-			g=(g << 2) | (g >> 4);
-			b=(b << 3) | (b >> 2);
-			const uint a=(opaque || _screen_mask[i]) ? 0xFF : 0;
-			rgba[i]=r | (g << 8) | (b << 16) | (a << 24);
-		}
+		memcpy(data, _screen.ptr, _screen.length*ushort.sizeof);
+		memcpy(data+_screen.length*ushort.sizeof, _screen_mask.ptr, _screen_mask.length);
 
 		vmaUnmapMemory(_overlay_staging_memory);
 	}
 
 	// recorded outside the render pass
 	void RecordOverlayCopy(VkCommandBuffer buffer)
+	{
+		RecordOverlayImageCopy(buffer, _overlay_image, 0);
+		RecordOverlayImageCopy(buffer, _overlay_mask_image, _screen.length*ushort.sizeof);
+	}
+
+	void RecordOverlayImageCopy(VkCommandBuffer buffer, VkImage image, VkDeviceSize offset)
 	{
 		VkImageMemoryBarrier barrier={
 			srcAccessMask: VK_ACCESS_SHADER_READ_BIT,
@@ -1311,7 +1375,7 @@ LAB_0004814b:
 			newLayout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
 			dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
-			image: _overlay_image,
+			image: image,
 			subresourceRange: {
 				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
 				baseMipLevel: 0,
@@ -1323,6 +1387,7 @@ LAB_0004814b:
 		vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &barrier);
 
 		VkBufferImageCopy image_copy={
+			bufferOffset: offset,
 			imageSubresource: {
 				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
 				mipLevel: 0,
@@ -1331,7 +1396,7 @@ LAB_0004814b:
 			},
 			imageExtent: { _screen_width, _screen_height, 1 }
 		};
-		vkCmdCopyBufferToImage(buffer, _overlay_staging, _overlay_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
+		vkCmdCopyBufferToImage(buffer, _overlay_staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
 
 		barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
 		barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
@@ -1348,6 +1413,9 @@ LAB_0004814b:
 		SetViewport(buffer, _frame_viewport); // the 2D layer covers the mode's whole area
 
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline_layout, 0, 1, &_overlay_descriptor, 0, null);
+		// without a 3D scene the 2D layer is the whole frame, cleared areas are black like the original back buffer
+		const float opaque=_scene_rendered ? 0f : 1f;
+		vkCmdPushConstants(buffer, _overlay_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, float.sizeof, &opaque);
 		vkCmdDraw(buffer, 3, 1, 0, 0);
 	}
 
