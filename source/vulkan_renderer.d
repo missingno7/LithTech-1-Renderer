@@ -392,6 +392,7 @@ public:
 	// console "Saturate" (Blood II's autoexec sets 1): the lightmap pass B blends SRCBLEND DESTCOLOR, doubling lightmapped
 	// surfaces (blood2_recon port_notes/world.md 4.1)
 	bool _saturate;
+	bool _debug_clear; // console "d_DebugClear": holes in the world in cornflower blue instead of black
 
 	// shader.frag / object.frag push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
 	// 3 world fullbright), fog colour and switch, fog range
@@ -425,6 +426,7 @@ public:
 			_fog_enable=false;
 		_fog_by_distance=ConsoleFloat("d_FogMode", 0f)!=0f;
 		_saturate=ConsoleFloat("Saturate", 0f)!=0f;
+		_debug_clear=ConsoleFloat("d_DebugClear", 0f)!=0f;
 	}
 
 	//// Window: borderless fullscreen on the window's monitor (3D at the monitor's resolution), or with the engine's
@@ -744,9 +746,9 @@ LAB_0004814b:
 				// dynamic state of the world pipeline
 				SetViewport(buffer, _scene_viewport);
 
-				// the render pass clears to black (the bars around the mode's area); debug builds show holes in the
-				// world in a loud colour instead
-				debug if (_scene_rendered)
+				// the render pass clears to black like d3d.ren, which is what holes in the world show (the gaps between the
+				// train's cars in the first level); console "d_DebugClear 1" shows them in a loud colour instead
+				if (_debug_clear && _scene_rendered)
 				{
 					VkClearAttachment clear_attachment={
 						aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
