@@ -295,15 +295,14 @@ public:
 		loadGlobalLevelFunctions(test_out.getFP());
 
 		{
-			/+
-			 + possible avenue for replacing the window with a 32 bit pixel format: GetWindowLong(window, GWL_WNDPROC) -> create new window
-			 +/
+			import Main: _renderer;
+
 			test_out.writeln("hDC: ", GetDC(window), ", WndProc: ", cast(void*)GetWindowLong(window, GWL_WNDPROC));
 
-			RECT rect={ 0, 0, Width, Height };
-			DWORD style=GetWindowLong(window, GWL_STYLE);
-			AdjustWindowRectEx(&rect, style, 0, 0);
-			SetWindowPos(window, HWND_NOTOPMOST, rect.left, rect.top, rect.right-rect.left, rect.bottom-rect.top, SWP_NOCOPYBITS | SWP_NOMOVE | SWP_NOACTIVATE);
+			// the mode the engine picked (screen_width/height are set by Init before this)
+			_screen_width=(_renderer && _renderer.screen_width>0) ? _renderer.screen_width : Width;
+			_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
+			SetupWindow(cast(HWND)window);
 		}
 
 		EnumerateVkExtensions();
@@ -318,6 +317,7 @@ public:
 
 		VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
 		CreateVkImageViews(_swapchain, _images, _buffers);
+		UpdateFrameViewport();
 
 		//// Render Pass
 		CreateRenderPass();
@@ -371,9 +371,115 @@ public:
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
 	}
 
+	//// Window: borderless fullscreen on the window's monitor (3D at the monitor's resolution), or with the engine's
+	//// "windowed" console variable a window whose client area is the mode's size
+
+	void SetupWindow(HWND window)
+	{
+		import Main: _renderer;
+
+		void* windowed_var=_renderer ? _renderer.GetConsoleVar("windowed") : null;
+		const bool windowed=windowed_var && _renderer.GetVarValueFloat(windowed_var)!=0f;
+
+		if (windowed)
+		{
+			RECT rect={ 0, 0, _screen_width, _screen_height };
+			AdjustWindowRectEx(&rect, GetWindowLong(window, GWL_STYLE), FALSE, GetWindowLong(window, GWL_EXSTYLE));
+			SetWindowPos(window, HWND_NOTOPMOST, 0, 0, rect.right-rect.left, rect.bottom-rect.top, SWP_NOCOPYBITS | SWP_NOMOVE | SWP_NOACTIVATE);
+		}
+		else
+		{
+			HMONITOR monitor=MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+			MONITORINFO info;
+			info.cbSize=MONITORINFO.sizeof;
+			GetMonitorInfoA(monitor, &info);
+
+			SetWindowLong(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+			SetWindowLong(window, GWL_EXSTYLE, WS_EX_APPWINDOW);
+			SetWindowPos(window, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right-info.rcMonitor.left,
+				info.rcMonitor.bottom-info.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+		}
+
+		RECT client;
+		GetClientRect(window, &client);
+		test_out.writeln(windowed ? "Windowed" : "Borderless fullscreen", ", mode ", _screen_width, "x", _screen_height,
+			", window client ", client.right-client.left, "x", client.bottom-client.top);
+	}
+
+	// window resized or minimised; false while there's nothing to present to
+	bool RecreateSwapchain()
+	{
+		vkDeviceWaitIdle(g_Device);
+
+		VkSurfaceCapabilitiesKHR capabilities;
+		vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_PhysicalDevice, _surface, &capabilities);
+		if (capabilities.currentExtent.width==0 || capabilities.currentExtent.height==0)
+			return false;
+
+		const size_t image_count=_buffers.length;
+		foreach(ref buffer; _buffers)
+		{
+			vkDestroyFramebuffer(g_Device, buffer.framebuffer, null);
+			vkDestroyImageView(g_Device, buffer.view, null);
+		}
+		vkDestroyImageView(g_Device, _depth_image_view, null);
+		vkDestroyImage(g_Device, _depth_image, null);
+		vkDestroySwapchainKHR(g_Device, _swapchain, null);
+
+		// render pass and pipelines don't depend on the size (dynamic viewport/scissor), only these do
+		VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR (recreate)");
+		CreateVkImageViews(_swapchain, _images, _buffers);
+		if (_buffers.length!=image_count) // command buffers, uniform buffers and descriptor sets are per image
+			VkCheck(VK_ERROR_INITIALIZATION_FAILED, "swapchain image count changed on recreate");
+		CreateDepthBuffer();
+		CreateFramebuffers();
+		UpdateFrameViewport();
+
+		test_out.writeln("Swapchain recreated: ", _extents.width, "x", _extents.height);
+		return true;
+	}
+
+	//// Framing: the engine draws in its mode's coordinates (_screen_width x _screen_height); that area is scaled into the
+	//// swapchain keeping its aspect (pillar/letterboxed), and the scene's view rect is mapped into it
+
+	VkViewport _frame_viewport; // the whole mode, for the 2D layer
+	VkViewport _scene_viewport; // SceneDesc.view_rect, for the 3D scene
+
+	void UpdateFrameViewport()
+	{
+		import std.algorithm: min;
+
+		const float scale=min(_extents.width/cast(float)_screen_width, _extents.height/cast(float)_screen_height);
+		const float width=_screen_width*scale, height=_screen_height*scale;
+		_frame_viewport=VkViewport((_extents.width-width)*0.5f, (_extents.height-height)*0.5f, width, height, 0f, 1f);
+		_scene_viewport=_frame_viewport;
+	}
+
+	VkViewport MapToFrame(const ref Rect rect)
+	{
+		const float scale=_frame_viewport.width/_screen_width;
+		if (rect.x2<=rect.x1 || rect.y2<=rect.y1)
+			return _frame_viewport;
+		return VkViewport(_frame_viewport.x+rect.x1*scale, _frame_viewport.y+rect.y1*scale,
+			(rect.x2-rect.x1)*scale, (rect.y2-rect.y1)*scale, 0f, 1f);
+	}
+
+	static VkRect2D ScissorOf(const ref VkViewport viewport)
+	{
+		return VkRect2D(VkOffset2D(cast(int)viewport.x, cast(int)viewport.y),
+			VkExtent2D(cast(uint)(viewport.width+0.5f), cast(uint)(viewport.height+0.5f)));
+	}
+
+	void SetViewport(VkCommandBuffer buffer, const ref VkViewport viewport)
+	{
+		vkCmdSetViewport(buffer, 0, 1, &viewport);
+		VkRect2D scissor=ScissorOf(viewport);
+		vkCmdSetScissor(buffer, 0, 1, &scissor);
+	}
+
 	vec3 camera_pos;
 	quat camera_view=quat.identity;
-	float fov_global=45f;
+	float fov_x=1.5708f, fov_y=1.2f; // radians, from the scene
 	override void RenderScene(SceneDesc* scene_desc) // vkCmd*
 	{
 		_scene_rendered=true;
@@ -382,7 +488,13 @@ public:
 		camera_pos=vec3(scene_desc.camera_position);
 		camera_view=quat(scene_desc.camera_rotation[3], vec3(scene_desc.camera_rotation[0..3]));
 
-		fov_global=degrees(scene_desc.fov_y);
+		// the engine's horizontal and vertical FOV already match its view rect's aspect
+		if (scene_desc.fov_x>0f && scene_desc.fov_y>0f)
+		{
+			fov_x=scene_desc.fov_x;
+			fov_y=scene_desc.fov_y;
+		}
+		_scene_viewport=MapToFrame(scene_desc.view_rect);
 
 		CollectObjects(scene_desc);
 
@@ -524,20 +636,13 @@ LAB_0004814b:
 		uint image_index;
 		VkResult res=vkAcquireNextImageKHR(g_Device, _swapchain, uint.max, _is_image_available, VK_NULL_ND_HANDLE, &image_index);
 
-		if (res==VK_ERROR_SURFACE_LOST_KHR || res==VK_SUBOPTIMAL_KHR)
+		// window resized/minimised: nothing was acquired, rebuild and skip this frame (suboptimal still presents)
+		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
 		{
-			test_out.writeln("Trying to recreate surface.");
-
-			vkDeviceWaitIdle(g_Device);
-
-			DestroyVkSwapchain();
-			//
-			VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
-			CreateVkImageViews(_swapchain, _images, _buffers);
-			CreateRenderPass();
-			CreateGraphicsPipeline();
-			CreateFramebuffers();
-			CreateCommandBuffers();
+			RecreateSwapchain();
+			_scene_rendered=false;
+			_objects.Clear();
+			return;
 		}
 
 		VkSemaphore[] wait_semaphores=[ _is_image_available ];
@@ -551,15 +656,9 @@ LAB_0004814b:
 
 			void SetCommandBuffer(size_t image_index)
 			{
-				debug
-				{
-					VkClearValue[] clear_colour=[ { color: {[ 0.4f, 0.58f, 0.93f, 1f ]} }, { depthStencil: { 1f, 0 } } ]; // never clear to black! Black hides bugs!
-				}
-				else
-				{
-					// release should clear to black, there's holes in some maps (notably the train levels) that let you see the clear colour and black is expected
-					VkClearValue[] clear_colour=[ { color: {[ 0f, 0f, 0f, 1f ]} }, { depthStencil: { 1f, 0 } } ];
-				}
+				// release clears to black, there's holes in some maps (notably the train levels) that let you see the clear
+				// colour and black is expected; debug clears the scene area separately below
+				VkClearValue[] clear_colour=[ { color: {[ 0f, 0f, 0f, 1f ]} }, { depthStencil: { 1f, 0 } } ];
 
 				auto buffer=_command_buffers[image_index];
 
@@ -581,10 +680,22 @@ LAB_0004814b:
 				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
 
-				// both are dynamic state of the world pipeline
-				VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
-				vkCmdSetViewport(buffer, 0, 1, &viewport);
+				// dynamic state of the world pipeline
+				SetViewport(buffer, _scene_viewport);
 				vkCmdSetLineWidth(buffer, 1f);
+
+				// the render pass clears to black (the bars around the mode's area); debug builds show holes in the
+				// world in a loud colour instead
+				debug if (_scene_rendered)
+				{
+					VkClearAttachment clear_attachment={
+						aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+						colorAttachment: 0,
+						clearValue: { color: {[ 0.4f, 0.58f, 0.93f, 1f ]} } // never clear to black! Black hides bugs!
+					};
+					VkClearRect clear_rect={ rect: ScissorOf(_scene_viewport), baseArrayLayer: 0, layerCount: 1 };
+					vkCmdClearAttachments(buffer, 1, &clear_attachment, 1, &clear_rect);
+				}
 
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
@@ -663,22 +774,11 @@ LAB_0004814b:
 		};
 
 		res=vkQueuePresentKHR(_graphics_queue, &present_info);
-		// recover lost screen if necessary?
-		if (res==VK_ERROR_SURFACE_LOST_KHR || res==VK_SUBOPTIMAL_KHR)
-		{
-			test_out.writeln("Trying to recreate surface.");
-			vkDeviceWaitIdle(g_Device);
-			DestroyVkSwapchain();
-			//
-			VkCheck(CreateVkSwapchain(_format, _colour_space, _swapchain), "vkCreateSwapchainKHR");
-			CreateVkImageViews(_swapchain, _images, _buffers);
-			CreateRenderPass();
-			CreateGraphicsPipeline();
-			CreateFramebuffers();
-			CreateCommandBuffers();
-		}
 
 		vkQueueWaitIdle(_graphics_queue);
+
+		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
+			RecreateSwapchain();
 		_scene_rendered=false;
 		_object_vertex_count+=_objects.vertices.length;
 		_objects.Clear(); // built again by the next RenderScene
@@ -1139,10 +1239,7 @@ LAB_0004814b:
 	{
 		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline);
 
-		VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
-		vkCmdSetViewport(buffer, 0, 1, &viewport);
-		VkRect2D scissor={ { 0, 0 }, _extents };
-		vkCmdSetScissor(buffer, 0, 1, &scissor);
+		SetViewport(buffer, _frame_viewport); // the 2D layer covers the mode's whole area
 
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline_layout, 0, 1, &_overlay_descriptor, 0, null);
 		vkCmdDraw(buffer, 3, 1, 0, 0);
@@ -1428,10 +1525,7 @@ LAB_0004814b:
 
 			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-			VkViewport viewport={ 0f, 0f, _extents.width, _extents.height, 0f, 1f };
-			vkCmdSetViewport(buffer, 0, 1, &viewport);
-			VkRect2D scissor={ { 0, 0 }, _extents };
-			vkCmdSetScissor(buffer, 0, 1, &scissor);
+			SetViewport(buffer, _scene_viewport);
 
 			vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 
@@ -1707,27 +1801,6 @@ private:
 		test_out.writeln("Swapchain Images acquired.");
 	}
 
-	void DestroyVkSwapchain()
-	{
-		foreach(i; 0.._buffers.length)
-		{
-			vkDestroyFramebuffer(g_Device, _buffers[i].framebuffer, null);
-		}
-
-		vkFreeCommandBuffers(g_Device, _command_pool, _command_buffers.length, _command_buffers.ptr);
-
-		vkDestroyPipeline(g_Device, _pipeline, null);
-		//vkDestroyPipelineLayout(g_Device, _pipeline_layout, null);
-		vkDestroyRenderPass(g_Device, _render_pass, null);
-
-		foreach(i; 0.._buffers.length)
-		{
-			vkDestroyImageView(g_Device, _buffers[i].view, null);
-		}
-
-		vkDestroySwapchainKHR(g_Device, _swapchain, null);
-	}
-
 	void CreateVkViews()
 	{
 		foreach(size_t i, ref image; _images)
@@ -1921,10 +1994,11 @@ private:
 			blendConstants: [ 0f, 0f, 0f, 0f ]
 		};
 
-		VkDynamicState[] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_LINE_WIDTH ];
+		// viewport and scissor follow the scene's view rect and survive swapchain resizes
+		VkDynamicState[] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH ];
 
 		VkPipelineDynamicStateCreateInfo dynamic_state_info={
-			dynamicStateCount: 2,
+			dynamicStateCount: dynamic_states.length,
 			pDynamicStates: dynamic_states.ptr
 		};
 
@@ -1970,6 +2044,7 @@ private:
 			pMultisampleState: &multisampling_info,
 			pColorBlendState: &colour_blend_info,
 			pDepthStencilState: &depth_stencil_info,
+			pDynamicState: &dynamic_state_info, // was missing: the viewport stayed fixed at creation size
 			layout: _pipeline_layout,
 			renderPass: _render_pass,
 			basePipelineHandle: VK_NULL_ND_HANDLE,
@@ -2234,7 +2309,14 @@ private:
 		RotTransCamera(camera_pos, camera_view, test_camera_out);
 		ubo.view=test_camera_out.transposed();
 
-		ubo.proj=mat4.perspective(_extents.width, _extents.height, fov_global, 0.1f, 15000f).transposed();
+		// both angles come from the engine, so the projection matches its view rect whatever the window's aspect
+		{
+			import std.math: tan;
+
+			enum float near=0.1f, far=15000f;
+			const float x_max=near*tan(fov_x*0.5f), y_max=near*tan(fov_y*0.5f);
+			ubo.proj=mat4.perspective(-x_max, x_max, -y_max, y_max, near, far).transposed(); // the frustum overload
+		}
 
 		void* data;
 		//vkMapMemory(g_Device, _uniform_buffers_memory[image_index], 0, ubo.sizeof, 0, &data);

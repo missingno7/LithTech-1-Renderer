@@ -89,29 +89,39 @@ export Mode* GetSupportedModes()
 
 	//SDL_Init(SDL_INIT_VIDEO);
 
-	int mode_count=1; //SDL_GetNumDisplayModes(0);
-	Mode[] modes=(cast(Mode*)calloc(mode_count, Mode.sizeof))[0..mode_count]; //new Mode[mode_count];
+	import std.algorithm: sort, uniq;
+	import std.array: array;
+
+	// the primary display's resolutions; d_ren renders in 32-bit internally, 16 is the engine's 2D surface depth
+	uint[2][] resolutions=[[640, 480]];
+	DEVMODEA display_mode;
+	display_mode.dmSize=DEVMODEA.sizeof;
+	for (uint i=0; EnumDisplaySettingsA(null, i, &display_mode); ++i)
+	{
+		// LT1's Client.exe refuses surfaces past 5000 pixels (readme), keep well below
+		if (display_mode.dmPelsWidth>=640 && display_mode.dmPelsHeight>=480 &&
+			display_mode.dmPelsWidth<=4096 && display_mode.dmPelsHeight<=4096)
+			resolutions~=[display_mode.dmPelsWidth, display_mode.dmPelsHeight];
+	}
+	resolutions=resolutions.sort!((a, b) => a[0]!=b[0] ? a[0]<b[0] : a[1]<b[1]).uniq.array;
+
+	// one allocation, FreeModeList frees the head
+	Mode[] modes=(cast(Mode*)calloc(resolutions.length, Mode.sizeof))[0..resolutions.length];
 
 	immutable string renderer_filename="d_ren.ren";
-	immutable string driver_name="primary"; //SDL_GetCurrentVideoDriver();
-	immutable string display_name="Primary Video Thing"; //SDL_GetDisplayName(0);
+	immutable string driver_name="primary";
+	immutable string display_name="Vulkan";
 
-	foreach(int i, ref mode; modes)
+	foreach(i, ref mode; modes)
 	{
-		//SDL_DisplayMode sdl_mode;
-		//SDL_GetDisplayMode(0, i, &sdl_mode);
-
 		mode.is_hardware=1;
 		strcpy(mode.filename.ptr, renderer_filename.toStringz);
 		strcpy(mode.driver_name.ptr, driver_name.toStringz);
 		strcpy(mode.display_name.ptr, display_name.toStringz);
-		mode.width=640; //sdl_mode.w;
-		mode.height=480; //sdl_mode.h;
-		mode.depth=16; //(sdl_mode.format >> 8) & 0xFF;
-
-		//if (i<mode_count-1)
-		//	mode.next=&modes[i+1];
-		mode.next=null;
+		mode.width=resolutions[i][0];
+		mode.height=resolutions[i][1];
+		mode.depth=16;
+		mode.next=(i+1<modes.length) ? &modes[i+1] : null;
 	}
 
 	return modes.ptr;
