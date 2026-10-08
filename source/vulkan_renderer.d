@@ -393,6 +393,8 @@ public:
 	// surfaces (blood2_recon port_notes/world.md 4.1)
 	bool _saturate;
 	bool _debug_clear; // console "d_DebugClear": holes in the world in cornflower blue instead of black
+	bool _widescreen=true; // console "d_Widescreen": Hor+ FOV correction (RenderScene)
+	float[2] _game_fov; // the scene's FOVs as the game gave them, for the log
 
 	// shader.frag / object.frag push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
 	// 3 world fullbright), fog colour and switch, fog range
@@ -427,6 +429,7 @@ public:
 		_fog_by_distance=ConsoleFloat("d_FogMode", 0f)!=0f;
 		_saturate=ConsoleFloat("Saturate", 0f)!=0f;
 		_debug_clear=ConsoleFloat("d_DebugClear", 0f)!=0f;
+		_widescreen=ConsoleFloat("d_Widescreen", 1f)!=0f;
 	}
 
 	//// Window: borderless fullscreen on the window's monitor (3D at the monitor's resolution), or with the engine's
@@ -559,6 +562,19 @@ public:
 
 		if (scene_desc.draw_mode!=DrawMode.ObjectList)
 			ReadFogSettings();
+
+		// Blood II computes its FOVs for 4:3; d3d.ren projects them as given, which stretches the picture in a wider
+		// view. By default keep the vertical FOV and widen the horizontal one to the view's aspect ("Hor+"); console
+		// "d_Widescreen 0" projects the game's FOVs unchanged, like d3d.ren.
+		_game_fov=[fov_x, fov_y];
+		if (_widescreen && _scene_viewport.width>0f && _scene_viewport.height>0f)
+		{
+			import std.math: atan, tan, abs;
+			const float view_aspect=_scene_viewport.width/_scene_viewport.height;
+			const float fov_aspect=tan(fov_x*0.5f)/tan(fov_y*0.5f);
+			if (abs(fov_aspect-view_aspect)>0.01f)
+				fov_x=2f*atan(tan(fov_y*0.5f)*view_aspect);
+		}
 
 		CollectObjects(scene_desc);
 
@@ -888,6 +904,8 @@ LAB_0004814b:
 			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d fog: %s %s %s", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
 				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count,
 				_fog_enable, _fog_range, _fog_colour);
+			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
+				_scene_viewport.width, _scene_viewport.height);
 			test_out.flush();
 			_object_type_counts[]=0;
 			_scene_count=0;
