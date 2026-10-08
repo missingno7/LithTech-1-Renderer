@@ -290,6 +290,7 @@ public:
 		vkDestroyDevice(g_Device, null);
 		vkDestroySurfaceKHR(g_VkInstance, _surface, null);
 		vkDestroyInstance(g_VkInstance, null);
+		ShowCursor(TRUE);
 		test_out.close();
 	}
 
@@ -309,6 +310,9 @@ public:
 			_screen_width=(_renderer && _renderer.screen_width>0) ? _renderer.screen_width : Width;
 			_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
 			SetupWindow(cast(HWND)window);
+
+			// d3d.ren hides the cursor for the renderer's lifetime (d3d_init.cpp, shown again in d3d_FreeDDraw)
+			ShowCursor(FALSE);
 		}
 
 		EnumerateVkExtensions();
@@ -395,7 +399,10 @@ public:
 		}
 		else
 		{
-			HMONITOR monitor=MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+			// the primary monitor, like exclusive fullscreen: the engine recentres the cursor every frame at the
+			// window's width/2, height/2 in screen coordinates (client.cpp), which assumes the window is at 0,0
+			POINT origin={ 0, 0 };
+			HMONITOR monitor=MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
 			MONITORINFO info;
 			info.cbSize=MONITORINFO.sizeof;
 			GetMonitorInfoA(monitor, &info);
