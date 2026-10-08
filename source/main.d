@@ -274,10 +274,10 @@ void BindTexture(SharedTexture* texture, int unknown)
 	}
 }
 
-void UnbindTexture(SharedTexture*)
+void UnbindTexture(SharedTexture* texture)
 {
-	test();
-	// delete SharedTexture.render_data here?
+	if (texture && texture.render_data)
+		g_TextureManager.DestroyTexture(texture.render_data);
 }
 
 int QueryDeletePalette(DEPalette*)
@@ -300,8 +300,9 @@ void* CreateContext(RenderContextInit* context_init)
 
 	test_out.writeln(*context_init);
 
-	g_RenderContext=cast(RenderContext*)calloc(1, RenderContext.sizeof);
+	g_RenderContext=cast(RenderContext*)calloc(1, RenderContextAllocSize);
 	g_RenderContext.main_world=context_init.main_world;
+	g_RenderContext.frame_code=0xFFFF;
 
 	test_out.writeln(*g_RenderContext.main_world);
 
@@ -381,6 +382,11 @@ void DeleteContext(RenderContext* context)
 	test();
 	//test_out.writeln(context);
 	//test_out.writeln(*context);
+	if (context==g_RenderContext)
+	{
+		(cast(VulkanRenderer)_renderer_inst).DestroyBspBuffers();
+		g_RenderContext=null; // SwapBuffers/UpdateLightListUbo draw from it every frame
+	}
 	free(context);
 }
 

@@ -189,13 +189,24 @@ class RenderTexture
 		(cast(VulkanRenderer)_renderer_inst).CreateTextureImage(texture, image, memory);
 
 		VkComponentMapping map=VkComponentMapping(VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY);
-		image_view=(cast(VulkanRenderer)_renderer_inst).CreateImageView(image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, &map);
+		image_view=(cast(VulkanRenderer)_renderer_inst).CreateImageView(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &map);
 
 		(cast(VulkanRenderer)_renderer_inst).CreateTextureDescriptorSet(image_view, texture_descriptor);
 
 		return 0;
 
 		assert(0);
+	}
+
+	public void Destroy()
+	{
+		import Main: _renderer_inst;
+		import VulkanRender;
+		(cast(VulkanRenderer)_renderer_inst).DestroyTextureImage(image, image_view, texture_descriptor);
+
+		if (texture_ref && texture_ref.render_data is this)
+			texture_ref.render_data=null;
+		texture_ref=null;
 	}
 }
 
@@ -213,6 +224,18 @@ class TextureManager
 		textures~=r_texture;
 
 		return r_texture;
+	}
+
+	// UnbindTexture: like d3d.ren, the engine frees the texture's render data through this
+	void DestroyTexture(RenderTexture r_texture)
+	{
+		import std.algorithm: countUntil, remove;
+
+		const ptrdiff_t index=textures.countUntil!"a is b"(r_texture);
+		if (index>=0)
+			textures=textures.remove(index);
+
+		r_texture.Destroy();
 	}
 }
 

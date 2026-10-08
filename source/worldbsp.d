@@ -245,11 +245,14 @@ struct MainWorld
 
 	int[5] buf;
 
-	MainWorld* self2; // same as RenderContextInit.main_world
+	// the engine stores CreateContext's return here and passes it back as SceneDesc.render_context (Client 0x115ea)
+	import RendererTypes: RenderContext;
+	RenderContext* render_context;
 
 	//int[2] unknown_9;
 	//void*[64] buf;
 
+	static assert(render_context.offsetof==0xC8);
 	static assert(self.offsetof==172);
 	static assert(this.sizeof>=168);
 	static assert(this.sizeof==204);

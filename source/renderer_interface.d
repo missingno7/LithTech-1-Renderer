@@ -42,20 +42,25 @@ align(4): // 3 align bytes here
 
 struct RenderContextInit
 {
+	// the engine passes the address of a single stack slot (Client 0x115a0), there is nothing after this
 	MainWorld* main_world;
-	void*[4] buf;
-	void* list_end; // byte 24
-	void* list_head; // byte 28
-	void*[48] buf2;
+
+	static assert(this.sizeof==4);
 }
 
-struct RenderContext // this is whatever we want; should probably save lightmaps in here
+struct RenderContext // renderer-owned; d3d.ren and soft.ren both allocate 0x430 bytes
 {
 	Buffer* unknown_1;
-	int unknown_2; // 0x0000FFFF? "framecode"
+	int unknown_2;
 
-	MainWorld* main_world;
+	MainWorld* main_world; // +8, set by CreateContext in both original renderers
+	ushort frame_code; // +0xC, initialised to 0xFFFF by both original renderers
+
+	static assert(main_world.offsetof==8);
+	static assert(frame_code.offsetof==0xC);
 }
+
+enum size_t RenderContextAllocSize=0x430;
 
 enum DrawMode : int
 {
@@ -223,7 +228,7 @@ struct RenderDLL
 	void* function(const char*) GetConsoleVar;
 	float function(void*) GetVarValueFloat;
 	const char* function(void*) GetVarValueString;
-	void* function() UnknownFunc_5; // does nothing in d3d.ren
+	void* function() UnknownFunc_5; // engine-filled (empty in Blood 2), d3d.ren calls it before each draw phase; profiling tick?
 
 	version(LITHTECH_1_5)
 	{

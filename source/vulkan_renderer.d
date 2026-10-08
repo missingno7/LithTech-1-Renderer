@@ -192,7 +192,7 @@ const Vertex[] _test_triangle=[
 	{ [500f, 500f, -500f], [1f, 1f, 1f], [0f, 0f] },
 	{ [500f, -500f, -500f], [1f, 1f, 1f],  [0f, 0f] }
 ];
-const ushort[] _test_triangle_indices=[0, 1, 2, 3, 4, 5, 6, 7];
+const uint[] _test_triangle_indices=[0, 1, 2, 3, 4, 5, 6, 7];
 
 struct SwapchainBuffer
 {
@@ -329,11 +329,11 @@ public:
 
 		CreateTextureImage();
 
-		_texture_image_view=CreateImageView(_texture_image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+		_texture_image_view=CreateImageView(_texture_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
 		CreateTextureSampler();
 
 		CreateVertexBuffer(cast(VkDeviceSize)(Vertex.sizeof*_test_triangle.length), cast(void*)_test_triangle.ptr, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, _vertex_buffer, _vertex_buffer_memory);
-		CreateVertexBuffer(cast(VkDeviceSize)(ushort.sizeof*_test_triangle_indices.length), cast(void*)_test_triangle_indices.ptr, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, _vertex_index_buffer, _vertex_index_memory);
+		CreateVertexBuffer(cast(VkDeviceSize)(uint.sizeof*_test_triangle_indices.length), cast(void*)_test_triangle_indices.ptr, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, _vertex_index_buffer, _vertex_index_memory);
 
 		CreateUniformBuffers();
 		CreateLightListUniformBuffers();
@@ -568,16 +568,17 @@ LAB_0004814b:
 				vkCmdSetViewport(buffer, 0, 1, &viewport);
 				vkCmdSetLineWidth(buffer, 1f);
 
-				VkBuffer[] vertex_buffers=[ _vertex_buffer ];
-				VkDeviceSize[] offsets=[ 0 ];
-
-				vkCmdBindVertexBuffers(buffer, 0, vertex_buffers.length, vertex_buffers.ptr, offsets.ptr);
-				vkCmdBindIndexBuffer(buffer, _vertex_index_buffer, 0, VK_INDEX_TYPE_UINT16);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
 
-				if (g_RenderContext !is null)
+				if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
 				{
+					VkBuffer[] vertex_buffers=[ _vertex_buffer ];
+					VkDeviceSize[] offsets=[ 0 ];
+
+					vkCmdBindVertexBuffers(buffer, 0, vertex_buffers.length, vertex_buffers.ptr, offsets.ptr);
+					vkCmdBindIndexBuffer(buffer, _vertex_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+
 					WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
 
 					size_t index_start=0;
@@ -589,11 +590,13 @@ LAB_0004814b:
 						if (polygon.surface.flags & SurfaceFlags.Invisible)
 							continue;
 
-						RenderTexture this_texture=cast(RenderTexture)polygon.surface.shared_texture.render_data;
+						// unbound (or never bound) textures fall back to the dummy texture
+						SharedTexture* shared_texture=polygon.surface.shared_texture;
+						RenderTexture this_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
 						if (last_texture !is this_texture)
 						{
 							last_texture=this_texture;
-							VkDescriptorSet texture_image=this_texture.texture_descriptor;
+							VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
 							vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
 						}
 
@@ -2046,15 +2049,17 @@ private:
 
 	void CreateTextureDescriptorPool()
 	{
+		// sets are freed again by UnbindTexture
 		VkDescriptorPoolSize[] pool_size=[ {
 			type: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-			descriptorCount: 1024
+			descriptorCount: 4096
 		} ];
 
 		VkDescriptorPoolCreateInfo pool_info={
+			flags: VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
 			poolSizeCount: pool_size.length,
 			pPoolSizes: pool_size.ptr,
-			maxSets: 1024
+			maxSets: 4096
 		};
 
 		vkCreateDescriptorPool(g_Device, &pool_info, null, &_texture_descriptor_pool);
@@ -2123,10 +2128,10 @@ private:
 			// free pixels
 			pixels=null;
 
-			CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _texture_image, _texture_image_memory);
-			TransitionImageLayout(_texture_image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _texture_image, _texture_image_memory);
+			TransitionImageLayout(_texture_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 			CopyBufferToImage(staging_buffer, _texture_image, width, height);
-			TransitionImageLayout(_texture_image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			TransitionImageLayout(_texture_image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 			vkDestroyBuffer(g_Device, staging_buffer, null);
 			//vkFreeMemory(g_Device, staging_memory.memory, null);
@@ -2157,14 +2162,23 @@ private:
 			// free pixels
 			pixels=null;
 
-			CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture_img, texture_mem);
-			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture_img, texture_mem);
+			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 			CopyBufferToImage(staging_buffer, texture_img, width, height);
-			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 			vkDestroyBuffer(g_Device, staging_buffer, null);
 			//vkFreeMemory(g_Device, staging_memory.memory, null);
 		}
+	}
+
+	// the GPU is idle between frames (SwapBuffers waits), so this is safe whenever the engine calls it
+	public void DestroyTextureImage(VkImage image, VkImageView image_view, VkDescriptorSet descriptor)
+	{
+		if (descriptor!=VK_NULL_ND_HANDLE)
+			vkFreeDescriptorSets(g_Device, _texture_descriptor_pool, 1, &descriptor);
+		vkDestroyImageView(g_Device, image_view, null);
+		vkDestroyImage(g_Device, image, null);
 	}
 
 	void CreateVkImage(uint width, uint height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, out VkImage image, out VkMappedMemoryRange memory)
@@ -2373,15 +2387,30 @@ private:
 	}
 
 	uint index_count=0;
+
+	// world geometry is rebuilt per level (CreateContext); the allocator never reclaims the memory itself
+	public void DestroyBspBuffers()
+	{
+		vkDeviceWaitIdle(g_Device);
+
+		vkDestroyBuffer(g_Device, _vertex_buffer, null);
+		vkDestroyBuffer(g_Device, _vertex_index_buffer, null);
+		_vertex_buffer=VK_NULL_ND_HANDLE;
+		_vertex_index_buffer=VK_NULL_ND_HANDLE;
+		index_count=0;
+	}
+
 	public void CreateBspVertexBuffer(WorldBsp* bsp)
 	{
+		DestroyBspBuffers(); // the previous level's, or the startup test geometry
+
 		test_out.writeln("-- Begin create BSP");
 		//
 
 		Polygon*[] polygons=bsp.polygons[0..bsp.polygon_count];
 
 		Vertex[] vert_buffer=new Vertex[0];
-		ushort[] indices=new ushort[0];
+		uint[] indices=new uint[0];
 
 		uint vert_count=0;
 
@@ -2411,15 +2440,15 @@ private:
 
 				if (j>2)
 				{
-					indices~=cast(ushort)(vert_count);
-					indices~=cast(ushort)(vert_count+j-1);
+					indices~=cast(uint)(vert_count);
+					indices~=cast(uint)(vert_count+j-1);
 				}
 
-				indices~=cast(ushort)(vert_count+j);
+				indices~=cast(uint)(vert_count+j);
 			}
 		}
 
-		bool DoNode(Node* node, out Vertex[] verts_out, out ushort[] indices_out)
+		bool DoNode(Node* node, out Vertex[] verts_out, out uint[] indices_out)
 		{
 			test_out.writeln(*node);
 
@@ -2427,7 +2456,7 @@ private:
 		}
 
 		Vertex[] verts_extra;
-		ushort[] indices_extra;
+		uint[] indices_extra;
 
 		DoNode(bsp.root_node, verts_extra, indices_extra);
 
@@ -2435,7 +2464,7 @@ private:
 		test_out.writeln(index_count);
 
 		CreateVertexBuffer(cast(VkDeviceSize)(Vertex.sizeof*vert_buffer.length), vert_buffer.ptr, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, _vertex_buffer, _vertex_buffer_memory);
-		CreateVertexBuffer(cast(VkDeviceSize)(ushort.sizeof*indices.length), indices.ptr, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, _vertex_index_buffer, _vertex_index_memory);
+		CreateVertexBuffer(cast(VkDeviceSize)(uint.sizeof*indices.length), indices.ptr, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, _vertex_index_buffer, _vertex_index_memory);
 
 		test_out.writeln("-- End create BSP, ", vert_buffer.length);
 	}
