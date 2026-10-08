@@ -89,21 +89,29 @@ export Mode* GetSupportedModes()
 
 	//SDL_Init(SDL_INIT_VIDEO);
 
-	import std.algorithm: sort, uniq;
+	import std.algorithm: filter, sort, uniq;
 	import std.array: array;
 
-	// the primary display's resolutions; d_ren renders in 32-bit internally, 16 is the engine's 2D surface depth
-	uint[2][] resolutions=[[640, 480]];
+	// Modes are the engine's 2D/UI resolution: in borderless fullscreen the 3D always renders at the monitor's
+	// resolution and no display mode is set, so common modes the monitor doesn't list are offered too.
+	// d_ren renders in 32-bit internally, 16 is the engine's 2D surface depth.
+	uint[2][] resolutions=[[640, 480], [800, 600], [1024, 768], [1280, 720], [1280, 800], [1280, 960], [1366, 768], [1440, 900], [1600, 900]];
 	DEVMODEA display_mode;
 	display_mode.dmSize=DEVMODEA.sizeof;
 	for (uint i=0; EnumDisplaySettingsA(null, i, &display_mode); ++i)
-	{
-		// LT1's Client.exe refuses surfaces past 5000 pixels (readme), keep well below
-		if (display_mode.dmPelsWidth>=640 && display_mode.dmPelsHeight>=480 &&
-			display_mode.dmPelsWidth<=4096 && display_mode.dmPelsHeight<=4096)
-			resolutions~=[display_mode.dmPelsWidth, display_mode.dmPelsHeight];
-	}
-	resolutions=resolutions.sort!((a, b) => a[0]!=b[0] ? a[0]<b[0] : a[1]<b[1]).uniq.array;
+		resolutions~=[display_mode.dmPelsWidth, display_mode.dmPelsHeight];
+
+	// Nothing taller than 1000 rows: Client.exe's software surface warp (InternalWarpSurfaceToSurface, 0x40cf80; its
+	// edge walker 0x4300c0) keeps 1000-row span tables on the stack, and Blood 2 scales its 640x480 loading picture
+	// into a screen-sized surface with it on every level load (BloodClientShell::DrawLoadingScreen), so taller modes
+	// overflow the stack and crash -- with the original d3d.ren as well (verified at 1600x1200).
+	enum uint MaxModeHeight=1000;
+	resolutions=resolutions
+		.filter!(r => r[0]>=640 && r[1]>=480 && r[0]<=4096 && r[1]<=MaxModeHeight)
+		.array
+		.sort!((a, b) => a[0]!=b[0] ? a[0]<b[0] : a[1]<b[1])
+		.uniq
+		.array;
 
 	// one allocation, FreeModeList frees the head
 	Mode[] modes=(cast(Mode*)calloc(resolutions.length, Mode.sizeof))[0..resolutions.length];
