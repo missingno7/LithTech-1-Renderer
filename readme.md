@@ -34,9 +34,10 @@ them by default (see *Fog* below).
 - There is no visibility culling: the whole level is drawn every frame. It is still fast.
 
 ## Using it
-1. Copy `d_ren.dll` (renamed to `d_ren.ren`), the `*.spv` shaders and `test_texture.png` into the game folder.
-   `build.ps1 -GameDir <folder>` does this for you.
-2. Select it: `"RenderDLL" "d_ren.ren"` in `autoexec.cfg`, or `++RenderDll d_ren.ren` on the command line.
+1. Put `d_ren.ren` into the game folder. It's a single file with the shaders built in: unzip a release there, or let
+   `build.ps1 -GameDir <folder>` copy it.
+2. Select it in the game's launcher, or with `"RenderDLL" "d_ren.ren"` in `autoexec.cfg` / `++RenderDll d_ren.ren` on
+   the command line.
 3. Pick any resolution the game offers. d_ren runs borderless fullscreen on the primary monitor and renders 3D at the
    monitor's native resolution. The chosen mode only sets the size of the 2D interface, which is scaled up to fit.
    - With the game's `windowed 1` console variable it runs in a window of the mode's size instead.
@@ -109,13 +110,17 @@ Needs [LDC](https://github.com/ldc-developers/ldc) with the 32-bit (multilib) li
 Vulkan SDK's `glslangValidator`). `build.ps1` finds them under `-Toolchains` (default `D:\Prog\toolchains`) or on the
 `PATH`:
 ```
-.\build.ps1                                     # debug build, shaders compiled
+.\build.ps1                                     # debug build
 .\build.ps1 -Release -GameDir D:\Games\Blood2   # release build, deployed to the game folder
+.\build.ps1 -Package                            # release build -> dist\d_ren-<version>.zip (renderer + install notes)
 ```
 By hand: compile the six shaders (`shader`, `object` and `overlay`, `.vert`/`.frag`) to `vert.spv`/`frag.spv`,
-`object_vert.spv`/`object_frag.spv` and `overlay_vert.spv`/`overlay_frag.spv`, then run
-`dub build --arch=x86_mscoff --compiler=ldc2`. The `.ren` links druntime, Phobos and the C runtime statically, so it
-has no runtime DLL dependencies.
+`object_vert.spv`/`object_frag.spv` and `overlay_vert.spv`/`overlay_frag.spv` in the repository root (they're
+embedded into the DLL), then run `dub build --arch=x86_mscoff --compiler=ldc2`. The `.ren` links druntime, Phobos and
+the C runtime statically, so it has no runtime dependencies besides Windows and the Vulkan loader.
+
+The version is set in `source/version_info.d`. When the Windows SDK's `rc.exe` is installed, `build.ps1` also puts it
+into the DLL's file properties (dub configuration `versioned`).
 
 ## The Interesting Parts
 - `source/renderer_interface.d` and `source/object/*.d` hold the renderer ABI. Anyone working with LithTech 1.0 should

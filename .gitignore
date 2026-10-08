@@ -1,9 +1,12 @@
 # build outputs
 .dub/
+.build/
+dist/
 dub.selections.json
 d_ren.dll
 d_ren.exp
 d_ren.lib
 d_ren.pdb
+d_ren.res
 *.spv
 test_texture.png

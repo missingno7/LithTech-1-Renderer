@@ -305,6 +305,10 @@ public:
 	override void InitFrom(void* window)
 	{
 		test_out.open("vk_test.txt", "w");
+		{
+			import VersionInfo: DRenVersion;
+			test_out.writeln("d_ren ", DRenVersion);
+		}
 
 		import erupted.vulkan_lib_loader;
 		loadGlobalLevelFunctions(test_out.getFP());
@@ -3423,17 +3427,17 @@ private:
 	{
 		//if (TextureData* tex_data=texture.engine_data)
 		{
-			import std.string: toStringz;
-			import dimage;
-
+			// the fallback texture for surfaces without one: a 16x16 magenta / black checker of 4x4 squares, made here
+			// (it used to be loaded from test_texture.png next to the game)
 			int width=16, height=16, channels=4;
-
-			// get pixels
-			File source=File("test_texture.png");
-			Image texture=PNG.load(source);
-			width=texture.width;
-			height=texture.height;
-			ubyte[] pixels=texture.imageData.raw; //=TransitionTexturePixels(texture);
+			ubyte[] pixels=new ubyte[width*height*channels];
+			foreach(y; 0..height)
+				foreach(x; 0..width)
+				{
+					const bool magenta=(((x >> 2)+(y >> 2)) & 1)!=0;
+					const size_t i=(y*width+x)*channels;
+					pixels[i..i+4]=magenta ? [ubyte(255), ubyte(0), ubyte(255), ubyte(255)] : [ubyte(0), ubyte(0), ubyte(0), ubyte(255)];
+				}
 
 			size_t image_size=width*height*channels;
 
@@ -3968,14 +3972,16 @@ private:
 
 class Shader
 {
-	static ubyte[] ReadShader(inout string file_name)
+	// the SPIR-V is compiled into the DLL (build.ps1 compiles the shaders before the D build; dub.sdl's
+	// stringImportPaths), so a release is the .ren alone. Copied to a fresh array: vkCreateShaderModule needs the code
+	// 4-byte aligned, which embedded string data isn't guaranteed to be.
+	static ubyte[] ReadShader(string file_name)
 	{
-		import std.stdio;
-		File shader_file;
-		shader_file.open(file_name, "rb");
-		scope(exit) shader_file.close();
-		ulong file_size=shader_file.size;
-		return shader_file.rawRead(new ubyte[cast(uint)file_size]);
+		static immutable string[] names=[ "vert.spv", "frag.spv", "object_vert.spv", "object_frag.spv", "overlay_vert.spv", "overlay_frag.spv" ];
+		static foreach(name; names)
+			if (file_name==name)
+				return cast(ubyte[])(cast(const(ubyte)[])import(name)).dup;
+		assert(0, "No embedded shader "~file_name);
 	}
 
 	static VkShaderModule CreateShaderModule(ref VkDevice device, const ubyte[] shader_bytecode)

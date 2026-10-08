@@ -3,8 +3,18 @@ targetType "dynamicLibrary"
 dependency "bindbc-sdl" version="~>0.21.1"
 dependency "erupted" version="~>2.1.24+v1.2.174"
 dependency "gl3n" version="~>1.4.1"
-dependency "dimage" version="~>0.3.0-beta.1"
 versions "SDL_205" "VK_USE_PLATFORM_WIN32_KHR"
 libs "user32" "winmm"
+// the compiled shaders (*.spv, made by build.ps1) are embedded with import()
+stringImportPaths "."
 // LDC: make the .ren self-contained (static druntime/phobos + static MSVC CRT)
 dflags "-link-defaultlib-shared=false" "-mscrtlib=libcmt" "-fvisibility=hidden" "-dllimport=none" platform="windows-ldc"
+
+configuration "plain" {
+}
+
+// with the version resource (d_ren.res, compiled from source/version_info.d's version by build.ps1 when rc.exe is
+// available): file properties show the version
+configuration "versioned" {
+	sourceFiles "d_ren.res"
+}
