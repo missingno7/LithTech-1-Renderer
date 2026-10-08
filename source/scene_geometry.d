@@ -1,8 +1,9 @@
 module SceneGeometry;
 
 /+
- + Per-frame geometry of the scene's objects (models now; sprites, particles etc. later), built on the CPU during
- + RenderScene in world space and drawn after the world by SwapBuffers.
+ + Per-frame geometry of the scene's objects (models, world models, sprites, particles, polygrids, line systems and the
+ + sky), built on the CPU during RenderScene in world space and drawn by SwapBuffers: the sky group before the world,
+ + the other groups after it in d3d.ren's d3d_FlushObjectQueues order (blood2_recon renderer_port_abi.md section 5).
  +/
 
 import erupted;
@@ -33,56 +34,105 @@ struct ObjectVertex
 	}
 }
 
+// draw order; Sky is drawn before the world, the rest after it in this order. Nothing is depth sorted.
+enum DrawGroup
+{
+	Sky,
+	SolidModels,
+	SolidWorldModels,
+	SolidPolyGrids,
+	TranslucentModels, // from here on d3d.ren has the translucent object states on (blend, no depth write)
+	ParticleSystems,
+	TranslucentPolyGrids,
+	LineSystems,
+	TranslucentWorldModels,
+	Sprites,
+	SpritesNoZ, // FLAG_SPRITE_NOZ: drawn last with the depth test off
+}
+
+// the object pipelines (vulkan_renderer.d CreateObjectPipeline)
+enum ObjectPipe
+{
+	Opaque, // depth test and write
+	Blend, // SRCALPHA / INVSRCALPHA, depth test, no depth write
+	BlendNoZ, // blended, no depth test or write (sky, no-Z sprites)
+	OpaqueNoZ, // no blend, no depth (solid sky objects)
+	Lines, // line list, blended, depth test, no depth write
+}
+
+enum TextureMode : ubyte
+{
+	Normal,
+	Fullbright, // texture alpha marks fullbright texels
+	Untextured, // white texture
+}
+
 struct ObjectBatch
 {
 	VkDescriptorSet texture; // VK_NULL_ND_HANDLE: the renderer's dummy texture
 	uint first_vertex;
 	uint vertex_count;
-	bool fullbright; // texture alpha marks fullbright texels
+	TextureMode mode;
+	ObjectPipe pipe;
 }
 
-// d3d.ren flushes solid objects before translucent ones and sorts neither (port ABI section 5)
 struct ObjectGeometry
 {
 	ObjectVertex[] vertices;
-	ObjectBatch[] solid;
-	ObjectBatch[] translucent;
+	ObjectBatch[][DrawGroup.max+1] groups;
+
+	// where the solid / translucent batches of Begin(texture, translucent, fullbright) go; models and world models set
+	// these before drawing (DrawModel / DrawWorldModel only know whether they're translucent)
+	DrawGroup solid_group=DrawGroup.SolidModels, translucent_group=DrawGroup.TranslucentModels;
+	ObjectPipe solid_pipe=ObjectPipe.Opaque, translucent_pipe=ObjectPipe.Blend;
 
 	void Clear()
 	{
 		vertices.length=0;
 		vertices.assumeSafeAppend();
-		solid.length=0;
-		solid.assumeSafeAppend();
-		translucent.length=0;
-		translucent.assumeSafeAppend();
+		foreach(ref group; groups)
+		{
+			group.length=0;
+			group.assumeSafeAppend();
+		}
+	}
+
+	void Route(DrawGroup solid, ObjectPipe solid_pipe_, DrawGroup translucent, ObjectPipe translucent_pipe_)
+	{
+		solid_group=solid;
+		solid_pipe=solid_pipe_;
+		translucent_group=translucent;
+		translucent_pipe=translucent_pipe_;
 	}
 
 	// opens a batch; vertices appended until the next Begin belong to it
 	void Begin(VkDescriptorSet texture, bool is_translucent, bool fullbright=false)
 	{
-		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, fullbright: fullbright };
-		if (is_translucent)
-			translucent~=batch;
-		else
-			solid~=batch;
-		_current_translucent=is_translucent;
+		Begin(texture, is_translucent ? translucent_group : solid_group, is_translucent ? translucent_pipe : solid_pipe,
+			fullbright ? TextureMode.Fullbright : TextureMode.Normal);
+	}
+
+	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode)
+	{
+		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe };
+		groups[group]~=batch;
+		_current=group;
 	}
 
 	void Add(const ref ObjectVertex vertex)
 	{
 		vertices~=vertex;
-		(_current_translucent ? translucent : solid)[$-1].vertex_count++;
+		groups[_current][$-1].vertex_count++;
 	}
 
 	// drops the current batch if nothing was added to it
 	void End()
 	{
-		ObjectBatch[]* list=_current_translucent ? &translucent : &solid;
+		ObjectBatch[]* list=&groups[_current];
 		if ((*list).length && (*list)[$-1].vertex_count==0)
 			(*list).length--;
 	}
 
 private:
-	bool _current_translucent;
+	DrawGroup _current;
 }

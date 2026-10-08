@@ -4,7 +4,7 @@ layout(set=0, binding=1) uniform sampler tex_sampler;
 layout(set=1, binding=0) uniform texture2D tex;
 
 layout(push_constant) uniform PushConstants {
-	vec4 light_scale_fullbright; // w: 1 if the bound texture is DTX_FULLBRITE
+	vec4 light_scale_mode; // w: 0 normal texture, 1 DTX_FULLBRITE texture, 2 untextured (lines, polygrids without a sprite)
 } pc;
 
 layout(location=0) in vec4 colour_in;
@@ -14,9 +14,16 @@ layout(location=0) out vec4 colour_out;
 
 void main()
 {
+	if (pc.light_scale_mode.w>1.5)
+	{
+		// no texture bound: the diffuse colour alone
+		colour_out=colour_in;
+		return;
+	}
+
 	vec4 texel=texture(sampler2D(tex, tex_sampler), uv_in);
 
-	if (pc.light_scale_fullbright.w>0.5)
+	if (pc.light_scale_mode.w>0.5)
 	{
 		// fullbright textures: alpha marks the fullbright texels (palette 246..255), which d3d.ren draws again
 		// with DECAL + alpha blending, i.e. at full texture colour (blood2_recon port_notes/model.md)

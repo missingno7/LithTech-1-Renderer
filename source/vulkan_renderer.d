@@ -20,7 +20,8 @@ import Texture;
 import vk.Surface: ImageSurface;
 import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
 import SceneGeometry: ObjectGeometry;
-import LTObjects: LTObject;
+import LTObjects: LTObject, DynamicLight;
+import EffectsDraw: EffectView;
 
 File test_out; //import Main: test_out;
 
@@ -240,6 +241,7 @@ private:
 	VkPipelineLayout _pipeline_layout;
 
 	VkPipeline _pipeline;
+	VkPipeline _pipeline_depth_only; // sky portals: depth, no colour
 
 	VkSemaphore _is_image_available;
 	VkSemaphore _is_render_finished;
@@ -269,6 +271,7 @@ public:
 			vkDestroyFramebuffer(g_Device, buffer.framebuffer, null);
 
 		vkDestroyPipeline(g_Device, _pipeline, null);
+		vkDestroyPipeline(g_Device, _pipeline_depth_only, null);
 
 		vkDestroyPipelineLayout(g_Device, _pipeline_layout, null);
 		vkDestroyRenderPass(g_Device, _render_pass, null);
@@ -374,10 +377,10 @@ public:
 
 	float[3] _global_light_scale=[1f, 1f, 1f]; // SceneDesc GlobalLightScale of the last scene
 
-	// shader.frag / object.frag push constants: GlobalLightScale, fullbright flag
-	void PushBatchConstants(VkCommandBuffer buffer, bool fullbright)
+	// shader.frag / object.frag push constants: GlobalLightScale, texture mode (0 normal, 1 fullbright, 2 untextured)
+	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode)
 	{
-		const float[4] constants=[_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], fullbright ? 1f : 0f];
+		const float[4] constants=[_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], texture_mode];
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
 	}
 
@@ -691,11 +694,9 @@ LAB_0004814b:
 				vkBeginCommandBuffer(buffer, &command_buffer_begin_info);
 				RecordOverlayCopy(buffer);
 				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
 
 				// dynamic state of the world pipeline
 				SetViewport(buffer, _scene_viewport);
-				vkCmdSetLineWidth(buffer, 1f);
 
 				// the render pass clears to black (the bars around the mode's area); debug builds show holes in the
 				// world in a loud colour instead
@@ -710,9 +711,14 @@ LAB_0004814b:
 					vkCmdClearAttachments(buffer, 1, &clear_attachment, 1, &clear_rect);
 				}
 
+				// d3d.ren draws the sky before any world geometry, without depth (port_notes/sky.md)
+				RecordObjectDraws(buffer, image_index, true);
+
+				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+				vkCmdSetLineWidth(buffer, 1f);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
-				PushBatchConstants(buffer, false);
+				PushBatchConstants(buffer, 0f);
 
 				if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
 				{
@@ -724,35 +730,49 @@ LAB_0004814b:
 
 					WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
 
-					size_t index_start=0;
-
-					RenderTexture last_texture=null;
-
-					foreach(i, polygon; bsp.polygons[0..bsp.polygon_count])
+					// the index buffer holds every visible polygon in order; sky_portals selects which ones a pass draws
+					void DrawPolygons(bool sky_portals)
 					{
-						if (polygon.surface.flags & SurfaceFlags.Invisible)
-							continue;
+						size_t index_start=0;
+						RenderTexture last_texture=null;
+						bool first=true;
 
-						// unbound (or never bound) textures fall back to the dummy texture
-						SharedTexture* shared_texture=polygon.surface.shared_texture;
-						RenderTexture this_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
-						if (last_texture !is this_texture)
+						foreach(i, polygon; bsp.polygons[0..bsp.polygon_count])
 						{
-							last_texture=this_texture;
-							VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
-							vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
-							PushBatchConstants(buffer, this_texture && this_texture.fullbright);
-						}
+							if (polygon.surface.flags & SurfaceFlags.Invisible)
+								continue;
 
-						int vert_count=(polygon.DiskVerts().length-2)*3;
-						vkCmdDrawIndexed(buffer, vert_count, 1, index_start, 0, 0);
-						index_start+=vert_count;
+							const int vert_count=(polygon.DiskVerts().length-2)*3;
+							scope(exit) index_start+=vert_count;
+
+							if (((polygon.surface.flags & SurfaceFlags.Sky)!=0)!=sky_portals)
+								continue;
+
+							// unbound (or never bound) textures fall back to the dummy texture
+							SharedTexture* shared_texture=polygon.surface.shared_texture;
+							RenderTexture this_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
+							if (!sky_portals && (first || last_texture !is this_texture))
+							{
+								first=false;
+								last_texture=this_texture;
+								VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
+								vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
+								PushBatchConstants(buffer, (this_texture && this_texture.fullbright) ? 1f : 0f);
+							}
+
+							vkCmdDrawIndexed(buffer, vert_count, 1, index_start, 0, 0);
+						}
 					}
+
+					// sky portals are never drawn in d3d.ren, so the sky shows through them; here they write depth only, which
+					// keeps world geometry behind them (that d3d.ren's visibility wouldn't draw) from covering the sky
+					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_depth_only);
+					DrawPolygons(true);
+					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+					DrawPolygons(false);
 				}
 
-				//vkCmdDrawIndexed(buffer, index_count, 1, 0, 0, 0);
-
-				RecordObjectDraws(buffer, image_index);
+				RecordObjectDraws(buffer, image_index, false);
 				RecordOverlayDraw(buffer);
 
 				vkCmdEndRenderPass(buffer);
@@ -817,8 +837,8 @@ LAB_0004814b:
 			// polygrid, line system, container), object vertices
 			uint[9] objects_per_frame=_object_type_counts[1..$];
 			objects_per_frame[]/=_fps_frames;
-			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
-				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames);
+			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
+				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count);
 			test_out.flush();
 			_object_type_counts[]=0;
 			_scene_count=0;
@@ -1268,8 +1288,8 @@ LAB_0004814b:
 	uint _scene_count;
 	size_t _object_vertex_count;
 
-	VkPipeline _object_pipeline_solid;
-	VkPipeline _object_pipeline_translucent;
+	import SceneGeometry: ObjectPipe;
+	VkPipeline[ObjectPipe.max+1] _object_pipelines;
 	VkShaderModule _object_vert_shader;
 	VkShaderModule _object_frag_shader;
 
@@ -1310,10 +1330,22 @@ LAB_0004814b:
 			g_DisableVertexAnimation=ConsoleFloat("d_ModelVertexAnim", 1f)==0f;
 		}
 
+		import EffectsDraw;
+		import SceneGeometry: DrawGroup, ObjectPipe;
+		import WorldModelDraw: DrawSkyWorldModel;
+
+		float ConsoleFloat(const(char)* name, float default_value)
+		{
+			void* variable=_renderer.GetConsoleVar(name);
+			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
+		}
+
 		MainWorld* world=g_RenderContext ? g_RenderContext.main_world : null;
+		const bool normal_mode=scene_desc.draw_mode!=DrawMode.ObjectList;
 
 		// the fixed model light comes from above and behind the camera (port_notes/model.md, Lighting)
 		const Mat4 camera=QuatToMatrix(scene_desc.camera_rotation);
+		const float[3] right=[camera.m[0][0], camera.m[1][0], camera.m[2][0]];
 		const float[3] up=[camera.m[0][1], camera.m[1][1], camera.m[2][1]];
 		const float[3] forward=[camera.m[0][2], camera.m[1][2], camera.m[2][2]];
 		const float[3] light_direction=Normalised([2f*up[0]-forward[0], 2f*up[1]-forward[1], 2f*up[2]-forward[2]]);
@@ -1322,6 +1354,36 @@ LAB_0004814b:
 		{
 			return EnsureTextureBound(texture);
 		}
+
+		// the frame's dynamic lights (d3d_CalcLightAdd's list), gathered from the world; object-list scenes reuse them
+		if (normal_mode && world && world.world_bsp)
+		{
+			_scene_lights.length=0;
+			_scene_lights.assumeSafeAppend();
+			ForEachWorldObject(world.world_bsp, (LTObject* object) {
+				if (object.type==ObjectType.Light && (object.flags & ObjectFlag.Visible) && !(object.flags & ObjectFlag.SkyObject))
+					_scene_lights~=DynamicLight(object.pos, [cast(float)object.r, cast(float)object.g, cast(float)object.b], At!float(object, LightRadiusOffset));
+			});
+		}
+
+		import std.math: tan;
+		EffectView view={
+			camera: scene_desc.camera_position.vector,
+			right: right, up: up, forward: forward,
+			offset: [0f, 0f, 0f],
+			tan_half_fov_x: tan(fov_x*0.5f), tan_half_fov_y: tan(fov_y*0.5f),
+			near_z: 0.1f, far_z: scene_desc.far_clipping_plane>0f ? scene_desc.far_clipping_plane : 15000f,
+			sky: false,
+			world: world,
+			lights: _scene_lights,
+			light_scale: scene_desc.global_light_scale.vector,
+			resolve_texture: &ResolveTexture
+		};
+
+		const bool draw_sprites=ConsoleFloat("DrawSprites", 1f)!=0f;
+		const bool draw_particles=ConsoleFloat("DrawParticles", 1f)!=0f;
+		const bool draw_polygrids=ConsoleFloat("DrawPolyGrids", 1f)!=0f;
+		const bool draw_line_systems=ConsoleFloat("DrawLineSystems", 1f)!=0f;
 
 		void Process(LTObject* object)
 		{
@@ -1335,14 +1397,32 @@ LAB_0004814b:
 			switch(object.type)
 			{
 				case ObjectType.Model:
+					_objects.Route(DrawGroup.SolidModels, ObjectPipe.Opaque, DrawGroup.TranslucentModels, ObjectPipe.Blend);
 					DrawModel(_objects, object, scene_desc, world, light_direction, &ResolveTexture);
 					break;
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
+					_objects.Route(DrawGroup.SolidWorldModels, ObjectPipe.Opaque, DrawGroup.TranslucentWorldModels, ObjectPipe.Blend);
 					DrawWorldModel(_objects, object, scene_desc, &ResolveTexture);
 					break;
+				case ObjectType.Sprite:
+					if (draw_sprites)
+						DrawSprite(_objects, object, view);
+					break;
+				case ObjectType.ParticleSystem:
+					if (draw_particles)
+						DrawParticleSystem(_objects, object, view);
+					break;
+				case ObjectType.Polygrid:
+					if (draw_polygrids)
+						DrawPolyGrid(_objects, object, view);
+					break;
+				case ObjectType.LineSystem:
+					if (draw_line_systems)
+						DrawLineSystem(_objects, object, view);
+					break;
 				default:
-					break; // sprites, particles, world models, ... not ported yet
+					break; // lights, cameras, normal objects
 			}
 		}
 
@@ -1358,7 +1438,7 @@ LAB_0004814b:
 				Process(cast(LTObject*)_renderer.GetAttachmentObject(cast(BaseObject*)object, cast(Attachment*)attachment));
 		}
 
-		if (scene_desc.draw_mode==DrawMode.ObjectList)
+		if (!normal_mode)
 		{
 			if (scene_desc.obj_list_head)
 				foreach(object; (cast(LTObject**)scene_desc.obj_list_head)[0..scene_desc.obj_count])
@@ -1366,7 +1446,85 @@ LAB_0004814b:
 		}
 		else if (world && world.world_bsp)
 		{
-			ForEachWorldObject(world.world_bsp, &ProcessWithAttachments);
+			// the world tree's objects, without sky objects and polygrids (world_visibility.cpp r_CollectVisibleObjects)
+			ForEachWorldObject(world.world_bsp, (LTObject* object) {
+				if (object.type!=ObjectType.Polygrid && !(object.flags & ObjectFlag.SkyObject))
+					ProcessWithAttachments(object);
+			});
+
+			// polygrids come from the leaves' object lists (r_VLTagPolies); without visibility, every leaf's
+			ForEachLeafObject(world.world_bsp, (LTObject* object) {
+				if (object.type==ObjectType.Polygrid && !(object.flags & ObjectFlag.SkyObject))
+					ProcessWithAttachments(object);
+			});
+
+			CollectSky(scene_desc, view, &ResolveTexture, ConsoleFloat("DrawSky", 1f)!=0f);
+		}
+	}
+
+	DynamicLight[] _scene_lights;
+	int _sky_object_count; // of the last normal scene, for the log
+
+	// d3d.ren r_DrawSky / sky-object pass (port_notes/sky.md): the sky objects seen from a sky camera that moves through
+	// the sky box (SkyDef ViewMin..ViewMax) in proportion to the camera's position in the level, with the main camera's
+	// rotation and FOV. Drawn first, without depth, so the world covers it everywhere but the sky portals.
+	void CollectSky(SceneDesc* scene_desc, EffectView main_view, RenderTexture delegate(SharedTexture*) resolve,
+		bool draw_sky)
+	{
+		import LTObjects;
+		import EffectsDraw;
+		import SceneGeometry: DrawGroup, ObjectPipe;
+		import WorldModelDraw: DrawSkyWorldModel;
+		import Main: g_RenderContext;
+		import Objects.BaseObject: ObjectType;
+
+		_sky_object_count=scene_desc.sky_objects ? scene_desc.sky_object_count : 0;
+		if (!draw_sky || scene_desc.sky_objects is null || scene_desc.sky_object_count<=0)
+			return;
+
+		WorldBsp* bsp=(g_RenderContext && g_RenderContext.main_world) ? g_RenderContext.main_world.world_bsp : null;
+
+		// r_SetupSkyStuff: the fraction of the camera's way through the world's box, per axis
+		float[3] fraction=[0.5f, 0.5f, 0.5f];
+		if (bsp && scene_desc.draw_mode==DrawMode.Normal)
+			foreach(axis; 0..3)
+			{
+				const float extent=bsp.extents_max.vector[axis]-bsp.extents_min.vector[axis];
+				if (extent!=0f)
+					fraction[axis]=(main_view.camera[axis]-bsp.extents_min.vector[axis])/extent;
+			}
+
+		const float[3] view_min=scene_desc.sky_def[2], view_max=scene_desc.sky_def[3];
+		float[3] sky_camera;
+		foreach(axis; 0..3)
+			sky_camera[axis]=view_min[axis]+(view_max[axis]-view_min[axis])*fraction[axis];
+
+		EffectView view=main_view;
+		view.sky=true;
+		view.camera=sky_camera;
+		view.offset=[main_view.camera[0]-sky_camera[0], main_view.camera[1]-sky_camera[1], main_view.camera[2]-sky_camera[2]];
+
+		// in SceneDesc order, painter's algorithm; only sprites, polygrids and world models
+		foreach(object; (cast(LTObject**)scene_desc.sky_objects)[0..scene_desc.sky_object_count])
+		{
+			if (object is null || !(object.flags & ObjectFlag.Visible))
+				continue;
+
+			switch(object.type)
+			{
+				case ObjectType.Sprite:
+					DrawSprite(_objects, object, view);
+					break;
+				case ObjectType.Polygrid:
+					DrawPolyGrid(_objects, object, view);
+					break;
+				case ObjectType.WorldModel:
+					_objects.Route(DrawGroup.Sky, ObjectPipe.OpaqueNoZ, DrawGroup.Sky, ObjectPipe.BlendNoZ);
+					DrawSkyWorldModel(_objects, object, scene_desc, sky_camera, view.offset, resolve);
+					break;
+				default:
+					break; // models, particles, line systems are ignored in the sky
+			}
 		}
 	}
 
@@ -1375,13 +1533,17 @@ LAB_0004814b:
 		_object_vert_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("object_vert.spv"));
 		_object_frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("object_frag.spv"));
 
-		_object_pipeline_solid=CreateObjectPipeline(false);
-		_object_pipeline_translucent=CreateObjectPipeline(true);
+		foreach(pipe; 0..ObjectPipe.max+1)
+			_object_pipelines[pipe]=CreateObjectPipeline(cast(ObjectPipe)pipe);
 	}
 
-	VkPipeline CreateObjectPipeline(bool translucent)
+	VkPipeline CreateObjectPipeline(ObjectPipe pipe)
 	{
 		import SceneGeometry: ObjectVertex;
+
+		const bool blend=pipe==ObjectPipe.Blend || pipe==ObjectPipe.BlendNoZ || pipe==ObjectPipe.Lines;
+		const bool depth_test=pipe==ObjectPipe.Opaque || pipe==ObjectPipe.Blend || pipe==ObjectPipe.Lines;
+		const bool depth_write=pipe==ObjectPipe.Opaque;
 
 		VkPipelineShaderStageCreateInfo[] shader_stages=[
 			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _object_vert_shader, pName: "main" },
@@ -1398,7 +1560,7 @@ LAB_0004814b:
 		};
 
 		VkPipelineInputAssemblyStateCreateInfo input_assembly_info={
-			topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+			topology: pipe==ObjectPipe.Lines ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
 		};
 
 		VkPipelineViewportStateCreateInfo viewport_state_info={
@@ -1420,13 +1582,13 @@ LAB_0004814b:
 		};
 
 		VkPipelineDepthStencilStateCreateInfo depth_stencil_info={
-			depthTestEnable: VK_TRUE,
-			depthWriteEnable: translucent ? VK_FALSE : VK_TRUE,
-			depthCompareOp: VK_COMPARE_OP_LESS
+			depthTestEnable: depth_test ? VK_TRUE : VK_FALSE,
+			depthWriteEnable: depth_write ? VK_TRUE : VK_FALSE,
+			depthCompareOp: VK_COMPARE_OP_LESS_OR_EQUAL // D3D's default ZFUNC; a polygrid's env pass redraws at equal depth
 		};
 
 		VkPipelineColorBlendAttachmentState colour_blend_attachment={
-			blendEnable: translucent ? VK_TRUE : VK_FALSE,
+			blendEnable: blend ? VK_TRUE : VK_FALSE,
 			srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
 			dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 			colorBlendOp: VK_BLEND_OP_ADD,
@@ -1466,14 +1628,14 @@ LAB_0004814b:
 
 		VkPipeline pipeline;
 		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &pipeline),
-			translucent ? "vkCreateGraphicsPipelines (objects, translucent)" : "vkCreateGraphicsPipelines (objects, solid)");
+			"vkCreateGraphicsPipelines (objects)");
 		return pipeline;
 	}
 
 	void DestroyObjectRendering()
 	{
-		vkDestroyPipeline(g_Device, _object_pipeline_solid, null);
-		vkDestroyPipeline(g_Device, _object_pipeline_translucent, null);
+		foreach(pipeline; _object_pipelines)
+			vkDestroyPipeline(g_Device, pipeline, null);
 		vkDestroyShaderModule(g_Device, _object_vert_shader, null);
 		vkDestroyShaderModule(g_Device, _object_frag_shader, null);
 		DestroyAllocBuffer(g_Allocator, _object_vertex_buffer);
@@ -1520,45 +1682,47 @@ LAB_0004814b:
 		vmaUnmapMemory(_object_vertex_memory);
 	}
 
-	// recorded inside the render pass, after the world
-	void RecordObjectDraws(VkCommandBuffer buffer, uint image_index)
+	// recorded inside the render pass: the sky group before the world (sky = true), every other group after it
+	void RecordObjectDraws(VkCommandBuffer buffer, uint image_index, bool sky)
 	{
-		import SceneGeometry: ObjectBatch;
+		import SceneGeometry: ObjectBatch, DrawGroup, TextureMode;
 
 		if (_objects.vertices.length==0 || _object_vertex_buffer==VK_NULL_ND_HANDLE)
 			return;
 
 		VkDeviceSize offset=0;
 		vkCmdBindVertexBuffers(buffer, 0, 1, &_object_vertex_buffer, &offset);
+		SetViewport(buffer, _scene_viewport);
 
-		void DrawBatches(VkPipeline pipeline, ObjectBatch[] batches)
+		ObjectPipe bound_pipe=ObjectPipe.max;
+		bool pipe_bound=false;
+		VkDescriptorSet bound_texture=VK_NULL_ND_HANDLE;
+
+		const size_t first_group=sky ? DrawGroup.Sky : DrawGroup.SolidModels;
+		const size_t end_group=sky ? DrawGroup.Sky+1 : DrawGroup.max+1;
+		foreach(group; first_group..end_group)
 		{
-			if (batches.length==0)
-				return;
-
-			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-			SetViewport(buffer, _scene_viewport);
-
-			vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
-
-			VkDescriptorSet bound=VK_NULL_ND_HANDLE;
-			foreach(ref batch; batches)
+			foreach(ref batch; _objects.groups[group])
 			{
+				if (!pipe_bound || batch.pipe!=bound_pipe)
+				{
+					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _object_pipelines[batch.pipe]);
+					if (!pipe_bound)
+						vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
+					bound_pipe=batch.pipe;
+					pipe_bound=true;
+				}
+
 				VkDescriptorSet texture=batch.texture!=VK_NULL_ND_HANDLE ? batch.texture : _texture_descriptor;
-				if (texture!=bound)
+				if (texture!=bound_texture)
 				{
 					vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture, 0, null);
-					bound=texture;
+					bound_texture=texture;
 				}
-				PushBatchConstants(buffer, batch.fullbright);
+				PushBatchConstants(buffer, batch.mode==TextureMode.Fullbright ? 1f : batch.mode==TextureMode.Untextured ? 2f : 0f);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
-
-		// d3d_FlushObjectQueues: solid before translucent
-		DrawBatches(_object_pipeline_solid, _objects.solid);
-		DrawBatches(_object_pipeline_translucent, _objects.translucent);
 	}
 
 private:
@@ -2066,6 +2230,12 @@ private:
 
 		vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_pipeline);
 		test_out.writeln("Graphics Pipeline created.");
+
+		// the same with colour writes off and both faces, for the sky portals
+		colour_blend_attachment.colorWriteMask=0;
+		rasterizer_info.cullMode=VK_CULL_MODE_NONE;
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_pipeline_depth_only),
+			"vkCreateGraphicsPipelines (sky portals)");
 	}
 
 	void CreateFramebuffers()

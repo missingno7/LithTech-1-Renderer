@@ -126,9 +126,11 @@ ubyte[] TransitionTexturePixels(TextureData* texture, out int width, out int hei
 			pixel_alpha=(pixel>=246) ? 0xFF : 0;
 		if (texture.header.flags & DtxFlags.AlphaMasks)
 		{
+			// 4 bits per texel, two per byte: the low nibble is the even (left) texel, the high nibble the odd one
+			// (blood2_recon port_notes/world.md 6.3)
 			pixel_alpha=texture.mipmap_data[0].alpha[i/2];
 			if (i & 1)
-				pixel_alpha>>=2;
+				pixel_alpha>>=4;
 			pixel_alpha&=0xF;
 			pixel_alpha|=pixel_alpha << 4;
 		}

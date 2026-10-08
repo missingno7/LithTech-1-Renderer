@@ -19,9 +19,16 @@ ref T At(T)(const(void)* base, size_t offset)
 enum ObjectFlag : uint
 {
 	Visible=0x1,
+	PolyGridUnsigned=0x2, // polygrids: samples are uint8 (else int8)
 	ModelTint=0x4,
+	RotateableSprite=0x8,
+	GlowSprite=0x20, // sprites; on polygrids 0x20 means "environment map only"
+	PolyGridEnvOnly=0x20,
 	ReallyClose=0x40,
+	SpriteBias=0x40,
+	SpriteNoZ=0x80,
 	NoLight=0x200,
+	SkyObject=0x1000, // drawn only by the sky pass, from SceneDesc's sky list
 }
 
 // DObject header, ABI 4.1 (0x128 bytes; subclass data follows)
@@ -86,6 +93,34 @@ void ForEachWorldObject(WorldBsp* bsp, scope void delegate(LTObject*) fn)
 	}
 }
 
+//// Leaf object lists, ABI 2.3 / 2.4: Leaf +0x14 is a DLink sentinel whose links carry an object-tree record with the
+//// object at +0x18 (recon world_visibility.cpp r_VLTagPolies). Polygrids are found only this way.
+
+enum size_t WorldBspLeavesOffset=0x30, WorldBspLeafCountOffset=0x34, LeafSize=0x30, LeafObjectsOffset=0x14,
+	LeafRecordObjectOffset=0x18;
+
+void ForEachLeafObject(WorldBsp* bsp, scope void delegate(LTObject*) fn)
+{
+	ubyte* leaves=At!(ubyte*)(bsp, WorldBspLeavesOffset);
+	const uint leaf_count=At!uint(bsp, WorldBspLeafCountOffset);
+	if (leaves is null)
+		return;
+
+	foreach(i; 0..leaf_count)
+	{
+		DLink* sentinel=cast(DLink*)(leaves+i*LeafSize+LeafObjectsOffset);
+		uint guard=0;
+		for (DLink* link=sentinel.next; link !is null && link!=sentinel && guard<100_000; link=link.next, ++guard)
+		{
+			if (link.data is null)
+				continue;
+			LTObject* object=At!(LTObject*)(link.data, LeafRecordObjectOffset);
+			if (object !is null)
+				fn(object);
+		}
+	}
+}
+
 //// Matrices: row-major, column vectors (translation in m[i][3]), like the LT1 DMatrix
 
 struct Mat4
@@ -143,6 +178,62 @@ Mat4 QuatToMatrix(const float[4] q)
 	r.m[1][0]=xy+wz;      r.m[1][1]=1f-(xx+zz); r.m[1][2]=yz-wx;
 	r.m[2][0]=xz-wy;      r.m[2][1]=yz+wx;      r.m[2][2]=1f-(xx+yy);
 	return r;
+}
+
+// d3d_SetupTransformation (recon common/transform.cpp): rotation with its columns scaled, then the translation.
+// Unlike the model path there is no handedness flip. The original also resets out-of-range quaternion components in
+// place; this works on a copy.
+Mat4 SetupTransformation(const float[3] pos, const float[4] rotation, const float[3] scale)
+{
+	enum float RotationMax=2f; // a unit quaternion's components are within ±1; anything else is garbage
+
+	float[4] q=rotation;
+	foreach(i; 0..3)
+		if (!(q[i]>=-RotationMax && q[i]<=RotationMax))
+			q[i]=0f;
+	if (!(q[3]>=-RotationMax && q[3]<=RotationMax))
+		q[3]=1f;
+
+	Mat4 r=QuatToMatrix(q);
+	foreach(row; 0..3)
+	{
+		r.m[row][0]*=scale[0];
+		r.m[row][1]*=scale[1];
+		r.m[row][2]*=scale[2];
+		r.m[row][3]=pos[row];
+	}
+	return r;
+}
+
+//// Dynamic lights, ABI 4.9: colour from the header, radius at +0x128
+
+enum size_t LightRadiusOffset=0x128;
+
+struct DynamicLight
+{
+	float[3] pos;
+	float[3] colour; // 0..255
+	float radius;
+}
+
+// d3d_CalcLightAdd (recon common/3d_ops.cpp): (2c - 255) * 0.7 * (1 - d/r) per light, summed; 0..255 scale
+float[3] CalcLightAdd(const float[3] pos, const DynamicLight[] lights)
+{
+	import std.math: sqrt;
+
+	float[3] add=[0f, 0f, 0f];
+	foreach(ref light; lights)
+	{
+		const float dx=light.pos[0]-pos[0], dy=light.pos[1]-pos[1], dz=light.pos[2]-pos[2];
+		const float distance_squared=dx*dx+dy*dy+dz*dz;
+		if (distance_squared>=light.radius*light.radius)
+			continue;
+
+		const float percent=(1f-sqrt(distance_squared)/light.radius)*0.7f;
+		foreach(channel; 0..3)
+			add[channel]+=(light.colour[channel]-(255f-light.colour[channel]))*percent;
+	}
+	return add;
 }
 
 float[3] Normalised(float[3] v, float[3] fallback=[1f, 0f, 0f])
