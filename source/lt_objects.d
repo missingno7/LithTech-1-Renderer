@@ -164,7 +164,8 @@ struct Mat4
 	}
 }
 
-// d3d.ren 0x3e1d0 / quat_ConvertToMatrix; q is x, y, z, w
+// quat_ConvertToMatrix, used for object, camera and d3d_SetupTransformation rotations; q is x, y, z, w. Model node
+// rotations use d3d.ren's 0x3e1d0 instead, which is this transposed (ModelDraw.KeyRotation conjugates the quaternion).
 Mat4 QuatToMatrix(const float[4] q)
 {
 	const float s=2f/(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);

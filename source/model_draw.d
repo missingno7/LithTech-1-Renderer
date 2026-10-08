@@ -312,9 +312,9 @@ struct PoseContext
 	}
 }
 
-// Animation keys rotate the opposite way to object rotations: blood2_recon's ours_D3DQuatToMatrix (0x3e1d0) uses
-// them as stored, but compared against d3d.ren in the opening cutscene that splays limbs and loses heads; the
-// conjugate (= transposed rotation matrix) matches. Likely the native pose uses quat_ConvertToMatrixTransposed.
+// Node rotations use d3d.ren's quaternion-to-matrix at 0x3e1d0, which is the transpose of the standard one (strict in
+// blood2_recon since 2026-10-08, port_notes/model.md). The transpose of a rotation is the rotation by the conjugate.
+// Found here first by comparing the opening cutscene with d3d.ren: the untransposed form splays limbs and loses heads.
 float[4] KeyRotation(const float[4] q)
 {
 	return [-q[0], -q[1], -q[2], q[3]];

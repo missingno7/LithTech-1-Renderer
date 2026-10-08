@@ -103,20 +103,47 @@ struct SharedTexture
 	static assert(file_stream.offsetof==0x20);
 }
 
+// the size of a mip level: the top size halved per level, at least 1
+uint MipSize(uint top, uint mip)
+{
+	const uint size=top >> mip;
+	return size ? size : 1;
+}
+
+// how many of the DTX's mip levels can be uploaded: present, and halving in size like Vulkan expects (d3d.ren uploads up
+// to 4, blood2_recon port_notes/world.md 6.4)
+uint UsableMipCount(TextureData* texture)
+{
+	uint count=1;
+	foreach(mip; 1..DtxMipMapCount)
+	{
+		const auto data=&texture.mipmap_data[mip];
+		if (mip>=texture.header.mipmap_count || data.pixels is null)
+			break;
+		if (data.width!=MipSize(texture.header.width, mip) || data.height!=MipSize(texture.header.height, mip))
+			break;
+		if ((texture.header.flags & DtxFlags.AlphaMasks) && data.alpha is null)
+			break;
+		count++;
+	}
+	return count;
+}
+
 /+
  + converts 8-bit indexed ARGB4888 to RGBA8888
  +/
-ubyte[] TransitionTexturePixels(TextureData* texture, out int width, out int height, out int channels /+ bytes per pixel? +/, ubyte rotate=0)
+ubyte[] TransitionTexturePixels(TextureData* texture, out int width, out int height, out int channels /+ bytes per pixel? +/, ubyte rotate=0,
+	uint mip=0)
 {
-	width=texture.header.width;
-	height=texture.header.height;
+	width=MipSize(texture.header.width, mip);
+	height=MipSize(texture.header.height, mip);
 	channels=4;
 
 	size_t image_size=width*height*channels;
 	// get pixels
 	ubyte[] pixels=new ubyte[image_size];
 	uint[] pixel_view=(cast(uint*)pixels.ptr)[0..(image_size/4)];
-	foreach(i, pixel; texture.mipmap_data[0].pixels[0..(image_size/4)])
+	foreach(i, pixel; texture.mipmap_data[mip].pixels[0..(image_size/4)])
 	{
 		Colour pixel_colour=texture.palette.colours[pixel];
 		ubyte pixel_alpha=0xFF;
@@ -128,7 +155,7 @@ ubyte[] TransitionTexturePixels(TextureData* texture, out int width, out int hei
 		{
 			// 4 bits per texel, two per byte: the low nibble is the even (left) texel, the high nibble the odd one
 			// (blood2_recon port_notes/world.md 6.3)
-			pixel_alpha=texture.mipmap_data[0].alpha[i/2];
+			pixel_alpha=texture.mipmap_data[mip].alpha[i/2];
 			if (i & 1)
 				pixel_alpha>>=4;
 			pixel_alpha&=0xF;
@@ -201,7 +228,8 @@ class RenderTexture
 		(cast(VulkanRenderer)_renderer_inst).CreateTextureImage(texture, image, memory);
 
 		VkComponentMapping map=VkComponentMapping(VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY);
-		image_view=(cast(VulkanRenderer)_renderer_inst).CreateImageView(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &map);
+		image_view=(cast(VulkanRenderer)_renderer_inst).CreateImageView(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &map,
+			UsableMipCount(data));
 
 		(cast(VulkanRenderer)_renderer_inst).CreateTextureDescriptorSet(image_view, texture_descriptor);
 

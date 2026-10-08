@@ -3046,30 +3046,54 @@ private:
 	{
 		if (TextureData* tex_data=texture.engine_data)
 		{
-			int width, height, channels;
+			import core.stdc.string: memcpy;
 
-			ubyte[] pixels=TransitionTexturePixels(tex_data, width, height, channels, 8);
-
-			size_t image_size=width*height*channels;
+			// every usable mip level from the DTX, packed one after another in the staging buffer
+			const uint mip_count=UsableMipCount(tex_data);
+			ubyte[][] levels=new ubyte[][mip_count];
+			uint[2][] sizes=new uint[2][mip_count];
+			size_t total_size=0;
+			foreach(mip; 0..mip_count)
+			{
+				int width, height, channels;
+				levels[mip]=TransitionTexturePixels(tex_data, width, height, channels, 8, mip);
+				sizes[mip]=[width, height];
+				total_size+=levels[mip].length;
+			}
 
 			VkBuffer staging_buffer;
 			VkMappedMemoryRange staging_memory;
 
-			CreateVkBuffer(image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging_buffer, staging_memory);
+			CreateVkBuffer(total_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging_buffer, staging_memory);
 
 			void* data;
-			vmaMapMemory(staging_memory, &data);
-			import core.stdc.string: memcpy;
-			memcpy(data, pixels.ptr, cast(size_t)image_size);
+			if (staging_buffer==VK_NULL_ND_HANDLE || vmaMapMemory(staging_memory, &data)!=VK_SUCCESS)
+				return;
+
+			VkBufferImageCopy[] regions=new VkBufferImageCopy[mip_count];
+			size_t offset=0;
+			foreach(mip; 0..mip_count)
+			{
+				memcpy(data+offset, levels[mip].ptr, levels[mip].length);
+				VkBufferImageCopy region={
+					bufferOffset: offset,
+					imageSubresource: { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, mipLevel: mip, baseArrayLayer: 0, layerCount: 1 },
+					imageExtent: { sizes[mip][0], sizes[mip][1], 1 }
+				};
+				regions[mip]=region;
+				offset+=levels[mip].length;
+			}
 			vmaUnmapMemory(staging_memory);
+			levels=null;
 
-			// free pixels
-			pixels=null;
+			CreateVkImage(sizes[0][0], sizes[0][1], VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture_img, texture_mem, mip_count);
+			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mip_count);
 
-			CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture_img, texture_mem);
-			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-			CopyBufferToImage(staging_buffer, texture_img, width, height);
-			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			VkCommandBuffer cmd_buffer=BeginSingleTimeCommands();
+			vkCmdCopyBufferToImage(cmd_buffer, staging_buffer, texture_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, cast(uint)regions.length, regions.ptr);
+			EndSingleTimeCommands(cmd_buffer);
+
+			TransitionImageLayout(texture_img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mip_count);
 
 			DestroyAllocBuffer(g_Allocator, staging_buffer);
 		}
@@ -3084,7 +3108,8 @@ private:
 		DestroyAllocImage(g_Allocator, image);
 	}
 
-	void CreateVkImage(uint width, uint height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, out VkImage image, out VkMappedMemoryRange memory)
+	void CreateVkImage(uint width, uint height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, out VkImage image, out VkMappedMemoryRange memory,
+		uint mip_levels=1)
 	{
 		VkImageCreateInfo image_info={
 			imageType: VK_IMAGE_TYPE_2D,
@@ -3093,7 +3118,7 @@ private:
 				height: height,
 				depth: 1
 			},
-			mipLevels: 1,
+			mipLevels: mip_levels,
 			arrayLayers: 1,
 			format: format,
 			tiling: tiling,
@@ -3137,7 +3162,7 @@ private:
 		vkFreeCommandBuffers(g_Device, _command_pool, 1, &command_buffer);
 	}
 
-	void TransitionImageLayout(VkImage image, VkFormat format, VkImageLayout layout_out, VkImageLayout layout_new)
+	void TransitionImageLayout(VkImage image, VkFormat format, VkImageLayout layout_out, VkImageLayout layout_new, uint mip_levels=1)
 	{
 		VkCommandBuffer cmd_buffer=BeginSingleTimeCommands();
 
@@ -3150,7 +3175,7 @@ private:
 			subresourceRange: {
 				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
 				baseMipLevel: 0,
-				levelCount: 1,
+				levelCount: mip_levels,
 				baseArrayLayer: 0,
 				layerCount: 1
 			},
@@ -3208,7 +3233,8 @@ private:
 
 	VkImageView _texture_image_view;
 
-	public VkImageView CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags, VkComponentMapping* colour_map=null)
+	public VkImageView CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspect_flags, VkComponentMapping* colour_map=null,
+		uint mip_levels=1)
 	{
 		VkImageViewCreateInfo view_info={
 			image: image,
@@ -3218,7 +3244,7 @@ private:
 			subresourceRange: {
 				aspectMask: aspect_flags,
 				baseMipLevel: 0,
-				levelCount: 1,
+				levelCount: mip_levels,
 				baseArrayLayer: 0,
 				layerCount: 1
 			}
@@ -3248,10 +3274,11 @@ private:
 			unnormalizedCoordinates: VK_FALSE,
 			compareEnable: VK_FALSE,
 			compareOp: VK_COMPARE_OP_ALWAYS,
-			mipmapMode: VK_SAMPLER_MIPMAP_MODE_LINEAR,
+			// d3d.ren: bilinear within a level, MIPFILTER POINT between the DTX's mip levels (port_notes/world.md 1)
+			mipmapMode: VK_SAMPLER_MIPMAP_MODE_NEAREST,
 			mipLodBias: 0f,
 			minLod: 0f,
-			maxLod: 0f
+			maxLod: VK_LOD_CLAMP_NONE
 		};
 		vkCreateSampler(g_Device, &create_info, null, &_texture_sampler);
 	}
