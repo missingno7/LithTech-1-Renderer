@@ -949,6 +949,86 @@ LAB_0004814b:
 		// 240 Hz), so with vsync on and no explicit cap, also pace frames at the display's refresh rate
 		if (_vsync && _max_fps==0)
 			_max_fps=DisplayRefreshRate();
+
+		// the game's speed above 100 fps: see ApplyGameSpeedFix
+		const bool game_speed_fix=ConsoleFloat("d_GameSpeedFix", 1f)!=0f;
+		if (game_speed_fix && !ApplyGameSpeedFix())
+		{
+			if (_max_fps==0 || _max_fps>GameSafeMaxFPS)
+				_max_fps=GameSafeMaxFPS;
+		}
+	}
+
+	//// Game speed above 100 fps
+	////
+	//// The game steps its server once per rendered frame with the real frame time, clamped to at least
+	//// MIN_FRAMETIME = 0.01 s (blood2_recon ServerMgr.cpp CServerMgr::Update). Above 100 fps every step still advances
+	//// game time by 10 ms, so physics, AI and cutscenes run fast: 2.4x at 240 fps. The server code exists twice: in
+	//// CLIENT.EXE (single player runs it in-process) and in Server.dll. In both the constant is read only by that clamp
+	//// (two instructions), so d_GameSpeedFix lowers it to 1 ms in memory, nothing on disk. If the game's code isn't the
+	//// expected one, frames are capped at 100 fps instead.
+
+	enum int GameSafeMaxFPS=100;
+	enum float GameSpeedMinFrameTime=0.001f;
+
+	struct FrameTimeClamp
+	{
+		string module_name; // null: the game executable
+		size_t constant_rva;
+		size_t[2] operand_rvas; // the two instructions' address operands
+	}
+	static immutable FrameTimeClamp[2] FrameTimeClamps=[
+		FrameTimeClamp(null, 0x80068, [0x564a7, 0x564c4]),            // CLIENT.EXE (Blood II 2.1)
+		FrameTimeClamp("server.dll", 0x42ba8, [0x26df1, 0x26e07]),    // Server.dll (Blood II 2.1)
+	];
+	bool _game_speed_mismatch_logged;
+
+	// true when the fix is in effect wherever the server code is loaded; false when it can't be applied
+	bool ApplyGameSpeedFix()
+	{
+		import std.string: toStringz;
+
+		bool ok=true;
+		foreach(ref clamp; FrameTimeClamps)
+		{
+			ubyte* image=cast(ubyte*)GetModuleHandleA(clamp.module_name ? clamp.module_name.toStringz : null);
+			if (image is null)
+				continue; // Server.dll is only loaded for a dedicated/remote setup
+
+			float* min_frame_time=cast(float*)(image+clamp.constant_rva);
+			const uint expected_reference=cast(uint)min_frame_time;
+
+			// both instructions must address this constant, else this isn't the build the fix is for
+			const bool matches=*cast(uint*)(image+clamp.operand_rvas[0])==expected_reference &&
+				*cast(uint*)(image+clamp.operand_rvas[1])==expected_reference &&
+				(*min_frame_time==0.01f || *min_frame_time==GameSpeedMinFrameTime);
+			if (!matches)
+			{
+				if (!_game_speed_mismatch_logged)
+				{
+					test_out.writeln("Game speed fix: ", clamp.module_name ? clamp.module_name : "the game executable",
+						" isn't the expected build, capping at ", GameSafeMaxFPS, " fps instead");
+					_game_speed_mismatch_logged=true;
+				}
+				ok=false;
+				continue;
+			}
+
+			if (*min_frame_time==GameSpeedMinFrameTime)
+				continue; // already applied to this load
+
+			uint old_protect;
+			if (!VirtualProtect(min_frame_time, float.sizeof, PAGE_READWRITE, &old_protect))
+			{
+				ok=false;
+				continue;
+			}
+			*min_frame_time=GameSpeedMinFrameTime;
+			VirtualProtect(min_frame_time, float.sizeof, old_protect, &old_protect);
+			test_out.writeln("Game speed fix: server minimum frame time 0.01 -> ", GameSpeedMinFrameTime, " s in ",
+				clamp.module_name ? clamp.module_name : "the game executable");
+		}
+		return ok;
 	}
 
 	int _refresh_rate=-1;
@@ -1000,6 +1080,7 @@ LAB_0004814b:
 	// per-second timing breakdown for the log, microseconds summed over the frames
 	enum Timing { Game, Scene, Acquire, Uniforms, Overlay, ObjectUpload, Record, Submit, Present, GpuWait }
 	long[Timing.max+1] _timing;
+	float _last_game_time=-1f;
 	MonoTime _t_frame_end;
 
 	import core.time: MonoTime, seconds;
@@ -1025,6 +1106,22 @@ LAB_0004814b:
 				_fog_enable, _fog_range, _fog_colour);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
+			{
+				// the local server's game clock against real time (g_pServerMgr CLIENT.EXE RVA 0x91728, m_GameTime +0x20c):
+				// 1.00 is normal speed
+				ubyte* exe=cast(ubyte*)GetModuleHandleA(null);
+				ubyte* server=*cast(ubyte**)(exe+0x91728);
+				if (server !is null && !IsBadReadPtr(server+0x20c, float.sizeof))
+				{
+					const float game_time=*cast(float*)(server+0x20c);
+					const double real_seconds=elapsed.total!"usecs"/1_000_000.0;
+					if (_last_game_time>=0f && game_time>=_last_game_time)
+						test_out.writefln("  game speed %.2fx (game clock %.2f s)", (game_time-_last_game_time)/real_seconds, game_time);
+					_last_game_time=game_time;
+				}
+				else
+					_last_game_time=-1f;
+			}
 			{
 				double Ms(Timing stage) { return _timing[stage]/1000.0/_fps_frames; }
 				test_out.writefln("  ms per frame: game %.2f, scene collect %.2f, acquire %.2f, uniforms %.2f, 2D convert %.2f, object upload %.2f, record %.2f, submit %.2f, present %.2f, GPU wait %.2f",

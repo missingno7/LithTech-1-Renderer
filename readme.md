@@ -60,6 +60,15 @@ Blood II levels turn fog on with ranges in world units (e.g. 700 to 2000). d3d.r
 Direct3D compares those ranges with the 0..1 device depth, and in practice nothing gets fogged. d_ren matches that by
 default. `d_FogMode 1` fogs by distance instead, as the level settings suggest was intended.
 
+### Game speed
+LithTech 1 steps the game simulation once per rendered frame, but never by less than 10 ms of game time
+(`MIN_FRAMETIME` in the server, which in single player runs inside `CLIENT.EXE`). Above 100 fps the game therefore runs
+fast: physics, AI and cutscenes at 2.4× speed at 240 fps. The original renderers have the same problem; the engine's
+own `MaxFPS` setting stops at 200. With `d_GameSpeedFix 1` d_ren lowers that floor to 1 ms in memory (nothing on disk is
+changed): the game runs at normal speed at 240 fps, measured from the server's own clock. If the game's code doesn't
+match the expected Blood II 2.1 build, d_ren caps the frame rate at 100 fps instead. `vk_test.txt` logs the measured
+game speed once a second.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
@@ -69,6 +78,7 @@ changes an option for the current session only; `+name value` also saves it.
 |---|---|---|
 | `d_VSync` | 1 | 1: present in sync with the display (FIFO), paced to its refresh rate; 0: unsynchronised (MAILBOX, else IMMEDIATE). |
 | `d_MaxFPS` | 0 | Frame cap; 0 = none (with `d_VSync 1`, the display's refresh rate). |
+| `d_GameSpeedFix` | 1 | Keeps the game at normal speed above 100 fps (see *Game speed* below). |
 | `d_Widescreen` | 1 | Hor+ FOV correction; 0 projects the game's FOV as given, like d3d.ren. |
 | `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
