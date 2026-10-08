@@ -13,6 +13,7 @@ struct ObjectVertex
 	float[3] pos; // world space
 	float[4] colour; // 0..1, alpha included
 	float[2] uv; // normalised (0..1 across the texture), as d3d.ren hands them to D3D
+	float[3] lightmap=[0f, 0f, 0f]; // atlas u, v (normalised) and 1 if lightmapped (solid world models)
 
 	static VkVertexInputBindingDescription GetBindingDescription()
 	{
@@ -24,12 +25,13 @@ struct ObjectVertex
 		return description;
 	}
 
-	static VkVertexInputAttributeDescription[3] GetAttributeDescriptions()
+	static VkVertexInputAttributeDescription[4] GetAttributeDescriptions()
 	{
 		return [
 			VkVertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, pos.offsetof),
 			VkVertexInputAttributeDescription(1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, colour.offsetof),
-			VkVertexInputAttributeDescription(2, 0, VK_FORMAT_R32G32_SFLOAT, uv.offsetof)
+			VkVertexInputAttributeDescription(2, 0, VK_FORMAT_R32G32_SFLOAT, uv.offsetof),
+			VkVertexInputAttributeDescription(3, 0, VK_FORMAT_R32G32B32_SFLOAT, lightmap.offsetof)
 		];
 	}
 }
@@ -48,6 +50,7 @@ enum DrawGroup
 	TranslucentWorldModels,
 	Sprites,
 	SpritesNoZ, // FLAG_SPRITE_NOZ: drawn last with the depth test off
+	LightAdd, // the camera's light add: an additive full-view quad after everything (d3d_draw.cpp r_DrawLightAddPoly)
 }
 
 // the object pipelines (vulkan_renderer.d CreateObjectPipeline)
@@ -58,13 +61,15 @@ enum ObjectPipe
 	BlendNoZ, // blended, no depth test or write (sky, no-Z sprites)
 	OpaqueNoZ, // no blend, no depth (solid sky objects)
 	Lines, // line list, blended, depth test, no depth write
+	Additive, // ONE / ONE, no depth (the light-add poly)
 }
 
 enum TextureMode : ubyte
 {
 	Normal,
-	Fullbright, // texture alpha marks fullbright texels
+	Fullbright, // texture alpha marks fullbright texels, drawn over the lit texel (models: DECAL pass)
 	Untextured, // white texture
+	WorldFullbright, // fullbright texels added on top (world surfaces: SRCALPHA / ONE or the lightmap pass's SRCALPHA / SRCCOLOR)
 }
 
 struct ObjectBatch

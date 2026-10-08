@@ -2,14 +2,15 @@ module WorldModelDraw;
 
 /+
  + World models (doors, lifts, signs, ...) and containers, after blood2_recon docs/seed_pass/port_notes/worldmodels.md:
- + the original BSP's polygons drawn through the engine-built local -> world transform, coloured by their pre-lit
- + vertex colours scaled by GlobalLightScale. Translucent iff the first surface of the current BSP has flag 0x8; then
- + the object's alpha applies, otherwise they are opaque.
+ + the original BSP's polygons drawn through the engine-built local -> world transform.
+ + - Solid world models are drawn like the world: lightmapped polygons (surface flag 0x80) as LM x GlobalLightScale x
+ +   texture, the others with their pre-lit vertex colours x GlobalLightScale plus the dynamic lights, and fullbright
+ +   texels added on top.
+ + - Translucent ones (first surface of the current BSP has flag 0x8) take one Gouraud-style pass with the object's
+ +   alpha: no lightmaps, no fullbright pass.
  +
- + Sky world models (port_notes/sky.md) use the same polygons, walked back to front through the original BSP from the
- + sky camera, and are moved by `offset` from the sky box into view of the main camera.
- +
- + Not ported yet: lightmaps on solid world models (they're lightmapped like the world), dynamic lights.
+ + Sky world models (port_notes/sky.md) use the same polygons without lightmaps, walked back to front through the
+ + original BSP from the sky camera, and are moved by `offset` from the sky box into view of the main camera.
  +/
 
 import LTObjects;
@@ -24,11 +25,16 @@ enum : size_t
 	WorldModelTransformOffset=0x12c, // local -> world, row-major with column vectors
 }
 
-void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene,
+// where each lightmapped polygon's block sits in the renderer's lightmap atlas (texels, inside the padding) and the
+// atlas' 1/width, 1/height; set when a level's world is loaded (main world and every world model's original BSP)
+__gshared uint[2][Polygon*] g_LightmapOrigins;
+__gshared float[2] g_LightmapAtlasScale=[1f, 1f];
+
+void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, const DynamicLight[] lights,
 	scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	WorldModelPolygons emitter;
-	if (!emitter.Setup(object, scene, [0f, 0f, 0f]))
+	if (!emitter.Setup(object, scene, [0f, 0f, 0f], false, lights))
 		return;
 
 	foreach(polygon; emitter.original.polygons[0..emitter.original.polygon_count])
@@ -42,7 +48,7 @@ void DrawSkyWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc*
 	const float[3] offset, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	WorldModelPolygons emitter;
-	if (!emitter.Setup(object, scene, offset))
+	if (!emitter.Setup(object, scene, offset, true, null))
 		return;
 
 	Node*[500] pending; // the native walk's fixed stack
@@ -81,14 +87,17 @@ private struct WorldModelPolygons
 	WorldBsp* original;
 	Mat4 transform;
 	bool translucent;
+	bool sky; // no lightmaps, no fullbright pass, no dynamic lights
 	float alpha;
 	float[3] scale;
 	float[3] offset;
+	const(DynamicLight)[] lights;
 
 	RenderTexture batch_texture;
+	TextureMode batch_mode;
 	bool batch_open;
 
-	bool Setup(LTObject* object, SceneDesc* scene, const float[3] offset_)
+	bool Setup(LTObject* object, SceneDesc* scene, const float[3] offset_, bool sky_, const DynamicLight[] lights_)
 	{
 		WorldData* data=At!(WorldData*)(object, WorldModelDataOffset);
 		if (data is null)
@@ -106,6 +115,8 @@ private struct WorldModelPolygons
 		alpha=translucent ? object.a/255f : 1f;
 		scale=scene.global_light_scale.vector;
 		offset=offset_;
+		sky=sky_;
+		lights=lights_;
 		return true;
 	}
 
@@ -119,13 +130,24 @@ private struct WorldModelPolygons
 			return;
 
 		RenderTexture texture=resolve_texture(polygon.surface.shared_texture);
-		if (!batch_open || texture !is batch_texture)
+
+		// the world's per-poly dispatch: solid world models only (translucent and sky ones are one Gouraud pass)
+		const bool world_path=!translucent && !sky;
+		const uint[2]* lightmap_origin=(world_path && (polygon.surface.flags & SurfaceFlags.LightMap)) ?
+			(polygon in g_LightmapOrigins) : null;
+		// a fullbright texture's alpha marks its fullbright texels, never opacity
+		const TextureMode mode=!(texture && texture.fullbright) ? TextureMode.Normal :
+			world_path ? TextureMode.WorldFullbright : TextureMode.Fullbright;
+
+		if (!batch_open || texture !is batch_texture || mode!=batch_mode)
 		{
 			if (batch_open)
 				geometry.End();
-			geometry.Begin(texture ? texture.texture_descriptor : typeof(texture.texture_descriptor).init, translucent,
-				texture && texture.fullbright);
+			geometry.Begin(texture ? texture.texture_descriptor : typeof(texture.texture_descriptor).init,
+				translucent ? geometry.translucent_group : geometry.solid_group,
+				translucent ? geometry.translucent_pipe : geometry.solid_pipe, mode);
 			batch_texture=texture;
+			batch_mode=mode;
 			batch_open=true;
 		}
 
@@ -136,14 +158,40 @@ private struct WorldModelPolygons
 		ObjectVertex Vertex(size_t i)
 		{
 			const auto source=&vertices[i];
-			float[3] pos=transform.TransformPoint([source.vertex_data.x, source.vertex_data.y, source.vertex_data.z]);
-			pos[]+=offset[];
-			ObjectVertex vertex={
-				pos: pos,
-				// pre-lit colour is stored b, g, r, a
-				colour: [source.colour[2]/255f*scale[0], source.colour[1]/255f*scale[1], source.colour[0]/255f*scale[2], alpha],
-				uv: [source.uv.x*u_scale, source.uv.y*v_scale]
-			};
+			const float[3] world_pos=transform.TransformPoint([source.vertex_data.x, source.vertex_data.y, source.vertex_data.z]);
+
+			ObjectVertex vertex;
+			vertex.pos=[world_pos[0]+offset[0], world_pos[1]+offset[1], world_pos[2]+offset[2]];
+			vertex.uv=[source.uv.x*u_scale, source.uv.y*v_scale];
+
+			if (lightmap_origin)
+			{
+				// pass A's diffuse is GlobalLightScale; the lightmap is multiplied in by the shader
+				vertex.colour=[scale[0], scale[1], scale[2], alpha];
+				vertex.lightmap=[(source.lightmap_uv.x+(*lightmap_origin)[0])*g_LightmapAtlasScale[0],
+					(source.lightmap_uv.y+(*lightmap_origin)[1])*g_LightmapAtlasScale[1], 1f];
+			}
+			else
+			{
+				// pre-lit colour is stored b, g, r, a; scaled, plus the dynamic lights' (2c - 255)(1 - d/r) in world space
+				float[3] colour=[source.colour[2]*scale[0], source.colour[1]*scale[1], source.colour[0]*scale[2]];
+				if (!sky)
+					foreach(ref light; lights)
+					{
+						import std.math: sqrt;
+						const float dx=light.pos[0]-world_pos[0], dy=light.pos[1]-world_pos[1], dz=light.pos[2]-world_pos[2];
+						const float distance=sqrt(dx*dx+dy*dy+dz*dz);
+						if (distance<light.radius)
+							foreach(channel; 0..3)
+								colour[channel]+=(2f*light.colour[channel]-255f)*(1f-distance/light.radius);
+					}
+				foreach(channel; 0..3)
+				{
+					const float c=colour[channel]/255f;
+					vertex.colour[channel]=c<0f ? 0f : c>1f ? 1f : c;
+				}
+				vertex.colour[3]=alpha;
+			}
 			return vertex;
 		}
 

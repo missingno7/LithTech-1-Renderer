@@ -9,7 +9,7 @@ module EffectsDraw;
  + - a billboard sprite's half extents are texture width/height x object scale,
  + - a particle's half size is 2 x its radius (half size in pixels = radius x FovXScale x view width / z).
  +
- + Not ported: sprite clipping to m_ClipperPoly, CoolFog, the (no-op) particle shadow pass.
+ + Not ported: CoolFog, the (no-op) particle shadow pass.
  +/
 
 import LTObjects;
@@ -70,6 +70,93 @@ enum : size_t
 {
 	SpriteAnimationOffset=0x12c,
 	SpriteFrameOffset=0x130, // -> { SharedTexture* }
+	SpriteClipperPolyOffset=0x13c, // HPOLY: world model index << 16 (0xffff = main world) | node index; 0xffffffff = none
+}
+
+// drawsprite.cpp r_ClipSprite: the quad is clipped against the planes through each edge of the clipper polygon; nothing is
+// drawn if the camera is behind the polygon or the handle doesn't resolve
+private ObjectVertex[] ClipToPolygon(const ObjectVertex[] quad, uint handle, const ref EffectView view)
+{
+	import WorldBsp: WorldBsp, WorldData, Polygon, Node;
+	import std.math: sqrt;
+
+	MainWorld* world=cast(MainWorld*)view.world;
+	if (world is null)
+		return null;
+
+	WorldBsp* bsp;
+	if ((handle >> 16)==0xFFFF)
+		bsp=world.world_bsp;
+	else
+	{
+		if ((handle >> 16)>=world.world_model_count || world.world_models is null)
+			return null;
+		WorldData* data=world.world_models[handle >> 16];
+		bsp=data ? data.objs[0] : null;
+	}
+	if (bsp is null || bsp.nodes is null || (handle & 0xFFFF)>=bsp.node_count)
+		return null;
+
+	Polygon* polygon=bsp.nodes[handle & 0xFFFF].polygons;
+	if (polygon is null || polygon.surface is null || polygon.surface.plane is null)
+		return null;
+
+	const float[3] normal=polygon.surface.plane.vector.vector;
+	if (Dot(normal, view.camera)-polygon.surface.plane.distance<=0.01f)
+		return null;
+
+	static ObjectVertex[] buffer_a, buffer_b; // reused
+	buffer_a.length=0;
+	buffer_a.assumeSafeAppend();
+	buffer_a~=quad;
+
+	auto points=polygon.DiskVerts();
+	if (points.length<3)
+		return null;
+
+	foreach(i; 0..points.length)
+	{
+		const float[3] previous=(*points[i==0 ? points.length-1 : i-1].vertex_data).xyz.vector;
+		const float[3] current=(*points[i].vertex_data).xyz.vector;
+
+		// the plane through this edge, facing into the polygon
+		const float[3] edge=[current[0]-previous[0], current[1]-previous[1], current[2]-previous[2]];
+		float[3] plane=[edge[1]*normal[2]-edge[2]*normal[1], edge[2]*normal[0]-edge[0]*normal[2], edge[0]*normal[1]-edge[1]*normal[0]];
+		const float length=sqrt(Dot(plane, plane));
+		if (length<1e-6f)
+			continue;
+		plane[]/=length;
+		const float plane_distance=Dot(plane, current);
+
+		buffer_b.length=0;
+		buffer_b.assumeSafeAppend();
+		foreach(j; 0..buffer_a.length)
+		{
+			const ObjectVertex* a=&buffer_a[j==0 ? buffer_a.length-1 : j-1];
+			const ObjectVertex* b=&buffer_a[j];
+			const float da=Dot(plane, a.pos)-plane_distance, db=Dot(plane, b.pos)-plane_distance;
+			if (da>0f)
+				buffer_b~=*a;
+			if ((da>0f)!=(db>0f))
+			{
+				const float t=-da/(db-da);
+				ObjectVertex v;
+				foreach(k; 0..3) v.pos[k]=a.pos[k]+(b.pos[k]-a.pos[k])*t;
+				foreach(k; 0..4) v.colour[k]=a.colour[k]+(b.colour[k]-a.colour[k])*t;
+				foreach(k; 0..2) v.uv[k]=a.uv[k]+(b.uv[k]-a.uv[k])*t;
+				buffer_b~=v;
+			}
+		}
+		if (buffer_b.length==0)
+			return null;
+
+		// buffer_b now holds the polygon clipped so far
+		auto swap=buffer_a;
+		buffer_a=buffer_b;
+		buffer_b=swap;
+	}
+
+	return buffer_a;
 }
 
 void DrawSprite(ref ObjectGeometry geometry, LTObject* object, const ref EffectView view)
@@ -103,10 +190,36 @@ void DrawSprite(ref ObjectGeometry geometry, LTObject* object, const ref EffectV
 		const float[2][4] uvs=[[u_min, v_min], [u_max, v_min], [u_max, v_max], [u_min, v_max]];
 		foreach(i; 0..4)
 		{
-			corners[i].pos=view.Out(matrix.TransformPoint([local[i][0], local[i][1], 0f]));
+			corners[i].pos=matrix.TransformPoint([local[i][0], local[i][1], 0f]);
 			corners[i].colour=colour;
 			corners[i].uv=uvs[i];
 		}
+
+		// decals: clipped to the edges of the world polygon they're on
+		const uint clipper=At!uint(object, SpriteClipperPolyOffset);
+		if (clipper!=0xFFFFFFFF && clipper!=0)
+		{
+			ObjectVertex[] polygon=ClipToPolygon(corners[], clipper, view);
+			if (polygon.length<3)
+				return;
+
+			geometry.Begin(Descriptor(texture), group, pipe, texture.fullbright ? TextureMode.Fullbright : TextureMode.Normal);
+			foreach(i; 1..polygon.length-1)
+			{
+				ObjectVertex a=polygon[0], b=polygon[i], c=polygon[i+1];
+				a.pos=view.Out(a.pos);
+				b.pos=view.Out(b.pos);
+				c.pos=view.Out(c.pos);
+				geometry.Add(a);
+				geometry.Add(b);
+				geometry.Add(c);
+			}
+			geometry.End();
+			return;
+		}
+
+		foreach(ref corner; corners)
+			corner.pos=view.Out(corner.pos);
 	}
 	else
 	{

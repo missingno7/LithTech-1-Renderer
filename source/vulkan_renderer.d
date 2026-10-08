@@ -377,11 +377,54 @@ public:
 
 	float[3] _global_light_scale=[1f, 1f, 1f]; // SceneDesc GlobalLightScale of the last scene
 
-	// shader.frag / object.frag push constants: GlobalLightScale, texture mode (0 normal, 1 fullbright, 2 untextured)
-	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode)
+	enum FogKind { None, World, Sky }
+
+	// D3D table fog from the renderer console variables, read every normal scene (d3d_extra_consolevars.cpp): FogEnable,
+	// FogNearZ / FogFarZ (0 / 2000), FogR/G/B (255); the sky pass uses SkyFogNearZ / SkyFogFarZ (0 / 2000). Fog is off
+	// when near and far are equal.
+	bool _fog_enable;
+	float[3] _fog_colour=[1f, 1f, 1f];
+	float[2] _fog_range=[0f, 2000f], _sky_fog_range=[0f, 2000f];
+	// d3d.ren draws pre-transformed vertices, so D3D table fog compares the ranges with the device depth (0..1), not world
+	// units, and Blood II's ranges (e.g. 700..2000) fog nothing; verified against d3d.ren under dgVoodoo (the opening train
+	// level is unfogged). Console "d_FogMode 1" fogs by eye distance instead, as the ranges suggest was meant.
+	bool _fog_by_distance;
+	// console "Saturate" (Blood II's autoexec sets 1): the lightmap pass B blends SRCBLEND DESTCOLOR, doubling lightmapped
+	// surfaces (blood2_recon port_notes/world.md 4.1)
+	bool _saturate;
+
+	// shader.frag / object.frag push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
+	// 3 world fullbright), fog colour and switch, fog range
+	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World)
 	{
-		const float[4] constants=[_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], texture_mode];
+		const float[2] range=fog==FogKind.Sky ? _sky_fog_range : _fog_range;
+		const bool fog_on=_fog_enable && fog!=FogKind.None && range[0]!=range[1];
+		const float[12] constants=[
+			_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], texture_mode,
+			_fog_colour[0], _fog_colour[1], _fog_colour[2], fog_on ? 1f : 0f,
+			range[0], range[1], _fog_by_distance ? 1f : 0f, _saturate ? 1f : 0f
+		];
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
+	}
+
+	void ReadFogSettings()
+	{
+		import Main: _renderer;
+
+		float ConsoleFloat(const(char)* name, float default_value)
+		{
+			void* variable=_renderer ? _renderer.GetConsoleVar(name) : null;
+			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
+		}
+
+		_fog_enable=ConsoleFloat("FogEnable", 0f)!=0f;
+		_fog_colour=[ConsoleFloat("FogR", 255f)/255f, ConsoleFloat("FogG", 255f)/255f, ConsoleFloat("FogB", 255f)/255f];
+		_fog_range=[ConsoleFloat("FogNearZ", 0f), ConsoleFloat("FogFarZ", 2000f)];
+		_sky_fog_range=[ConsoleFloat("SkyFogNearZ", 0f), ConsoleFloat("SkyFogFarZ", 2000f)];
+		if (_fog_range[0]==_fog_range[1])
+			_fog_enable=false;
+		_fog_by_distance=ConsoleFloat("d_FogMode", 0f)!=0f;
+		_saturate=ConsoleFloat("Saturate", 0f)!=0f;
 	}
 
 	//// Window: borderless fullscreen on the window's monitor (3D at the monitor's resolution), or with the engine's
@@ -511,6 +554,9 @@ public:
 			fov_y=scene_desc.fov_y;
 		}
 		_scene_viewport=MapToFrame(scene_desc.view_rect);
+
+		if (scene_desc.draw_mode!=DrawMode.ObjectList)
+			ReadFogSettings();
 
 		CollectObjects(scene_desc);
 
@@ -837,8 +883,9 @@ LAB_0004814b:
 			// polygrid, line system, container), object vertices
 			uint[9] objects_per_frame=_object_type_counts[1..$];
 			objects_per_frame[]/=_fps_frames;
-			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
-				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count);
+			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d fog: %s %s %s", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
+				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count,
+				_fog_enable, _fog_range, _fog_colour);
 			test_out.flush();
 			_object_type_counts[]=0;
 			_scene_count=0;
@@ -1398,12 +1445,12 @@ LAB_0004814b:
 			{
 				case ObjectType.Model:
 					_objects.Route(DrawGroup.SolidModels, ObjectPipe.Opaque, DrawGroup.TranslucentModels, ObjectPipe.Blend);
-					DrawModel(_objects, object, scene_desc, world, light_direction, &ResolveTexture);
+					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &ResolveTexture);
 					break;
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
 					_objects.Route(DrawGroup.SolidWorldModels, ObjectPipe.Opaque, DrawGroup.TranslucentWorldModels, ObjectPipe.Blend);
-					DrawWorldModel(_objects, object, scene_desc, &ResolveTexture);
+					DrawWorldModel(_objects, object, scene_desc, _scene_lights, &ResolveTexture);
 					break;
 				case ObjectType.Sprite:
 					if (draw_sprites)
@@ -1459,7 +1506,52 @@ LAB_0004814b:
 			});
 
 			CollectSky(scene_desc, view, &ResolveTexture, ConsoleFloat("DrawSky", 1f)!=0f);
+
+			if (ConsoleFloat("LightAddPoly", 1f)!=0f)
+				CollectLightAdd(scene_desc, view);
 		}
+	}
+
+	// d3d_draw.cpp r_DrawLightAddPoly: the camera's light add (screen flashes) as an untextured quad over the whole view,
+	// ONE / ONE, no depth, no fog, last in the frame; only when a channel reaches 0.001
+	void CollectLightAdd(SceneDesc* scene_desc, const ref EffectView view)
+	{
+		import SceneGeometry: ObjectVertex, DrawGroup, ObjectPipe, TextureMode;
+
+		const float[3] add=scene_desc.global_light_add;
+		if (add[0]<0.001f && add[1]<0.001f && add[2]<0.001f)
+			return;
+
+		float[4] colour;
+		foreach(channel; 0..3)
+		{
+			// truncated to a byte like the original
+			const float c=add[channel]<0f ? 0f : add[channel]>1f ? 1f : add[channel];
+			colour[channel]=cast(int)(c*255f)/255f;
+		}
+		colour[3]=1f;
+
+		// a camera-facing quad one unit ahead, a little larger than the view
+		const float half_x=view.tan_half_fov_x*1.1f, half_y=view.tan_half_fov_y*1.1f;
+		float[3] Corner(float x, float y)
+		{
+			float[3] p;
+			foreach(axis; 0..3)
+				p[axis]=view.camera[axis]+view.forward[axis]+view.right[axis]*x+view.up[axis]*y;
+			return p;
+		}
+
+		ObjectVertex[4] corners=[
+			ObjectVertex(Corner(-half_x, half_y), colour, [0f, 0f]),
+			ObjectVertex(Corner(half_x, half_y), colour, [0f, 0f]),
+			ObjectVertex(Corner(half_x, -half_y), colour, [0f, 0f]),
+			ObjectVertex(Corner(-half_x, -half_y), colour, [0f, 0f])
+		];
+		_objects.Begin(VkDescriptorSet.init, DrawGroup.LightAdd, ObjectPipe.Additive, TextureMode.Untextured);
+		static immutable size_t[6] order=[0, 1, 2, 0, 2, 3];
+		foreach(i; order)
+			_objects.Add(corners[i]);
+		_objects.End();
 	}
 
 	DynamicLight[] _scene_lights;
@@ -1541,7 +1633,8 @@ LAB_0004814b:
 	{
 		import SceneGeometry: ObjectVertex;
 
-		const bool blend=pipe==ObjectPipe.Blend || pipe==ObjectPipe.BlendNoZ || pipe==ObjectPipe.Lines;
+		const bool additive=pipe==ObjectPipe.Additive;
+		const bool blend=pipe==ObjectPipe.Blend || pipe==ObjectPipe.BlendNoZ || pipe==ObjectPipe.Lines || additive;
 		const bool depth_test=pipe==ObjectPipe.Opaque || pipe==ObjectPipe.Blend || pipe==ObjectPipe.Lines;
 		const bool depth_write=pipe==ObjectPipe.Opaque;
 
@@ -1589,8 +1682,8 @@ LAB_0004814b:
 
 		VkPipelineColorBlendAttachmentState colour_blend_attachment={
 			blendEnable: blend ? VK_TRUE : VK_FALSE,
-			srcColorBlendFactor: VK_BLEND_FACTOR_SRC_ALPHA,
-			dstColorBlendFactor: VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			srcColorBlendFactor: additive ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA,
+			dstColorBlendFactor: additive ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 			colorBlendOp: VK_BLEND_OP_ADD,
 			srcAlphaBlendFactor: VK_BLEND_FACTOR_ONE,
 			dstAlphaBlendFactor: VK_BLEND_FACTOR_ZERO,
@@ -1719,7 +1812,10 @@ LAB_0004814b:
 					vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture, 0, null);
 					bound_texture=texture;
 				}
-				PushBatchConstants(buffer, batch.mode==TextureMode.Fullbright ? 1f : batch.mode==TextureMode.Untextured ? 2f : 0f);
+				// lines and the light-add poly are never fogged; the sky uses the sky fog range
+				const FogKind fog=group==DrawGroup.Sky ? FogKind.Sky :
+					(group==DrawGroup.LineSystems || group==DrawGroup.LightAdd) ? FogKind.None : FogKind.World;
+				PushBatchConstants(buffer, cast(float)batch.mode, fog);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
@@ -2183,11 +2279,11 @@ private:
 		CreateTextureDescriptorLayout();
 
 		VkDescriptorSetLayout[] pipeline_descriptor_layouts=[_descriptor_set_layout, _texture_descriptor_layout];
-		// per texture batch: GlobalLightScale and whether the texture is fullbright (shader.frag / object.frag)
+		// per texture batch: GlobalLightScale and texture mode, fog colour, fog range (shader.frag / object.frag)
 		VkPushConstantRange push_constant_range={
 			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT,
 			offset: 0,
-			size: float.sizeof*4
+			size: float.sizeof*12
 		};
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: pipeline_descriptor_layouts.length,
@@ -2711,6 +2807,12 @@ private:
 
 	void DestroyLightmapAtlas()
 	{
+		{
+			// the polygons belong to the level being unloaded
+			import WorldModelDraw: g_LightmapOrigins;
+			g_LightmapOrigins=null;
+		}
+
 		if (_lightmap_image_view==VK_NULL_ND_HANDLE)
 			return;
 
@@ -2724,7 +2826,7 @@ private:
 	}
 
 	// packs the blocks with a shelf packer; returns each poly's block origin in the atlas (texels, inside the padding)
-	uint[2][Polygon*] BuildLightmapAtlas(WorldBsp* bsp)
+	uint[2][Polygon*] BuildLightmapAtlas(Polygon*[] polygons)
 	{
 		import std.algorithm: max, sort;
 
@@ -2732,7 +2834,7 @@ private:
 
 		struct Block { Polygon* poly; uint w, h; }
 		Block[] blocks;
-		foreach(polygon; bsp.polygons[0..bsp.polygon_count])
+		foreach(polygon; polygons)
 		{
 			if (polygon is null || polygon.surface is null || !(polygon.surface.flags & SurfaceFlags.LightMap) || polygon.lightmap_data is null)
 				continue;
@@ -2798,6 +2900,12 @@ private:
 		CreateLightmapImage(LightmapAtlasWidth, atlas_height, pixels, _lightmap_image, _lightmap_image_memory, _lightmap_image_view);
 		_lightmap_atlas_height=atlas_height;
 		BindLightmapAtlas();
+
+		{
+			import WorldModelDraw: g_LightmapOrigins, g_LightmapAtlasScale;
+			g_LightmapOrigins=origins;
+			g_LightmapAtlasScale=[1f/LightmapAtlasWidth, 1f/atlas_height];
+		}
 
 		test_out.writeln("Lightmap atlas: ", blocks.length, " blocks, ", LightmapAtlasWidth, "x", atlas_height);
 		return origins;
@@ -3191,14 +3299,32 @@ private:
 
 		uint vert_count=0;
 
-		// block-local lightmap UVs first: this also clears the lightmap flag of polies without lightmap data, like d3d.ren
-		foreach(polygon; polygons)
+		// d3d.ren pages in the main world's lightmaps, then every world model's original BSP (solid world models are
+		// lightmapped like the world)
+		Polygon*[] lightmapped_polygons=polygons.dup;
 		{
-			import WorldBsp: GenerateLightmapUvs;
-			GenerateLightmapUvs(*polygon);
+			import Main: g_RenderContext;
+			import WorldBsp: WorldData;
+
+			MainWorld* world=g_RenderContext ? g_RenderContext.main_world : null;
+			if (world && world.world_models)
+				foreach(data; world.world_models[0..world.world_model_count])
+				{
+					WorldBsp* original=data ? (data.objs[1] ? data.objs[1] : data.objs[0]) : null;
+					if (original && original!=bsp && original.polygons)
+						lightmapped_polygons~=original.polygons[0..original.polygon_count];
+				}
 		}
 
-		uint[2][Polygon*] lightmap_origins=BuildLightmapAtlas(bsp);
+		// block-local lightmap UVs first: this also clears the lightmap flag of polies without lightmap data, like d3d.ren
+		foreach(polygon; lightmapped_polygons)
+		{
+			import WorldBsp: GenerateLightmapUvs;
+			if (polygon && polygon.surface)
+				GenerateLightmapUvs(*polygon);
+		}
+
+		uint[2][Polygon*] lightmap_origins=BuildLightmapAtlas(lightmapped_polygons);
 
 		foreach(i, polygon; polygons)
 		{

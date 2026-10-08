@@ -6,7 +6,7 @@ module ModelDraw;
  + the vertex dispatch at 0x10e7c (16-step light ramp) and d3d_model_mesh.cpp (faces, per-face UVs).
  + Output is world-space triangles; the GPU does projection, clipping and depth instead of d3d.ren's CPU TL path.
  +
- + Not ported yet: LOD selection and collapse (always full detail), dynamic light add, CoolFog, tint pass, fullbrite and
+ + Not ported yet: LOD selection and collapse (always full detail), CoolFog, tint pass and
  + environment-map passes, shadows, the "really close" weapon pass.
  +/
 
@@ -86,7 +86,7 @@ alias ModelHookFn=extern(C) void function(ModelHookData*, void*);
 
 // d3d.ren draws every model through this; geometry goes into `geometry` in world space
 void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, MainWorld* world,
-	const float[3] light_direction, scope RenderTexture delegate(SharedTexture*) resolve_texture)
+	const float[3] light_direction, const DynamicLight[] lights, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	void* model=At!(void*)(object, ModelDataOffset);
 	void* prev_anim=At!(void*)(object, ModelPrevAnimOffset);
@@ -116,7 +116,7 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	debug DumpModelOnce(object, model, matrix_count);
 
 	//// light ramp
-	float[4][16] ramp=LightRamp(object, scene, world);
+	float[4][16] ramp=LightRamp(object, scene, world, lights);
 
 	//// hidden nodes (d3d_model_core.cpp ApplyHiddenNodeList)
 	_node_visible[]=true;
@@ -400,14 +400,16 @@ void BlendVertexAnimation(void* model, void* anim_a, void* anim_b, uint frame_a,
 }
 
 // d3d_model_frame_lighting.cpp ours_SetupModelFrameState + the 16-entry ramp of the vertex dispatch (0x10e7c)
-float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world)
+float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights)
 {
 	import gl3n.linalg: vec3;
 
 	const float[3] scale=scene.global_light_scale.vector;
 	float[3] ambient=[object.r, object.g, object.b];
 	ambient[]+=scene.model_light_add[];
-	// TODO: dynamic light add (d3d_CalcLightAdd) for objects without FLAG_NOLIGHT
+	// the dynamic lights at the object (d3d_CalcLightAdd), unless FLAG_NOLIGHT
+	if (!(object.flags & ObjectFlag.NoLight))
+		ambient[]+=CalcLightAdd(object.pos, lights)[];
 	ambient[]*=scale[];
 	foreach(ref channel; ambient)
 		channel=channel<0f ? 0f : channel>255f ? 255f : channel;

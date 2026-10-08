@@ -32,6 +32,7 @@ layout(location=1) out vec2 uv_out;
 layout(location=2) out vec2 lightmap_uv_out;
 layout(location=3) out float lightmapped_out;
 layout(location=4) out vec3 dynamic_light_out;
+layout(location=5) out float eye_depth_out; // for D3D-style table fog
 
 // d3d.ren adds (c - (255 - c)) * (1 - d/r) per light (blood2_recon port_notes/worldmodels.md, Dynamic lights):
 // colours below half darken
@@ -54,11 +55,13 @@ vec3 DynamicLight()
 
 void main()
 {
-	gl_Position=ubo.proj*ubo.view*ubo.model*vec4(position_in, 1.0);
+	vec4 view_pos=ubo.view*ubo.model*vec4(position_in, 1.0);
+	gl_Position=ubo.proj*view_pos;
 
 	colour_out=colour_in;
 	uv_out=uv_in;
 	lightmap_uv_out=lightmap_uv_in;
 	lightmapped_out=lightmapped_in;
 	dynamic_light_out=DynamicLight();
+	eye_depth_out=abs(view_pos.z);
 }
