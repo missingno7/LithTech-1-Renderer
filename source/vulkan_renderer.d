@@ -294,6 +294,10 @@ public:
 		vkDestroySurfaceKHR(g_VkInstance, _surface, null);
 		vkDestroyInstance(g_VkInstance, null);
 		ShowCursor(TRUE);
+		{
+			import core.sys.windows.mmsystem: timeEndPeriod;
+			timeEndPeriod(1);
+		}
 		test_out.close();
 	}
 
@@ -323,6 +327,13 @@ public:
 		CreateVkPhysicalDevice();
 		VkCheck(CreateVkSurface(g_VkInstance, window, _surface), "vkCreateWin32SurfaceKHR");
 		CreateVkLogicalDevice(g_VkInstance, g_Device);
+
+		// the options the first swapchain depends on (d_VSync), and 1 ms timer resolution for d_MaxFPS's sleeps
+		ReadPresentSettings();
+		{
+			import core.sys.windows.mmsystem: timeBeginPeriod;
+			timeBeginPeriod(1);
+		}
 
 		g_Allocator=Allocator.GetAllocator();
 
@@ -721,6 +732,11 @@ LAB_0004814b:
 		if (_t_frame_end!=MonoTime.init)
 			_timing[Timing.Game]+=(t_begin-_t_frame_end).total!"usecs"; // includes RenderScene, subtracted when logged
 
+		// presentation options, every frame (menus have no scene); a vsync change rebuilds the swapchain
+		ReadPresentSettings();
+		if (_vsync!=_swapchain_vsync)
+			RecreateSwapchain();
+
 		uint image_index;
 		VkResult res=vkAcquireNextImageKHR(g_Device, _swapchain, uint.max, _is_image_available, VK_NULL_ND_HANDLE, &image_index);
 		MonoTime t_mark=MonoTime.currTime;
@@ -905,7 +921,80 @@ LAB_0004814b:
 		_objects.Clear(); // built again by the next RenderScene
 
 		LogFrameRate();
+		LimitFrameRate();
 		_t_frame_end=MonoTime.currTime;
+	}
+
+	// console d_VSync (1) and d_MaxFPS (0 = unlimited); registered as saved options by Main.Init
+	bool _vsync=true, _swapchain_vsync=true;
+	int _max_fps;
+	MonoTime _next_frame_due;
+
+	void ReadPresentSettings()
+	{
+		import Main: _renderer;
+
+		if (_renderer is null)
+			return;
+		float ConsoleFloat(const(char)* name, float default_value)
+		{
+			void* variable=_renderer.GetConsoleVar(name);
+			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
+		}
+		_vsync=ConsoleFloat("d_VSync", 1f)!=0f;
+		const float max_fps=ConsoleFloat("d_MaxFPS", 0f);
+		_max_fps=max_fps>=1f ? cast(int)max_fps : 0;
+
+		// FIFO doesn't reliably hold a borderless window to the refresh rate on every driver (measured 215..430 fps at
+		// 240 Hz), so with vsync on and no explicit cap, also pace frames at the display's refresh rate
+		if (_vsync && _max_fps==0)
+			_max_fps=DisplayRefreshRate();
+	}
+
+	int _refresh_rate=-1;
+
+	// the current refresh rate of the primary display, 0 if unknown
+	int DisplayRefreshRate()
+	{
+		if (_refresh_rate<0)
+		{
+			DEVMODEA mode;
+			mode.dmSize=DEVMODEA.sizeof;
+			_refresh_rate=(EnumDisplaySettingsA(null, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency>1) ?
+				mode.dmDisplayFrequency : 0;
+			test_out.writeln("Display refresh rate: ", _refresh_rate, " Hz");
+		}
+		return _refresh_rate;
+	}
+
+	// d_MaxFPS: holds each frame to 1/max_fps, independent of what the driver does with vsync. Sleeps for most of the
+	// wait (Windows timers are ~1 ms at best) and spins the last stretch for an even pace.
+	void LimitFrameRate()
+	{
+		import core.time: usecs;
+		import core.thread: Thread;
+
+		if (_max_fps<=0)
+		{
+			_next_frame_due=MonoTime.init;
+			return;
+		}
+
+		const interval=usecs(1_000_000/_max_fps);
+		MonoTime now=MonoTime.currTime;
+		if (_next_frame_due==MonoTime.init || now-_next_frame_due>interval*4)
+			_next_frame_due=now; // first frame, or far behind: don't try to catch up
+
+		_next_frame_due+=interval;
+		while (true)
+		{
+			now=MonoTime.currTime;
+			const remaining=_next_frame_due-now;
+			if (remaining<=usecs(0))
+				break;
+			if (remaining>usecs(2000))
+				Thread.sleep(remaining-usecs(1500));
+		}
 	}
 
 	// per-second timing breakdown for the log, microseconds summed over the frames
@@ -2141,8 +2230,18 @@ private:
 		vkGetPhysicalDeviceSurfacePresentModesKHR(g_PhysicalDevice, _surface, &present_mode_count, null);
 		VkPresentModeKHR[] present_modes=new VkPresentModeKHR[present_mode_count];
 		vkGetPhysicalDeviceSurfacePresentModesKHR(g_PhysicalDevice, _surface, &present_mode_count, present_modes.ptr);
+		// d_VSync 1: FIFO (always available); 0: MAILBOX (no tearing, newest frame wins), else IMMEDIATE
+		import std.algorithm: canFind;
 		VkPresentModeKHR present_mode=VK_PRESENT_MODE_FIFO_KHR;
-		test_out.writeln(present_modes);
+		if (!_vsync)
+		{
+			if (present_modes.canFind(VK_PRESENT_MODE_MAILBOX_KHR))
+				present_mode=VK_PRESENT_MODE_MAILBOX_KHR;
+			else if (present_modes.canFind(VK_PRESENT_MODE_IMMEDIATE_KHR))
+				present_mode=VK_PRESENT_MODE_IMMEDIATE_KHR;
+		}
+		_swapchain_vsync=_vsync;
+		test_out.writeln(present_modes, " -> ", present_mode);
 
 		//uint[] queue_family=[ _graphics_queue, _present_queue ];
 		auto queue_family=GetQueueFamily();

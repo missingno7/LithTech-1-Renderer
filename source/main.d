@@ -271,6 +271,30 @@ export void RenderDLLSetup(RenderDLL* renderer)
 	test_out.flush();
 }
 
+// d_ren's user options are engine console variables. One the engine doesn't know yet is created with its default and
+// the save flag (a leading '+'), so it's written to autoexec.cfg on exit and can be edited there or in the console;
+// values already loaded from autoexec.cfg are left alone. Plain "name value" console input lasts only for the
+// session; "+name value" is saved.
+void RegisterRendererOptions()
+{
+	import std.string: toStringz;
+
+	static immutable string[2][] options=[
+		["d_VSync", "1"],      // 1: present synchronised to the display (FIFO); 0: MAILBOX / IMMEDIATE
+		["d_MaxFPS", "0"],     // frame cap, 0 = none
+		["d_Widescreen", "1"], // Hor+ FOV correction
+		["d_FogMode", "0"],    // 0: fog like d3d.ren (device depth); 1: by eye distance
+		["d_DebugClear", "0"], // 1: holes in the world shown in blue
+	];
+
+	if (_renderer is null || _renderer.GetConsoleVar is null || _renderer.RunConsoleString is null)
+		return;
+
+	foreach(option; options)
+		if (_renderer.GetConsoleVar(option[0].toStringz) is null)
+			_renderer.RunConsoleString(("+"~option[0]~" "~option[1]).toStringz);
+}
+
 int Init(RenderStructInit* init_struct)
 {
 	test();
@@ -287,6 +311,8 @@ int Init(RenderStructInit* init_struct)
 	void* windowed_cvar=_renderer.GetConsoleVar("windowed");
 	const char* windowed_str=_renderer.GetVarValueString(windowed_cvar);
 	test_out.writeln(windowed_cvar, windowed_str);
+
+	RegisterRendererOptions();
 
 	_renderer_inst=new VulkanRenderer;
 	//_renderer_inst=new Renderer;

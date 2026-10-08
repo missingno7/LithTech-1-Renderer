@@ -61,8 +61,14 @@ Direct3D compares those ranges with the 0..1 device depth, and in practice nothi
 default. `d_FogMode 1` fogs by distance instead, as the level settings suggest was intended.
 
 ### Console variables
+d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
+saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
+changes an option for the current session only; `+name value` also saves it.
+
 | Variable | Default | Meaning |
 |---|---|---|
+| `d_VSync` | 1 | 1: present in sync with the display (FIFO), paced to its refresh rate; 0: unsynchronised (MAILBOX, else IMMEDIATE). |
+| `d_MaxFPS` | 0 | Frame cap; 0 = none (with `d_VSync 1`, the display's refresh rate). |
 | `d_Widescreen` | 1 | Hor+ FOV correction; 0 projects the game's FOV as given, like d3d.ren. |
 | `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
