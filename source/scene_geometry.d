@@ -38,6 +38,7 @@ struct ObjectBatch
 	VkDescriptorSet texture; // VK_NULL_ND_HANDLE: the renderer's dummy texture
 	uint first_vertex;
 	uint vertex_count;
+	bool fullbright; // texture alpha marks fullbright texels
 }
 
 // d3d.ren flushes solid objects before translucent ones and sorts neither (port ABI section 5)
@@ -58,9 +59,9 @@ struct ObjectGeometry
 	}
 
 	// opens a batch; vertices appended until the next Begin belong to it
-	void Begin(VkDescriptorSet texture, bool is_translucent)
+	void Begin(VkDescriptorSet texture, bool is_translucent, bool fullbright=false)
 	{
-		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0 };
+		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, fullbright: fullbright };
 		if (is_translucent)
 			translucent~=batch;
 		else

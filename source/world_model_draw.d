@@ -57,7 +57,8 @@ void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* sc
 		{
 			if (batch_open)
 				geometry.End();
-			geometry.Begin(texture ? texture.texture_descriptor : typeof(texture.texture_descriptor).init, translucent);
+			geometry.Begin(texture ? texture.texture_descriptor : typeof(texture.texture_descriptor).init, translucent,
+				texture && texture.fullbright);
 			batch_texture=texture;
 			batch_open=true;
 		}

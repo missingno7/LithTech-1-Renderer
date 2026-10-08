@@ -136,7 +136,7 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	// solid iff the object is fully opaque (d3d_ProcessModel)
 	const bool translucent=object.a!=0xFF;
 	RenderTexture skin=resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset));
-	geometry.Begin(skin ? skin.texture_descriptor : VkDescriptorSet.init, translucent);
+	geometry.Begin(skin ? skin.texture_descriptor : VkDescriptorSet.init, translucent, skin && skin.fullbright);
 
 	foreach(face_index; 0..face_count)
 	{

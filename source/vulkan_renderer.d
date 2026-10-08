@@ -98,6 +98,8 @@ struct Vertex
 	vec3 pos;
 	vec3 colour;
 	vec2 uv;
+	vec2 lightmap_uv; // in the lightmap atlas, normalised
+	float lightmapped; // 1 = lit by the lightmap, 0 = by the pre-lit colour
 
 	static VkVertexInputBindingDescription GetBindingDescription()
 	{
@@ -360,12 +362,22 @@ public:
 		test_out.writeln("Vulkan done.");
 	}
 
+	float[3] _global_light_scale=[1f, 1f, 1f]; // SceneDesc GlobalLightScale of the last scene
+
+	// shader.frag / object.frag push constants: GlobalLightScale, fullbright flag
+	void PushBatchConstants(VkCommandBuffer buffer, bool fullbright)
+	{
+		const float[4] constants=[_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], fullbright ? 1f : 0f];
+		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
+	}
+
 	vec3 camera_pos;
 	quat camera_view=quat.identity;
 	float fov_global=45f;
 	override void RenderScene(SceneDesc* scene_desc) // vkCmd*
 	{
 		_scene_rendered=true;
+		_global_light_scale=scene_desc.global_light_scale.vector;
 
 		camera_pos=vec3(scene_desc.camera_position);
 		camera_view=quat(scene_desc.camera_rotation[3], vec3(scene_desc.camera_rotation[0..3]));
@@ -576,6 +588,7 @@ LAB_0004814b:
 
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
+				PushBatchConstants(buffer, false);
 
 				if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
 				{
@@ -604,6 +617,7 @@ LAB_0004814b:
 							last_texture=this_texture;
 							VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
 							vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
+							PushBatchConstants(buffer, this_texture && this_texture.fullbright);
 						}
 
 						int vert_count=(polygon.DiskVerts().length-2)*3;
@@ -1430,6 +1444,7 @@ LAB_0004814b:
 					vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture, 0, null);
 					bound=texture;
 				}
+				PushBatchConstants(buffer, batch.fullbright);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
@@ -1917,11 +1932,17 @@ private:
 		CreateTextureDescriptorLayout();
 
 		VkDescriptorSetLayout[] pipeline_descriptor_layouts=[_descriptor_set_layout, _texture_descriptor_layout];
+		// per texture batch: GlobalLightScale and whether the texture is fullbright (shader.frag / object.frag)
+		VkPushConstantRange push_constant_range={
+			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT,
+			offset: 0,
+			size: float.sizeof*4
+		};
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: pipeline_descriptor_layouts.length,
 			pSetLayouts: pipeline_descriptor_layouts.ptr,
-			pushConstantRangeCount: 0,
-			pPushConstantRanges: null
+			pushConstantRangeCount: 1,
+			pPushConstantRanges: &push_constant_range
 		};
 
 		VkResult res=vkCreatePipelineLayout(g_Device, &pipeline_layout_info, null, &_pipeline_layout);
@@ -2135,7 +2156,7 @@ private:
 						{
 							if (ubo.count<40 && !(obj.flags & ObjectFlags.OnlyLightWorld) && !(obj.flags & ObjectFlags.FogLight))
 							{
-								ubo.lights[ubo.count++]=LightObj(obj.position, vec3(obj.colour[0]/255f, obj.colour[1]/255f, obj.colour[3]/255f), obj.ToLight().radius);
+								ubo.lights[ubo.count++]=LightObj(obj.position, vec3(obj.colour[0]/255f, obj.colour[1]/255f, obj.colour[2]/255f), obj.ToLight().radius);
 							}
 						}
 						curr=curr.prev;
@@ -2256,7 +2277,14 @@ private:
 			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT
 		};
 
-		VkDescriptorSetLayoutBinding[] bindings=[ ubo_layout_binding, sampler_layout_binding, lights_ubo_layout_binding ];
+		VkDescriptorSetLayoutBinding lightmap_layout_binding={
+			binding: 3,
+			descriptorType: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+			descriptorCount: 1,
+			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT
+		};
+
+		VkDescriptorSetLayoutBinding[] bindings=[ ubo_layout_binding, sampler_layout_binding, lights_ubo_layout_binding, lightmap_layout_binding ];
 
 		VkDescriptorSetLayoutCreateInfo create_info={
 			bindingCount: bindings.length,
@@ -2275,6 +2303,10 @@ private:
 		},
 		{
 			type: VK_DESCRIPTOR_TYPE_SAMPLER,
+			descriptorCount: _buffers.length
+		},
+		{
+			type: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, // lightmap atlas
 			descriptorCount: _buffers.length
 		} ];
 
@@ -2349,7 +2381,165 @@ private:
 
 			vkUpdateDescriptorSets(g_Device, descriptor_write.length, descriptor_write.ptr, 0, null);
 		}
+
+		BindLightmapAtlas(); // the white dummy until a world is loaded
 	}
+
+	//// Lightmap atlas: every lightmapped world poly's block (WorldPoly +0x34: w, h, RGB565 texels) packed into one texture
+
+	enum uint LightmapAtlasWidth=2048;
+	enum uint LightmapPadding=1; // replicated border so bilinear filtering never reads a neighbouring block
+
+	VkImage _lightmap_image;
+	VkMappedMemoryRange _lightmap_image_memory;
+	VkImageView _lightmap_image_view;
+	VkImage _lightmap_dummy_image;
+	VkMappedMemoryRange _lightmap_dummy_memory;
+	VkImageView _lightmap_dummy_view;
+
+	// uploads RGBA8 pixels into a new sampled image
+	void CreateLightmapImage(uint width, uint height, const(uint)[] pixels, out VkImage image, out VkMappedMemoryRange memory, out VkImageView view)
+	{
+		import core.stdc.string: memcpy;
+
+		VkBuffer staging;
+		VkMappedMemoryRange staging_memory;
+		CreateVkBuffer(pixels.length*uint.sizeof, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, staging_memory);
+		void* data;
+		vmaMapMemory(staging_memory, &data);
+		memcpy(data, pixels.ptr, pixels.length*uint.sizeof);
+		vmaUnmapMemory(staging_memory);
+
+		CreateVkImage(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, image, memory);
+		TransitionImageLayout(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		CopyBufferToImage(staging, image, width, height);
+		TransitionImageLayout(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		vkDestroyBuffer(g_Device, staging, null);
+
+		view=CreateImageView(image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+	}
+
+	// points binding 3 of every frame's set 0 at the atlas (or the white dummy); only called between frames
+	void BindLightmapAtlas()
+	{
+		if (_lightmap_dummy_view==VK_NULL_ND_HANDLE)
+		{
+			const uint[1] white=[ 0xFFFFFFFF ];
+			CreateLightmapImage(1, 1, white[], _lightmap_dummy_image, _lightmap_dummy_memory, _lightmap_dummy_view);
+		}
+
+		VkDescriptorImageInfo image_info={
+			imageView: _lightmap_image_view!=VK_NULL_ND_HANDLE ? _lightmap_image_view : _lightmap_dummy_view,
+			imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+		};
+		foreach(set; _descriptor_sets)
+		{
+			VkWriteDescriptorSet write={
+				dstSet: set,
+				dstBinding: 3,
+				descriptorCount: 1,
+				descriptorType: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+				pImageInfo: &image_info
+			};
+			vkUpdateDescriptorSets(g_Device, 1, &write, 0, null);
+		}
+	}
+
+	void DestroyLightmapAtlas()
+	{
+		if (_lightmap_image_view==VK_NULL_ND_HANDLE)
+			return;
+
+		vkDeviceWaitIdle(g_Device);
+		VkImageView view=_lightmap_image_view;
+		_lightmap_image_view=VK_NULL_ND_HANDLE;
+		BindLightmapAtlas();
+		vkDestroyImageView(g_Device, view, null);
+		vkDestroyImage(g_Device, _lightmap_image, null);
+		_lightmap_image=VK_NULL_ND_HANDLE;
+	}
+
+	// packs the blocks with a shelf packer; returns each poly's block origin in the atlas (texels, inside the padding)
+	uint[2][Polygon*] BuildLightmapAtlas(WorldBsp* bsp)
+	{
+		import std.algorithm: max, sort;
+
+		DestroyLightmapAtlas();
+
+		struct Block { Polygon* poly; uint w, h; }
+		Block[] blocks;
+		foreach(polygon; bsp.polygons[0..bsp.polygon_count])
+		{
+			if (polygon is null || polygon.surface is null || !(polygon.surface.flags & SurfaceFlags.LightMap) || polygon.lightmap_data is null)
+				continue;
+			const uint w=polygon.lightmap_data[0], h=polygon.lightmap_data[1];
+			if (w && h)
+				blocks~=Block(polygon, w, h);
+		}
+
+		uint[2][Polygon*] origins;
+		if (blocks.length==0)
+			return origins;
+
+		// tallest first keeps the shelves tight
+		blocks.sort!((a, b) => a.h>b.h);
+
+		uint x=0, y=0, shelf_height=0;
+		uint[2][] positions=new uint[2][blocks.length];
+		foreach(i, ref block; blocks)
+		{
+			const uint w=block.w+LightmapPadding*2, h=block.h+LightmapPadding*2;
+			if (x+w>LightmapAtlasWidth)
+			{
+				y+=shelf_height;
+				x=0;
+				shelf_height=0;
+			}
+			positions[i]=[x, y];
+			x+=w;
+			shelf_height=max(shelf_height, h);
+		}
+		const uint atlas_height=y+shelf_height;
+		if (atlas_height>8192)
+		{
+			test_out.writeln("Lightmap atlas would be ", atlas_height, " texels high, lightmaps disabled");
+			return origins;
+		}
+
+		uint[] pixels=new uint[LightmapAtlasWidth*atlas_height];
+
+		// RGB565 expanded by a shift, no bit replication (d3d.ren dynamic lightmap builder)
+		static uint Expand565(ushort p)
+		{
+			const uint r=((p >> 11) & 0x1F) << 3, g=((p >> 5) & 0x3F) << 2, b=(p & 0x1F) << 3;
+			return r | (g << 8) | (b << 16) | 0xFF000000;
+		}
+
+		foreach(i, ref block; blocks)
+		{
+			const ushort* texels=cast(ushort*)(block.poly.lightmap_data+2);
+			const uint origin_x=positions[i][0]+LightmapPadding, origin_y=positions[i][1]+LightmapPadding;
+			// the padded rectangle samples the clamped block texel
+			foreach(py; 0..block.h+LightmapPadding*2)
+				foreach(px; 0..block.w+LightmapPadding*2)
+				{
+					const int sx=cast(int)px-cast(int)LightmapPadding, sy=cast(int)py-cast(int)LightmapPadding;
+					const uint cx=sx<0 ? 0 : (sx>=cast(int)block.w ? block.w-1 : sx);
+					const uint cy=sy<0 ? 0 : (sy>=cast(int)block.h ? block.h-1 : sy);
+					pixels[(positions[i][1]+py)*LightmapAtlasWidth+positions[i][0]+px]=Expand565(texels[cy*block.w+cx]);
+				}
+			origins[block.poly]=[origin_x, origin_y];
+		}
+
+		CreateLightmapImage(LightmapAtlasWidth, atlas_height, pixels, _lightmap_image, _lightmap_image_memory, _lightmap_image_view);
+		_lightmap_atlas_height=atlas_height;
+		BindLightmapAtlas();
+
+		test_out.writeln("Lightmap atlas: ", blocks.length, " blocks, ", LightmapAtlasWidth, "x", atlas_height);
+		return origins;
+	}
+
+	uint _lightmap_atlas_height=1;
 
 	VkDescriptorSetLayout _texture_descriptor_layout;
 	VkDescriptorPool _texture_descriptor_pool;
@@ -2721,6 +2911,8 @@ private:
 		_vertex_buffer=VK_NULL_ND_HANDLE;
 		_vertex_index_buffer=VK_NULL_ND_HANDLE;
 		index_count=0;
+
+		DestroyLightmapAtlas();
 	}
 
 	public void CreateBspVertexBuffer(WorldBsp* bsp)
@@ -2737,15 +2929,23 @@ private:
 
 		uint vert_count=0;
 
-		foreach(i, polygon; polygons)
+		// block-local lightmap UVs first: this also clears the lightmap flag of polies without lightmap data, like d3d.ren
+		foreach(polygon; polygons)
 		{
 			import WorldBsp: GenerateLightmapUvs;
 			GenerateLightmapUvs(*polygon);
+		}
 
+		uint[2][Polygon*] lightmap_origins=BuildLightmapAtlas(bsp);
+
+		foreach(i, polygon; polygons)
+		{
 			vert_count=vert_buffer.length;
 
 			if (polygon.surface.flags & SurfaceFlags.Invisible)
 				continue;
+
+			const uint[2]* lightmap_origin=polygon in lightmap_origins;
 
 			foreach(j, vertex; polygon.DiskVerts())
 			{
@@ -2758,6 +2958,13 @@ private:
 					colour.g=vertex.colour[1]/255f;
 					colour.b=vertex.colour[0]/255f;
 					uv=vertex.uv;
+
+					if (lightmap_origin)
+					{
+						lightmap_uv.x=(vertex.lightmap_uv.x+(*lightmap_origin)[0])/LightmapAtlasWidth;
+						lightmap_uv.y=(vertex.lightmap_uv.y+(*lightmap_origin)[1])/_lightmap_atlas_height;
+						lightmapped=1f;
+					}
 				}
 
 				vert_buffer~=new_vert;

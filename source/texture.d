@@ -120,6 +120,10 @@ ubyte[] TransitionTexturePixels(TextureData* texture, out int width, out int hei
 	{
 		Colour pixel_colour=texture.palette.colours[pixel];
 		ubyte pixel_alpha=0xFF;
+		// d3d.ren gives palette entries 246..255 the format's alpha bit and draws DTX_FULLBRITE textures a second time
+		// weighted by it (blood2_recon port_notes/world.md 6.2), so for those textures alpha marks the fullbright texels
+		if (texture.header.flags & DtxFlags.FullBrite)
+			pixel_alpha=(pixel>=246) ? 0xFF : 0;
 		if (texture.header.flags & DtxFlags.AlphaMasks)
 		{
 			pixel_alpha=texture.mipmap_data[0].alpha[i/2];
@@ -158,6 +162,7 @@ class RenderTexture
 	SharedTexture* texture_ref;
 
 	uint width, height; // of the top mip, to normalise texel UVs
+	bool fullbright; // DTX_FULLBRITE: alpha marks texels drawn at full brightness
 
 	public void DumpAsBMP(TextureData* data, ubyte[] pixels_)
 	{
@@ -187,6 +192,7 @@ class RenderTexture
 		texture.render_data=this;
 		width=data.header.width;
 		height=data.header.height;
+		fullbright=(data.header.flags & DtxFlags.FullBrite)!=0;
 
 		import Main: _renderer_inst;
 		import VulkanRender;
