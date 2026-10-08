@@ -23,6 +23,7 @@ them by default (see *Fog* below).
   polygon.
 - **Particle systems, polygrids** (water, with the environment-map pass) and **line systems**.
 - **Sky:** sky objects seen through a sky camera that moves through the sky box with the player, behind the sky portals.
+- **Surface effects:** the engine's scrolling, rotating and warbling textures (e.g. the tunnel seen from the train).
 - **Screen flashes** (the camera's light add), **fog** (see below), and **the 2D layer** (menus, HUD, console, loading
   screens).
 - Objects are drawn in the order of d3d.ren's object queues.
@@ -69,6 +70,13 @@ changed): the game runs at normal speed at 240 fps, measured from the server's o
 match the expected Blood II 2.1 build, d_ren caps the frame rate at 100 fps instead. `vk_test.txt` logs the measured
 game speed once a second.
 
+### Mouse look
+The engine spreads mouse movement over time and applies it per frame using `GetTickCount`, which only advances every
+~15.6 ms. Above ~64 fps most frames therefore get no mouse movement and the next one gets a lump: at 240 fps the view
+moved in only 64 of 240 frames (keyboard turning uses a different clock and was smooth). With `d_MouseFix 1` d_ren
+points the engine's `GetTickCount` import at a 1 ms clock while the renderer is loaded, and the view follows the mouse
+in every frame. The original import is restored when the renderer shuts down.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
@@ -78,7 +86,8 @@ changes an option for the current session only; `+name value` also saves it.
 |---|---|---|
 | `d_VSync` | 1 | 1: present in sync with the display (FIFO), paced to its refresh rate; 0: unsynchronised (MAILBOX, else IMMEDIATE). |
 | `d_MaxFPS` | 0 | Frame cap; 0 = none (with `d_VSync 1`, the display's refresh rate). |
-| `d_GameSpeedFix` | 1 | Keeps the game at normal speed above 100 fps (see *Game speed* below). |
+| `d_GameSpeedFix` | 1 | Keeps the game at normal speed above 100 fps (see *Game speed* above). |
+| `d_MouseFix` | 1 | Smooth mouse look above ~64 fps (see *Mouse look* above). |
 | `d_Widescreen` | 1 | Hor+ FOV correction; 0 projects the game's FOV as given, like d3d.ren. |
 | `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
@@ -88,7 +97,8 @@ changes an option for the current session only; `+name value` also saves it.
 The renderer also reads the game's own `FogEnable`, `FogNearZ`/`FogFarZ`, `FogR/G/B`, `SkyFogNearZ`/`SkyFogFarZ` and
 `Saturate`, the same way d3d.ren does.
 
-Logs: `vk_test.txt` (Vulkan setup, once-a-second fps and object statistics) and `test.txt` (engine calls, a
+Logs: `vk_test.txt` (Vulkan setup; once a second: fps, object statistics, a per-stage frame time breakdown, frame
+pacing, how often the camera moved, and the game speed) and `test.txt` (engine calls, a
 once-a-second heartbeat, and any exception thrown inside the renderer). Both are in the game folder.
 
 ## Building

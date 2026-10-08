@@ -294,6 +294,7 @@ public:
 		vkDestroySurfaceKHR(g_VkInstance, _surface, null);
 		vkDestroyInstance(g_VkInstance, null);
 		ShowCursor(TRUE);
+		RemoveMouseInputFix(); // before the DLL can unload: the import must not point into it
 		{
 			import core.sys.windows.mmsystem: timeEndPeriod;
 			timeEndPeriod(1);
@@ -334,6 +335,7 @@ public:
 			import core.sys.windows.mmsystem: timeBeginPeriod;
 			timeBeginPeriod(1);
 		}
+		InstallMouseInputFix();
 
 		g_Allocator=Allocator.GetAllocator();
 
@@ -563,6 +565,20 @@ public:
 		camera_pos=vec3(scene_desc.camera_position);
 		camera_view=quat(scene_desc.camera_rotation[3], vec3(scene_desc.camera_rotation[0..3]));
 
+		// smoothness diagnostics: how often the camera's rotation changes between normal scenes while it's turning
+		if (scene_desc.draw_mode!=DrawMode.ObjectList)
+		{
+			import std.math: abs;
+			const float[4] q=scene_desc.camera_rotation;
+			const float dot=abs(q[0]*_last_camera_rotation[0]+q[1]*_last_camera_rotation[1]+q[2]*_last_camera_rotation[2]+
+				q[3]*_last_camera_rotation[3]);
+			if (dot<0.9999999f)
+				_rotation_changed_frames++;
+			else
+				_rotation_same_frames++;
+			_last_camera_rotation=q;
+		}
+
 		// the engine's horizontal and vertical FOV already match its view rect's aspect
 		if (scene_desc.fov_x>0f && scene_desc.fov_y>0f)
 		{
@@ -791,6 +807,7 @@ LAB_0004814b:
 
 				vkBeginCommandBuffer(buffer, &command_buffer_begin_info);
 				RecordOverlayCopy(buffer);
+				RecordAnimatedSurfaceUpdates(buffer);
 				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
 				// dynamic state of the world pipeline
@@ -910,6 +927,19 @@ LAB_0004814b:
 
 		res=vkQueuePresentKHR(_graphics_queue, &present_info);
 		Mark(Timing.Present);
+		{
+			const MonoTime now=MonoTime.currTime;
+			if (_last_present!=MonoTime.init)
+			{
+				const long interval=(now-_last_present).total!"usecs";
+				if (interval<_interval_min) _interval_min=interval;
+				if (interval>_interval_max) _interval_max=interval;
+				_interval_sum+=interval;
+				_interval_sq_sum+=interval*interval;
+				_interval_count++;
+			}
+			_last_present=now;
+		}
 
 		vkQueueWaitIdle(_graphics_queue);
 		Mark(Timing.GpuWait);
@@ -957,6 +987,94 @@ LAB_0004814b:
 			if (_max_fps==0 || _max_fps>GameSafeMaxFPS)
 				_max_fps=GameSafeMaxFPS;
 		}
+	}
+
+	//// Mouse look above 64 fps
+	////
+	//// The engine turns mouse input into a rate and applies rate x frame time, with the frame time from GetTickCount
+	//// (blood2_recon input_win/input.cpp, the DirectInput read loop). GetTickCount advances in ~15.6 ms steps, so at
+	//// 240 fps most frames see a delta of 0 and the mouse moves the view only every 3rd or 4th frame, in uneven chunks.
+	//// Keyboard turning uses the engine's 1 ms clock and is smooth. d_MouseFix points CLIENT.EXE's GetTickCount import
+	//// at timeGetTime, which d_ren runs at 1 ms resolution (both count milliseconds since boot); the original import is
+	//// restored when the renderer shuts down.
+
+	__gshared void** _tick_count_import; // CLIENT.EXE's IAT slot for KERNEL32!GetTickCount
+	__gshared void* _original_tick_count;
+	__gshared uint _tick_count_offset;
+
+	// 1 ms steps, but never ahead of GetTickCount: the engine subtracts DirectInput event timestamps (on the coarse
+	// system tick) from this clock, and a clock running ahead makes those differences negative, which wrap and kill the
+	// mouse rate entirely. Aligned to GetTickCount at install and held 16 ms (one tick) behind it; only differences of
+	// this clock are ever used, so the constant lag doesn't matter.
+	static extern(Windows) uint FineTickCount() nothrow @nogc
+	{
+		import core.sys.windows.mmsystem: timeGetTime;
+		return timeGetTime()+_tick_count_offset;
+	}
+
+	void InstallMouseInputFix()
+	{
+		import Main: _renderer;
+		import core.stdc.string: strcmp;
+		import core.sys.windows.winnt: IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_IMPORT_DESCRIPTOR, IMAGE_DIRECTORY_ENTRY_IMPORT;
+
+		void* variable=_renderer ? _renderer.GetConsoleVar("d_MouseFix") : null;
+		if (variable && _renderer.GetVarValueFloat(variable)==0f)
+			return;
+		if (_tick_count_import !is null)
+			return;
+
+		ubyte* image=cast(ubyte*)GetModuleHandleA(null);
+		auto dos=cast(IMAGE_DOS_HEADER*)image;
+		auto nt=cast(IMAGE_NT_HEADERS32*)(image+dos.e_lfanew);
+		const auto directory=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (directory.VirtualAddress==0)
+			return;
+
+		for (auto descriptor=cast(IMAGE_IMPORT_DESCRIPTOR*)(image+directory.VirtualAddress); descriptor.Name; ++descriptor)
+		{
+			const char* dll=cast(const char*)(image+descriptor.Name);
+			if (lstrcmpiA(dll, "kernel32.dll")!=0)
+				continue;
+
+			uint* names=cast(uint*)(image+(descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk));
+			void** slots=cast(void**)(image+descriptor.FirstThunk);
+			for (size_t i=0; names[i]; ++i)
+			{
+				if (names[i] & 0x80000000)
+					continue; // by ordinal
+				const char* name=cast(const char*)(image+names[i]+2);
+				if (strcmp(name, "GetTickCount")!=0)
+					continue;
+
+				uint old_protect;
+				if (!VirtualProtect(&slots[i], (void*).sizeof, PAGE_READWRITE, &old_protect))
+					return;
+				{
+					import core.sys.windows.mmsystem: timeGetTime;
+					_tick_count_offset=GetTickCount()-timeGetTime()-16;
+				}
+				_original_tick_count=slots[i];
+				slots[i]=cast(void*)&FineTickCount;
+				VirtualProtect(&slots[i], (void*).sizeof, old_protect, &old_protect);
+				_tick_count_import=&slots[i];
+				test_out.writeln("Mouse input fix: GetTickCount -> timeGetTime (1 ms)");
+				return;
+			}
+		}
+	}
+
+	void RemoveMouseInputFix()
+	{
+		if (_tick_count_import is null)
+			return;
+		uint old_protect;
+		if (VirtualProtect(_tick_count_import, (void*).sizeof, PAGE_READWRITE, &old_protect))
+		{
+			*_tick_count_import=_original_tick_count;
+			VirtualProtect(_tick_count_import, (void*).sizeof, old_protect, &old_protect);
+		}
+		_tick_count_import=null;
 	}
 
 	//// Game speed above 100 fps
@@ -1081,6 +1199,12 @@ LAB_0004814b:
 	enum Timing { Game, Scene, Acquire, Uniforms, Overlay, ObjectUpload, Record, Submit, Present, GpuWait }
 	long[Timing.max+1] _timing;
 	float _last_game_time=-1f;
+
+	// smoothness diagnostics: camera rotation changes per scene, and frame-to-frame present intervals
+	float[4] _last_camera_rotation=[0f, 0f, 0f, 1f];
+	uint _rotation_changed_frames, _rotation_same_frames;
+	MonoTime _last_present;
+	long _interval_min=long.max, _interval_max, _interval_sum, _interval_sq_sum, _interval_count;
 	MonoTime _t_frame_end;
 
 	import core.time: MonoTime, seconds;
@@ -1106,6 +1230,17 @@ LAB_0004814b:
 				_fog_enable, _fog_range, _fog_colour);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
+			if (_interval_count>0)
+			{
+				import std.math: sqrt;
+				const double mean=cast(double)_interval_sum/_interval_count;
+				const double deviation=sqrt(cast(double)_interval_sq_sum/_interval_count-mean*mean);
+				test_out.writefln("  present interval ms: mean %.3f, min %.3f, max %.3f, std dev %.3f; camera rotation changed in %d scenes, unchanged in %d",
+					mean/1000, _interval_min/1000.0, _interval_max/1000.0, deviation/1000, _rotation_changed_frames, _rotation_same_frames);
+				_interval_min=long.max;
+				_interval_max=_interval_sum=_interval_sq_sum=_interval_count=0;
+				_rotation_changed_frames=_rotation_same_frames=0;
+			}
 			{
 				// the local server's game clock against real time (g_pServerMgr CLIENT.EXE RVA 0x91728, m_GameTime +0x20c):
 				// 1.00 is normal speed
@@ -3611,6 +3746,7 @@ private:
 		_vertex_buffer=VK_NULL_ND_HANDLE;
 		_vertex_index_buffer=VK_NULL_ND_HANDLE;
 		index_count=0;
+		_animated_polygons.length=0; // the level's polygons are about to go away
 
 		DestroyLightmapAtlas();
 	}
@@ -3715,7 +3851,118 @@ private:
 		CreateVertexBuffer(cast(VkDeviceSize)(Vertex.sizeof*vert_buffer.length), vert_buffer.ptr, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, _vertex_buffer, _vertex_buffer_memory);
 		CreateVertexBuffer(cast(VkDeviceSize)(uint.sizeof*indices.length), indices.ptr, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, _vertex_index_buffer, _vertex_index_memory);
 
+		FindAnimatedSurfaces(bsp, vert_buffer);
+
 		test_out.writeln("-- End create BSP, ", vert_buffer.length);
+	}
+
+	//// Surface effects (Pan, Rotate, Warble: the train's scrolling tunnel, ...). Each frame the engine moves the
+	//// surface's texture vectors and regenerates the UVs of its polygons in memory (blood2_recon ClientShell.cpp:
+	//// UpdateEffect, then w_GenerateTextureCoordinates for every poly of the surface). The main world's vertex buffer
+	//// is built once per level, so those polygons' UVs are copied into it again whenever they change.
+
+	struct AnimatedPolygon
+	{
+		Polygon* polygon;
+		uint first_vertex; // in the world vertex buffer
+	}
+	AnimatedPolygon[] _animated_polygons;
+	Vertex[] _animated_vertices; // CPU copy of their vertices, in _animated_polygons order
+	size_t[] _animated_offsets; // each polygon's start in _animated_vertices
+
+	enum : size_t
+	{
+		MainWorldSurfaceEffectsOffset=0x00, // SurfaceEffectInst* list
+		SurfaceEffectBspOffset=0x00, SurfaceEffectSurfaceOffset=0x04, SurfaceEffectNextOffset=0x10,
+		SurfaceFirstPolyOffset=0x58, // WORD poly index, 0xffff = none
+		PolygonNextPolyOffset=0x38, // WORD: next poly with the same surface
+	}
+
+	void FindAnimatedSurfaces(WorldBsp* bsp, const Vertex[] vertices)
+	{
+		import Main: g_RenderContext;
+		import LTObjects: At;
+
+		_animated_polygons.length=0;
+		_animated_vertices.length=0;
+		_animated_offsets.length=0;
+
+		MainWorld* world=g_RenderContext ? g_RenderContext.main_world : null;
+		if (world is null)
+			return;
+
+		// each main-world polygon's first vertex, as laid out above (invisible polygons have none)
+		uint[Polygon*] first_vertex;
+		uint next_vertex=0;
+		foreach(polygon; bsp.polygons[0..bsp.polygon_count])
+		{
+			if (polygon.surface.flags & SurfaceFlags.Invisible)
+				continue;
+			first_vertex[polygon]=next_vertex;
+			next_vertex+=polygon.DiskVerts().length;
+		}
+
+		uint guard=0;
+		for (void* effect=At!(void*)(world, MainWorldSurfaceEffectsOffset); effect !is null && guard<10_000;
+			effect=At!(void*)(effect, SurfaceEffectNextOffset), ++guard)
+		{
+			if (At!(WorldBsp*)(effect, SurfaceEffectBspOffset)!=bsp)
+				continue; // world models' surfaces: their geometry is read fresh every frame anyway
+			void* surface=At!(void*)(effect, SurfaceEffectSurfaceOffset);
+			if (surface is null)
+				continue;
+
+			uint chain=0;
+			for (uint index=At!ushort(surface, SurfaceFirstPolyOffset); index!=0xFFFF && index<bsp.polygon_count && chain<65536;
+				index=At!ushort(bsp.polygons[index], PolygonNextPolyOffset), ++chain)
+			{
+				Polygon* polygon=bsp.polygons[index];
+				if (const uint* first=polygon in first_vertex)
+				{
+					_animated_polygons~=AnimatedPolygon(polygon, *first);
+					_animated_offsets~=_animated_vertices.length;
+					_animated_vertices~=vertices[*first..*first+polygon.DiskVerts().length];
+				}
+			}
+		}
+
+		test_out.writeln("Surface effects: ", guard, " effects, ", _animated_polygons.length, " animated polygons");
+	}
+
+	// outside the render pass: the animated polygons whose UVs changed since the last frame
+	void RecordAnimatedSurfaceUpdates(VkCommandBuffer buffer)
+	{
+		if (_animated_polygons.length==0 || _vertex_buffer==VK_NULL_ND_HANDLE)
+			return;
+
+		bool any=false;
+		foreach(i, ref animated; _animated_polygons)
+		{
+			auto disk=animated.polygon.DiskVerts();
+			Vertex[] copy=_animated_vertices[_animated_offsets[i].._animated_offsets[i]+disk.length];
+
+			bool changed=false;
+			foreach(j, ref vertex; copy)
+				if (vertex.uv!=disk[j].uv)
+				{
+					vertex.uv=disk[j].uv;
+					changed=true;
+				}
+			if (!changed)
+				continue;
+
+			vkCmdUpdateBuffer(buffer, _vertex_buffer, animated.first_vertex*Vertex.sizeof, copy.length*Vertex.sizeof, copy.ptr);
+			any=true;
+		}
+
+		if (any)
+		{
+			VkMemoryBarrier barrier={
+				srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
+				dstAccessMask: VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+			};
+			vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, null, 0, null);
+		}
 	}
 }
 
