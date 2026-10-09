@@ -34,11 +34,17 @@ each can be switched off, and with all of them off the image is the d3d.ren repr
 | Water: normals, Fresnel, refraction | polygrid normals from the height field, scene colour/depth copy before translucents | heights, env map | water classification (container under the grid) | high / medium |
 | SSAO/GTAO applied to the ambient term only | depth prepass (the world is cheap to draw twice), half-res AO, AO sampled in the main pass | depth | – | medium–high / medium |
 | Dynamic-light shadows | cube/atlas shadow maps for a few selected lights | light positions, all geometry | – | medium / high |
-| Shadows from static lights | – | – | static light positions (not in the runtime data) | not feasible without extra data |
+| Shadows and specular from static lights | read the static lights from the world file | positions, colours, radii, spot directions in the .dat | the bake formula; the world file name at run time | medium–high / medium |
 
-Not feasible without new data: specular or shadows from the static (baked) lights. The light grid stores no direction,
-and the static lights themselves don't exist at run time. Directional lightmaps or light-position extraction from the
-level files could add that later.
+Static (baked) lights don't exist at run time, but the level files still have them. The editor's `Light`, `DirLight`,
+`GlobalDirLight` and `ObjectLight` classes are flagged CF_NORUNTIME: the engine reads their objects from the world file
+and skips them (LoadObjects, blood2_recon S_Object.cpp), but the objects and their properties are all there.
+`tools/world_objects.py` lists them. 04_steamtunnels has 535 `Light` objects (position, LightRadius, LightColor,
+OuterColor, BrightScale, ClipLight = shadowed in the bake, LightObjects = lights models), 171 `DirLight` objects
+(spotlights: Rotation as Euler angles, FOV, radius), 1 `ObjectLight`, and 7 `Water` volumes (surface height, texture,
+alpha, underwater fog). With them, models can be lit from the real lamps' directions, static lights can give specular
+and model shadows, and polygrids inside a `Water` volume can be told apart from other polygrids. Still to establish: the
+bake formula (fit against captures of lightmapped surfaces), and how d_ren finds the loaded world's file at run time.
 
 ## Plan
 
