@@ -815,6 +815,44 @@ public:
 		test_out.flush();
 	}
 
+	// the loaded world's static lights, read from its world file (world_file.d)
+	import WorldFile: StaticLight;
+	StaticLight[] _static_lights;
+
+	void LoadStaticLights()
+	{
+		import WorldFile: OpenGameFile, ReadStaticLights;
+
+		_static_lights=null;
+		const string world=LoadedWorldFile();
+		if (!world.length)
+		{
+			test_out.writeln("Static lights: the world file is unknown");
+			return;
+		}
+		const MonoTime start=MonoTime.currTime;
+		try
+		{
+			auto file=OpenGameFile(world);
+			if (!file.valid)
+			{
+				test_out.writeln("Static lights: ", world, " isn't in the -rez sources");
+				return;
+			}
+			_static_lights=ReadStaticLights(file);
+		}
+		catch (Exception e)
+		{
+			test_out.writeln("Static lights: ", world, ": ", e.msg);
+			return;
+		}
+		uint[StaticLight.Kind.max+1] counts;
+		foreach(ref light; _static_lights)
+			counts[light.kind]++;
+		test_out.writefln("Static lights: %d point, %d spot, %d object-only, %d directional from %s (%d ms)", counts[0],
+			counts[1], counts[2], counts[3], world, (MonoTime.currTime-start).total!"msecs");
+	}
+
 	// The world file the single-player server loaded, e.g. "Worlds_steamtunnels.dat" (null if it can't be read):
 	// g_pServerMgr (CLIENT.EXE RVA 0x91728) +0x1a4 m_pWorldFile, a UsedFile whose first field is the hash element
 	// keyed by the file name, the key at +0x16 (blood2_recon servermgr_lt1.h, dhashtable.cpp HashElement). The world
@@ -4966,6 +5004,7 @@ private:
 
 		test_out.writeln("-- End create BSP, ", vert_buffer.length);
 		test_out.writeln("World file: ", LoadedWorldFile());
+		LoadStaticLights();
 	}
 
 	//// Surface effects (Pan, Rotate, Warble: the train's scrolling tunnel, ...). Each frame the engine moves the
