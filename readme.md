@@ -134,6 +134,28 @@ Logs: `vk_test.txt` (Vulkan setup; once a second: fps, object statistics, a per-
 and per pass on the GPU, frame pacing, how often the camera moved, and the game speed) and `test.txt` (engine calls, a
 once-a-second heartbeat, and any exception thrown inside the renderer). Both are in the game folder.
 
+## Testing tools
+For testing renderer changes without driving the game window by hand:
+
+- **Start in a level:** `+runworld worlds_steamtunnels` on the command line starts that world directly (it stops at the
+  level's "Press a key to continue" screen).
+- **Background mode:** `+d_Background 1` keeps the game running and rendering without focus and doesn't take the
+  foreground, so a test instance can run behind other windows. Normally the engine shuts the renderer down when the
+  window loses focus.
+- **Command file:** d_ren runs the lines of `d_ren_cmd.txt` in the game folder (and deletes it). Lines are console
+  commands, plus `key <name> ...` (posts key presses to the game window: `space`, `enter`, `escape`, `f6`, letters...),
+  `wait <ms>`, and `capture`.
+- **Camera bookmarks:** `d_ViewSave <name>` stores the camera in `d_ren_views.txt`; `d_View <name>` renders from it
+  (without moving the player; the view weapon is hidden meanwhile); `d_View 0` goes back to the player's view.
+- **Debug captures:** `capture <name> [<label>:<key>=<value>,... ...]` renders the current frame again once per variant
+  and writes `captures\<name>_<label>.png`, the depth (`<name>_depth.f32`) and `<name>.json`: camera and matrices,
+  settings, lights, per-variant GPU time, and what drew each pixel. Variant keys: `view` (`final`, `light`, `dynamic`,
+  `normal`, `id`, `specular`, `lights`), `lighting`, `specular`, `falloff`, `aa`, `compare`, `hud`. For example
+  `capture spot classic:lighting=0 modern:lighting=1 id:view=id`.
+- `tools/analyze_capture.py <captures folder> <name>` reads a capture: what's at the crosshair or a pixel (`--at X Y`)
+  and which lights reach it, coverage and light terms per surface (`--surfaces`), and per-surface changes between two
+  variants (`--diff A B`).
+
 ## Building
 LithTech 1 is 32-bit only, so the renderer must be built as 32-bit. A 64-bit build fails one of the static asserts that
 check the shared structure layouts.

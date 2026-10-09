@@ -22,7 +22,8 @@ import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
 import SceneGeometry: ObjectGeometry, BatchLighting;
 import LTObjects: LTObject, DynamicLight;
 import EffectsDraw: EffectView;
-import PostProcess: PostProcess, AntiAliasing;
+import PostProcess: PostProcess, AntiAliasing, MakeScenePass, MakeColourPass;
+import DebugCapture;
 
 File test_out; //import Main: test_out;
 
@@ -80,6 +81,8 @@ struct LightListUbo
 	float specular=0f;
 	float[4] camera; // eye position, falloff exponent
 	float[4] model_light; // towards the models' fixed light, specular exponent
+	uint debug_view; // DebugView: one lighting term instead of the colour (debug captures)
+	private float[3] debug_pad;
 	LightObj[MaxLightCount] lights;
 }
 
@@ -264,6 +267,7 @@ public:
 		vkDeviceWaitIdle(g_Device);
 		DestroyOverlay();
 		DestroyObjectRendering();
+		DestroyCaptureTarget(true);
 		_post.Destroy();
 		if (_gpu_timer!=VK_NULL_ND_HANDLE)
 			vkDestroyQueryPool(g_Device, _gpu_timer, null);
@@ -300,6 +304,7 @@ public:
 		// before the DLL can unload: the imports must not point into it
 		RemoveMouseInputFix();
 		RemoveCursorGuard();
+		RemoveFocusFilter();
 		{
 			import core.sys.windows.mmsystem: timeEndPeriod;
 			timeEndPeriod(1);
@@ -309,7 +314,10 @@ public:
 
 	override void InitFrom(void* window)
 	{
-		test_out.open("vk_test.txt", "w");
+		// the engine unloads and loads the renderer again (focus changes, mode changes): one log per game run
+		__gshared bool log_started;
+		test_out.open("vk_test.txt", log_started ? "a" : "w");
+		log_started=true;
 		{
 			import VersionInfo: DRenVersion;
 			test_out.writeln("d_ren ", DRenVersion);
@@ -328,7 +336,16 @@ public:
 			_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
 			SetupWindow(cast(HWND)window);
 			InstallCursorGuard(cast(HWND)window);
-			BringToForeground(cast(HWND)window);
+			InstallFocusFilter(cast(HWND)window);
+			// a background test run (d_Background 1) mustn't take the foreground; the engine only runs its client after a
+			// WM_ACTIVATEAPP(TRUE), which a window that never had focus doesn't get, so it's told it's active instead
+			if (_renderer && _renderer.GetConsoleVar("d_Background") && _renderer.GetVarValueFloat(_renderer.GetConsoleVar("d_Background"))!=0f)
+			{
+				_keep_running=true;
+				PostMessageA(cast(HWND)window, WM_ACTIVATEAPP, TRUE, 0);
+			}
+			else
+				BringToForeground(cast(HWND)window);
 
 			// d3d.ren hides the cursor for the renderer's lifetime (d3d_init.cpp, shown again in d3d_FreeDDraw); d_ren
 			// hides it while the game has focus
@@ -506,7 +523,7 @@ public:
 	enum uint PushConstantFloats=24;
 
 	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World,
-		const BatchLighting lighting=BatchLighting.init)
+		const BatchLighting lighting=BatchLighting.init, float draw_id=0f)
 	{
 		const float[2] range=fog==FogKind.Sky ? _sky_fog_range : _fog_range;
 		const bool fog_on=_fog_enable && fog!=FogKind.None && range[0]!=range[1];
@@ -516,7 +533,7 @@ public:
 			range[0], range[1], _fog_by_distance ? 1f : 0f, _saturate ? 1f : 0f,
 			_cloud_pan[0], _cloud_pan[1], _cloud_pan[2], _cloud_pan[3],
 			lighting.ambient[0], lighting.ambient[1], lighting.ambient[2], cast(float)lighting.kind,
-			lighting.directional[0], lighting.directional[1], lighting.directional[2], 0f
+			lighting.directional[0], lighting.directional[1], lighting.directional[2], draw_id
 		];
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 			constants.sizeof, constants.ptr);
@@ -606,6 +623,7 @@ public:
 			vkDestroyImageView(g_Device, buffer.view, null);
 		}
 		_post.DestroyTargets();
+		DestroyCaptureTarget(false);
 		vkDestroyImageView(g_Device, _depth_image_view, null);
 		DestroyAllocImage(g_Allocator, _depth_image);
 		vkDestroySwapchainKHR(g_Device, _swapchain, null);
@@ -667,6 +685,8 @@ public:
 	float fov_x=1.5708f, fov_y=1.2f; // radians, from the scene
 	override void RenderScene(SceneDesc* scene_desc) // vkCmd*
 	{
+		if (!ApplyViewBookmark(scene_desc))
+			return;
 		_scene_rendered=true;
 		_global_light_scale=scene_desc.global_light_scale.vector;
 
@@ -733,6 +753,106 @@ public:
 			} while (uVar9 < g_pWorldBsp->leaf_count);
 		}
 		+/
+	}
+
+	//// Camera bookmarks, for repeatable tests: console "d_ViewSave <name>" stores the camera in d_ren_views.txt (in the
+	//// game folder, one "name x y z qx qy qz qw" line each), "d_View <name>" renders from that camera instead of the
+	//// player's until "d_View 0". d_ren draws the whole level every frame, so any viewpoint works without moving the
+	//// player. The view weapon is left out meanwhile (it's placed relative to the player's camera).
+
+	float[7][string] _views;
+	string _view_in_use; // for the log
+
+	string ConsoleString(const(char)* name)
+	{
+		import Main: _renderer;
+		import std.string: fromStringz, strip;
+		void* variable=_renderer ? _renderer.GetConsoleVar(name) : null;
+		const(char)* value=variable ? _renderer.GetVarValueString(variable) : null;
+		return value ? value.fromStringz.idup.strip : null;
+	}
+
+	void LoadViews()
+	{
+		import std.file: exists, readText;
+		import std.string: split, splitLines;
+		import std.conv: to;
+		_views=null;
+		try
+		{
+			if (!exists("d_ren_views.txt"))
+				return;
+			foreach(line; readText("d_ren_views.txt").splitLines)
+			{
+				string[] words=line.split;
+				if (words.length!=8)
+					continue;
+				float[7] view;
+				foreach(i; 0..7)
+					view[i]=words[i+1].to!float;
+				_views[words[0]]=view;
+			}
+		}
+		catch (Exception e)
+			test_out.writeln("d_ren_views.txt: ", e.msg);
+	}
+
+	void SaveView(string name, const SceneDesc* scene_desc)
+	{
+		import std.file: write;
+		import std.format: format;
+		import std.algorithm: sort;
+		LoadViews();
+		const float[3] p=scene_desc.camera_position.vector;
+		const float[4] q=scene_desc.camera_rotation;
+		_views[name]=[p[0], p[1], p[2], q[0], q[1], q[2], q[3]];
+		string text;
+		foreach(key; _views.keys.sort)
+		{
+			const float[7] v=_views[key];
+			text~=format("%s %.3f %.3f %.3f %.6f %.6f %.6f %.6f\n", key, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+		}
+		try write("d_ren_views.txt", text);
+		catch (Exception e) test_out.writeln("d_ren_views.txt: ", e.msg);
+		test_out.writeln("view saved: ", name, " ", _views[name]);
+	}
+
+	// false: leave this scene out (the view weapon while a bookmark is in use)
+	bool ApplyViewBookmark(SceneDesc* scene_desc)
+	{
+		import Main: _renderer;
+		import std.string: toStringz;
+
+		const bool normal=scene_desc.draw_mode!=DrawMode.ObjectList;
+		const string save=ConsoleString("d_ViewSave");
+		if (normal && save.length && save!="0")
+		{
+			SaveView(save, scene_desc);
+			_renderer.RunConsoleString("d_ViewSave 0");
+		}
+
+		const string name=ConsoleString("d_View");
+		if (!name.length || name=="0")
+		{
+			_view_in_use=null;
+			return true;
+		}
+		if (name !in _views)
+			LoadViews();
+		const float[7]* view=name in _views;
+		if (view is null)
+		{
+			if (_view_in_use!=name)
+				test_out.writeln("d_View: no view called ", name, " in d_ren_views.txt");
+			_view_in_use=name;
+			return true;
+		}
+		_view_in_use=name;
+		if (!normal)
+			return false;
+		scene_desc.camera_position.vector=(*view)[0..3];
+		scene_desc.camera_rotation=(*view)[3..7];
+		return true;
 	}
 
 	private void DrawBSP(Node* node)
@@ -895,146 +1015,11 @@ LAB_0004814b:
 			UpdateCloudPan();
 			Mark(Timing.Uniforms);
 
-			void SetCommandBuffer(size_t image_index)
-			{
-				// release clears to black, there's holes in some maps (notably the train levels) that let you see the clear
-				// colour and black is expected; debug clears the scene area separately below
-				VkClearValue[] clear_colour=[ { color: {[ 0f, 0f, 0f, 1f ]} }, { depthStencil: { 1f, 0 } } ];
-
-				auto buffer=_command_buffers[image_index];
-
-				// with a post effect on, the scene goes to the offscreen image and the post pass draws it into the swapchain
-				const bool post=_scene_rendered && _anti_aliasing!=AntiAliasing.Off;
-				VkRenderPassBeginInfo render_pass_begin_info={
-					renderPass: post ? _post.scene_pass : _render_pass,
-					framebuffer: post ? _post.scene_framebuffer : _buffers[image_index].framebuffer,
-					renderArea: {
-						offset: { 0, 0 },
-						extent: _extents
-					},
-					clearValueCount: clear_colour.length,
-					pClearValues: clear_colour.ptr
-				};
-
-				VkCommandBufferBeginInfo command_buffer_begin_info;
-
-				vkBeginCommandBuffer(buffer, &command_buffer_begin_info);
-				if (_gpu_timer!=VK_NULL_ND_HANDLE)
-				{
-					vkCmdResetQueryPool(buffer, _gpu_timer, 0, GpuStamp.max+1);
-					vkCmdWriteTimestamp(buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _gpu_timer, GpuStamp.Start);
-				}
-				RecordOverlayCopy(buffer);
-				RecordAnimatedSurfaceUpdates(buffer);
-				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-
-				// dynamic state of the world pipeline
-				SetViewport(buffer, _scene_viewport);
-
-				// the render pass clears to black like d3d.ren, which is what holes in the world show (the gaps between the
-				// train's cars in the first level); console "d_DebugClear 1" shows them in a loud colour instead
-				if (_debug_clear && _scene_rendered)
-				{
-					VkClearAttachment clear_attachment={
-						aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
-						colorAttachment: 0,
-						clearValue: { color: {[ 0.4f, 0.58f, 0.93f, 1f ]} } // never clear to black! Black hides bugs!
-					};
-					VkClearRect clear_rect={ rect: ScissorOf(_scene_viewport), baseArrayLayer: 0, layerCount: 1 };
-					vkCmdClearAttachments(buffer, 1, &clear_attachment, 1, &clear_rect);
-				}
-
-				// d3d.ren draws the sky before any world geometry, without depth (port_notes/sky.md)
-				RecordObjectDraws(buffer, image_index, true);
-
-				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
-				vkCmdSetLineWidth(buffer, 1f);
-				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
-				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
-				VkDescriptorSet cloud_texture=_cloud_descriptor!=VK_NULL_ND_HANDLE ? _cloud_descriptor : _texture_descriptor;
-				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 2, 1, &cloud_texture, 0, null);
-				PushBatchConstants(buffer, 0f);
-
-				if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
-				{
-					VkBuffer[] vertex_buffers=[ _vertex_buffer ];
-					VkDeviceSize[] offsets=[ 0 ];
-
-					vkCmdBindVertexBuffers(buffer, 0, vertex_buffers.length, vertex_buffers.ptr, offsets.ptr);
-					vkCmdBindIndexBuffer(buffer, _vertex_index_buffer, 0, VK_INDEX_TYPE_UINT32);
-
-					WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
-
-					// the index buffer holds every visible polygon in order; sky_portals selects which ones a pass draws
-					void DrawPolygons(bool sky_portals)
-					{
-						size_t index_start=0;
-						RenderTexture last_texture=null;
-						bool first=true;
-
-						foreach(i, polygon; bsp.polygons[0..bsp.polygon_count])
-						{
-							if (polygon.surface.flags & SurfaceFlags.Invisible)
-								continue;
-
-							const int vert_count=(polygon.DiskVerts().length-2)*3;
-							scope(exit) index_start+=vert_count;
-
-							if (((polygon.surface.flags & SurfaceFlags.Sky)!=0)!=sky_portals)
-								continue;
-
-							// unbound (or never bound) textures fall back to the dummy texture
-							SharedTexture* shared_texture=polygon.surface.shared_texture;
-							RenderTexture this_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
-							if (!sky_portals && (first || last_texture !is this_texture))
-							{
-								first=false;
-								last_texture=this_texture;
-								VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
-								vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
-								PushBatchConstants(buffer, (this_texture && this_texture.fullbright) ? 1f : 0f);
-							}
-
-							vkCmdDrawIndexed(buffer, vert_count, 1, index_start, 0, 0);
-						}
-					}
-
-					// sky portals are never drawn in d3d.ren, so the sky shows through them; here they write depth only, which
-					// keeps world geometry behind them (that d3d.ren's visibility wouldn't draw) from covering the sky
-					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_depth_only);
-					DrawPolygons(true);
-					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
-					DrawPolygons(false);
-				}
-				Stamp(buffer, GpuStamp.World);
-
-				RecordObjectDraws(buffer, image_index, false);
-				Stamp(buffer, GpuStamp.Objects);
-
-				if (post)
-				{
-					vkCmdEndRenderPass(buffer);
-					VkRenderPassBeginInfo present_begin_info={
-						renderPass: _post.present_pass,
-						framebuffer: _post.present_framebuffers[image_index],
-						renderArea: { offset: { 0, 0 }, extent: _extents }
-					};
-					vkCmdBeginRenderPass(buffer, &present_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-					_post.Record(buffer, _anti_aliasing, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f);
-				}
-				Stamp(buffer, GpuStamp.Post);
-				RecordOverlayDraw(buffer, post ? _overlay_pipeline_present : _overlay_pipeline);
-				Stamp(buffer, GpuStamp.Overlay);
-
-				vkCmdEndRenderPass(buffer);
-				vkEndCommandBuffer(buffer);
-			}
-
 			UploadOverlay();
 			Mark(Timing.Overlay);
 			UploadObjects();
 			Mark(Timing.ObjectUpload);
-			SetCommandBuffer(image_index);
+			RecordFrame(_command_buffers[image_index], image_index, SwapchainTarget(image_index));
 			Mark(Timing.Record);
 
 			VkPipelineStageFlags[] wait_stages = [ VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT ];
@@ -1081,6 +1066,11 @@ LAB_0004814b:
 		Mark(Timing.GpuWait);
 		ReadGpuTimer();
 
+		// the command file, and a requested capture of this frame (its geometry is still here)
+		PollCommands();
+		if (_capture_request !is null && res!=VK_ERROR_OUT_OF_DATE_KHR)
+			RunCapture(image_index);
+
 		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
 			RecreateSwapchain();
 		_scene_rendered=false;
@@ -1091,6 +1081,173 @@ LAB_0004814b:
 		LimitFrameRate();
 		_t_frame_end=MonoTime.currTime;
 	}
+
+	// where a frame goes: the swapchain image, or a debug capture's image
+	struct FrameTarget
+	{
+		VkRenderPass scene_pass; // without post effects the scene and the 2D layer go here
+		VkFramebuffer scene_framebuffer;
+		VkRenderPass present_pass; // with post effects: post.frag and the 2D layer
+		VkFramebuffer present_framebuffer;
+		bool overlay=true; // the 2D layer
+		bool uploads=true; // the frame's uploads (2D layer, animated surfaces), once per frame
+	}
+
+	FrameTarget SwapchainTarget(uint image_index)
+	{
+		return FrameTarget(_render_pass, _buffers[image_index].framebuffer, _post.present_pass, _post.present_framebuffers[image_index]);
+	}
+
+	// the frame's command buffer
+	void RecordFrame(VkCommandBuffer buffer, uint image_index, const FrameTarget target)
+	{
+		VkCommandBufferBeginInfo begin_info;
+		vkBeginCommandBuffer(buffer, &begin_info);
+		RecordFrameBody(buffer, image_index, target);
+		vkEndCommandBuffer(buffer);
+	}
+
+	// its commands: sky, world, objects, post-processing, 2D layer
+	void RecordFrameBody(VkCommandBuffer buffer, uint image_index, const FrameTarget target)
+	{
+		import Main: g_RenderContext;
+
+		// release clears to black, there's holes in some maps (notably the train levels) that let you see the clear
+		// colour and black is expected; debug clears the scene area separately below
+		VkClearValue[] clear_colour=[ { color: {[ 0f, 0f, 0f, 1f ]} }, { depthStencil: { 1f, 0 } } ];
+
+		// with a post effect on, the scene goes to the offscreen image and the post pass draws it into the target; debug
+		// views are never post-processed
+		const bool post=_scene_rendered && _anti_aliasing!=AntiAliasing.Off && _debug_view==DebugView.Final;
+		VkRenderPassBeginInfo render_pass_begin_info={
+			renderPass: post ? _post.scene_pass : target.scene_pass,
+			framebuffer: post ? _post.scene_framebuffer : target.scene_framebuffer,
+			renderArea: {
+				offset: { 0, 0 },
+				extent: _extents
+			},
+			clearValueCount: clear_colour.length,
+			pClearValues: clear_colour.ptr
+		};
+
+		if (_gpu_timer!=VK_NULL_ND_HANDLE)
+		{
+			vkCmdResetQueryPool(buffer, _gpu_timer, 0, GpuStamp.max+1);
+			vkCmdWriteTimestamp(buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _gpu_timer, GpuStamp.Start);
+		}
+		if (target.uploads)
+		{
+			RecordOverlayCopy(buffer);
+			RecordAnimatedSurfaceUpdates(buffer);
+		}
+		vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+
+		// dynamic state of the world pipeline
+		SetViewport(buffer, _scene_viewport);
+
+		// the render pass clears to black like d3d.ren, which is what holes in the world show (the gaps between the
+		// train's cars in the first level); console "d_DebugClear 1" shows them in a loud colour instead
+		if (_debug_clear && _scene_rendered)
+		{
+			VkClearAttachment clear_attachment={
+				aspectMask: VK_IMAGE_ASPECT_COLOR_BIT,
+				colorAttachment: 0,
+				clearValue: { color: {[ 0.4f, 0.58f, 0.93f, 1f ]} } // never clear to black! Black hides bugs!
+			};
+			VkClearRect clear_rect={ rect: ScissorOf(_scene_viewport), baseArrayLayer: 0, layerCount: 1 };
+			vkCmdClearAttachments(buffer, 1, &clear_attachment, 1, &clear_rect);
+		}
+
+		// d3d.ren draws the sky before any world geometry, without depth (port_notes/sky.md)
+		RecordObjectDraws(buffer, image_index, true);
+
+		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+		vkCmdSetLineWidth(buffer, 1f);
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
+		VkDescriptorSet cloud_texture=_cloud_descriptor!=VK_NULL_ND_HANDLE ? _cloud_descriptor : _texture_descriptor;
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 2, 1, &cloud_texture, 0, null);
+		PushBatchConstants(buffer, 0f);
+
+		if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
+		{
+			VkBuffer[] vertex_buffers=[ _vertex_buffer ];
+			VkDeviceSize[] offsets=[ 0 ];
+
+			vkCmdBindVertexBuffers(buffer, 0, vertex_buffers.length, vertex_buffers.ptr, offsets.ptr);
+			vkCmdBindIndexBuffer(buffer, _vertex_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+
+			WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
+
+			// the index buffer holds every visible polygon in order; sky_portals selects which ones a pass draws
+			void DrawPolygons(bool sky_portals)
+			{
+				size_t index_start=0;
+				RenderTexture last_texture=null;
+				bool first=true;
+
+				foreach(i, polygon; bsp.polygons[0..bsp.polygon_count])
+				{
+					if (polygon.surface.flags & SurfaceFlags.Invisible)
+						continue;
+
+					const int vert_count=(polygon.DiskVerts().length-2)*3;
+					scope(exit) index_start+=vert_count;
+
+					if (((polygon.surface.flags & SurfaceFlags.Sky)!=0)!=sky_portals)
+						continue;
+
+					// unbound (or never bound) textures fall back to the dummy texture
+					SharedTexture* shared_texture=polygon.surface.shared_texture;
+					RenderTexture this_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
+					if (!sky_portals && (first || last_texture !is this_texture))
+					{
+						first=false;
+						last_texture=this_texture;
+						VkDescriptorSet texture_image=this_texture ? this_texture.texture_descriptor : _texture_descriptor;
+						vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture_image, 0, null);
+						PushBatchConstants(buffer, (this_texture && this_texture.fullbright) ? 1f : 0f);
+					}
+					// the id view names every polygon (its index + 1)
+					if (!sky_portals && _debug_view==DebugView.Id)
+						PushBatchConstants(buffer, (this_texture && this_texture.fullbright) ? 1f : 0f, FogKind.World,
+							BatchLighting.init, cast(float)(i+1));
+
+					vkCmdDrawIndexed(buffer, vert_count, 1, index_start, 0, 0);
+				}
+			}
+
+			// sky portals are never drawn in d3d.ren, so the sky shows through them; here they write depth only, which
+			// keeps world geometry behind them (that d3d.ren's visibility wouldn't draw) from covering the sky
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_depth_only);
+			DrawPolygons(true);
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+			DrawPolygons(false);
+		}
+		Stamp(buffer, GpuStamp.World);
+
+		RecordObjectDraws(buffer, image_index, false);
+		Stamp(buffer, GpuStamp.Objects);
+
+		if (post)
+		{
+			vkCmdEndRenderPass(buffer);
+			VkRenderPassBeginInfo present_begin_info={
+				renderPass: target.present_pass,
+				framebuffer: target.present_framebuffer,
+				renderArea: { offset: { 0, 0 }, extent: _extents }
+			};
+			vkCmdBeginRenderPass(buffer, &present_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+			_post.Record(buffer, _anti_aliasing, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f);
+		}
+		Stamp(buffer, GpuStamp.Post);
+		if (target.overlay)
+			RecordOverlayDraw(buffer, post ? _overlay_pipeline_present : _overlay_pipeline);
+		Stamp(buffer, GpuStamp.Overlay);
+
+		vkCmdEndRenderPass(buffer);
+	}
+
 
 	// console d_VSync (1) and d_MaxFPS (0 = unlimited); registered as saved options by Main.Init
 	bool _vsync=true, _swapchain_vsync=true;
@@ -1109,6 +1266,7 @@ LAB_0004814b:
 			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
 		}
 		_vsync=ConsoleFloat("d_VSync", 1f)!=0f;
+		_keep_running=ConsoleFloat("d_Background", 0f)!=0f;
 		const float max_fps=ConsoleFloat("d_MaxFPS", 0f);
 		_max_fps=max_fps>=1f ? cast(int)max_fps : 0;
 
@@ -1295,6 +1453,39 @@ LAB_0004814b:
 			ShowCursor(focused ? FALSE : TRUE);
 			_cursor_captured=focused;
 		}
+	}
+
+	//// Running in the background (console d_Background 1, for test runs): the engine shuts the renderer down and stops
+	//// the client when its window loses focus (WM_ACTIVATEAPP(FALSE), blood2_recon engine_jupiter/client.cpp). With the
+	//// option on, d_ren keeps that message from the engine's window procedure, so the game keeps running and rendering
+	//// behind other windows; the cursor guard already leaves the cursor alone then.
+
+	__gshared WNDPROC _engine_window_proc;
+	__gshared HWND _filtered_window;
+	__gshared bool _keep_running;
+
+	static extern(Windows) LRESULT FocusFilterProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) nothrow
+	{
+		if (message==WM_ACTIVATEAPP && !wparam && _keep_running)
+			return 0;
+		return CallWindowProcA(_engine_window_proc, window, message, wparam, lparam);
+	}
+
+	void InstallFocusFilter(HWND window)
+	{
+		if (_engine_window_proc !is null)
+			return;
+		_filtered_window=window;
+		_engine_window_proc=cast(WNDPROC)SetWindowLongA(window, GWL_WNDPROC, cast(LONG)&FocusFilterProc);
+	}
+
+	// before the DLL goes: the window must not call into it
+	void RemoveFocusFilter()
+	{
+		if (_engine_window_proc is null)
+			return;
+		SetWindowLongA(_filtered_window, GWL_WNDPROC, cast(LONG)_engine_window_proc);
+		_engine_window_proc=null;
 	}
 
 	void ReleaseCursor()
@@ -1517,6 +1708,429 @@ LAB_0004814b:
 		}
 	}
 
+	//// Commands and debug captures (debug_capture.d): the renderer runs the lines of d_ren_cmd.txt as console commands,
+	//// and "capture" renders the current frame again per variant into its own image, read back with depth and written
+	//// to captures\ with a JSON description
+
+	DebugView _debug_view; // the view the frame being recorded shows
+	float[16] _view_matrix, _proj_matrix; // the last frame's, as the shaders got them
+	CaptureRequest* _capture_request;
+	MonoTime _next_command_poll;
+
+	VkImage _capture_image;
+	VkMappedMemoryRange _capture_image_memory;
+	VkImageView _capture_view;
+	VkRenderPass _capture_scene_pass, _capture_present_pass;
+	VkFramebuffer _capture_scene_framebuffer, _capture_present_framebuffer;
+	VkBuffer _capture_colour_buffer, _capture_depth_buffer;
+	VkMappedMemoryRange _capture_colour_memory, _capture_depth_memory;
+	VkCommandBuffer _capture_command_buffer;
+	VkExtent2D _capture_extent;
+
+	// the command file's lines run in order, one batch per frame up to a "wait <ms>"
+	string[] _command_queue;
+	MonoTime _command_resume;
+
+	void PollCommands()
+	{
+		import Main: _renderer;
+		import std.string: toStringz, split, toLower;
+		import std.conv: to;
+		import core.time: dur;
+
+		const MonoTime now=MonoTime.currTime;
+		if (now>=_next_command_poll)
+		{
+			_next_command_poll=now+dur!"msecs"(250);
+			_command_queue~=PollCommandFile("d_ren_cmd.txt");
+		}
+
+		while (_command_queue.length && now>=_command_resume && _capture_request is null)
+		{
+			const string line=_command_queue[0];
+			_command_queue=_command_queue[1..$];
+			test_out.writeln("command: ", line);
+			string[] words=line.split;
+			if (CaptureRequest* request=ParseCapture(line))
+				_capture_request=request;
+			else if (words[0].toLower=="wait" && words.length==2)
+			{
+				try _command_resume=now+dur!"msecs"(words[1].to!long);
+				catch (Exception) {}
+			}
+			else if (words[0].toLower=="key")
+			{
+				foreach(name; words[1..$])
+					if (!PostKey(name))
+						test_out.writeln("key: unknown key ", name);
+			}
+			else if (_renderer && _renderer.RunConsoleString)
+				_renderer.RunConsoleString(line.toStringz);
+		}
+		test_out.flush();
+	}
+
+	// a key press posted to the game window: the engine collects WM_KEYDOWN / WM_KEYUP for the client shell's
+	// OnKeyDown (menus, "press a key to continue", F5 / F6) without needing focus (blood2_recon client.cpp)
+	bool PostKey(string name)
+	{
+		import std.string: toLower;
+		import std.conv: to;
+
+		uint vk;
+		const string key=name.toLower;
+		switch(key)
+		{
+			case "space": vk=VK_SPACE; break;
+			case "enter", "return": vk=VK_RETURN; break;
+			case "escape", "esc": vk=VK_ESCAPE; break;
+			case "up": vk=VK_UP; break;
+			case "down": vk=VK_DOWN; break;
+			case "left": vk=VK_LEFT; break;
+			case "right": vk=VK_RIGHT; break;
+			case "tab": vk=VK_TAB; break;
+			case "backspace": vk=VK_BACK; break;
+			default:
+				if (key.length==1 && ((key[0]>='a' && key[0]<='z') || (key[0]>='0' && key[0]<='9')))
+					vk=cast(uint)(key[0]>='a' ? key[0]-'a'+'A' : key[0]);
+				else if (key.length>=2 && key[0]=='f')
+				{
+					try vk=VK_F1+key[1..$].to!uint-1; catch (Exception) return false;
+				}
+				else
+					return false;
+		}
+		if (_game_window is null)
+			return false;
+		const uint scan=MapVirtualKeyA(vk, 0);
+		PostMessageA(_game_window, WM_KEYDOWN, vk, 1 | (scan << 16));
+		PostMessageA(_game_window, WM_KEYUP, vk, 1 | (scan << 16) | (1u << 30) | (1u << 31));
+		return true;
+	}
+
+	bool EnsureCaptureTarget()
+	{
+		if (_capture_image!=VK_NULL_ND_HANDLE && _capture_extent==_extents)
+			return true;
+		DestroyCaptureTarget(false);
+		_capture_extent=_extents;
+
+		CreateVkImage(_extents.width, _extents.height, _format, VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			_capture_image, _capture_image_memory);
+		if (_capture_image==VK_NULL_ND_HANDLE)
+			return false;
+		_capture_view=CreateImageView(_capture_image, _format, VK_IMAGE_ASPECT_COLOR_BIT);
+
+		// compatible with the main and post present passes, but ending ready to be copied (and keeping depth)
+		if (_capture_scene_pass==VK_NULL_ND_HANDLE)
+		{
+			_capture_scene_pass=MakeScenePass(_format, FindDepthFormat(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
+			_capture_present_pass=MakeColourPass(_format, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		}
+
+		VkImageView[2] scene_views=[_capture_view, _depth_image_view];
+		VkFramebufferCreateInfo scene_info={ renderPass: _capture_scene_pass, attachmentCount: 2, pAttachments: scene_views.ptr,
+			width: _extents.width, height: _extents.height, layers: 1 };
+		VkCheck(vkCreateFramebuffer(g_Device, &scene_info, null, &_capture_scene_framebuffer), "vkCreateFramebuffer (capture)");
+		VkFramebufferCreateInfo present_info={ renderPass: _capture_present_pass, attachmentCount: 1, pAttachments: &_capture_view,
+			width: _extents.width, height: _extents.height, layers: 1 };
+		VkCheck(vkCreateFramebuffer(g_Device, &present_info, null, &_capture_present_framebuffer), "vkCreateFramebuffer (capture present)");
+
+		const VkDeviceSize bytes=cast(VkDeviceSize)_extents.width*_extents.height*4;
+		CreateVkBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			_capture_colour_buffer, _capture_colour_memory);
+		CreateVkBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			_capture_depth_buffer, _capture_depth_memory);
+
+		if (_capture_command_buffer is null)
+		{
+			VkCommandBufferAllocateInfo alloc_info={ commandPool: _command_pool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1 };
+			vkAllocateCommandBuffers(g_Device, &alloc_info, &_capture_command_buffer);
+		}
+		return true;
+	}
+
+	// the size-dependent parts; everything when `all`
+	void DestroyCaptureTarget(bool all)
+	{
+		if (_capture_scene_framebuffer!=VK_NULL_ND_HANDLE) vkDestroyFramebuffer(g_Device, _capture_scene_framebuffer, null);
+		if (_capture_present_framebuffer!=VK_NULL_ND_HANDLE) vkDestroyFramebuffer(g_Device, _capture_present_framebuffer, null);
+		if (_capture_view!=VK_NULL_ND_HANDLE) vkDestroyImageView(g_Device, _capture_view, null);
+		if (_capture_image!=VK_NULL_ND_HANDLE) DestroyAllocImage(g_Allocator, _capture_image);
+		if (_capture_colour_buffer!=VK_NULL_ND_HANDLE) DestroyAllocBuffer(g_Allocator, _capture_colour_buffer);
+		if (_capture_depth_buffer!=VK_NULL_ND_HANDLE) DestroyAllocBuffer(g_Allocator, _capture_depth_buffer);
+		_capture_scene_framebuffer=_capture_present_framebuffer=VK_NULL_ND_HANDLE;
+		_capture_view=VK_NULL_ND_HANDLE;
+		_capture_image=VK_NULL_ND_HANDLE;
+		_capture_colour_buffer=_capture_depth_buffer=VK_NULL_ND_HANDLE;
+		_capture_extent=VkExtent2D(0, 0);
+		if (all)
+		{
+			if (_capture_scene_pass!=VK_NULL_ND_HANDLE) vkDestroyRenderPass(g_Device, _capture_scene_pass, null);
+			if (_capture_present_pass!=VK_NULL_ND_HANDLE) vkDestroyRenderPass(g_Device, _capture_present_pass, null);
+			_capture_scene_pass=_capture_present_pass=VK_NULL_ND_HANDLE;
+		}
+	}
+
+	// a variant's setting over the current ones; false if the key is unknown
+	bool ApplyCaptureSetting(string key, string value)
+	{
+		import std.conv: to;
+		try
+		{
+			switch(key)
+			{
+				case "lighting", "d_lighting": _modern_lighting=value!="0"; return true;
+				case "specular", "d_specular": _specular=value.to!float; return true;
+				case "falloff", "d_lightfalloff": _light_falloff=value.to!float; return true;
+				case "aa", "d_antialiasing": _anti_aliasing=value!="0" ? AntiAliasing.Fxaa : AntiAliasing.Off; return true;
+				case "compare", "d_compare": _compare=value!="0"; return true;
+				default: return false;
+			}
+		}
+		catch (Exception)
+			return false;
+	}
+
+	void RunCapture(uint image_index)
+	{
+		import std.file: mkdirRecurse, write;
+		import std.format: format;
+
+		CaptureRequest request=*_capture_request;
+		_capture_request=null;
+		// without a 3D scene (menus, loading screens) there's only the 2D layer to capture
+		if (!_scene_rendered)
+			request.variants=[CaptureVariant("screen", DebugView.Final, null, true)];
+		if (!EnsureCaptureTarget())
+		{
+			test_out.writeln("capture ", request.name, ": no capture image");
+			return;
+		}
+		try mkdirRecurse("captures"); catch (Exception) {}
+
+		const bool bgra=_format==VK_FORMAT_B8G8R8A8_UNORM || _format==VK_FORMAT_B8G8R8A8_SRGB;
+		const VkFormat depth_format=FindDepthFormat();
+		const bool depth_readable=depth_format==VK_FORMAT_D32_SFLOAT || depth_format==VK_FORMAT_D32_SFLOAT_S8_UINT;
+		const uint width=_extents.width, height=_extents.height;
+
+		// the settings the variants change, restored afterwards
+		const bool saved_modern=_modern_lighting, saved_compare=_compare;
+		const float saved_specular=_specular, saved_falloff=_light_falloff;
+		const AntiAliasing saved_aa=_anti_aliasing;
+		scope(exit)
+		{
+			_modern_lighting=saved_modern;
+			_compare=saved_compare;
+			_specular=saved_specular;
+			_light_falloff=saved_falloff;
+			_anti_aliasing=saved_aa;
+			_debug_view=DebugView.Final;
+			UpdateLightListUbo(image_index);
+		}
+
+		string variants_json;
+		bool[uint] ids_seen;
+		bool depth_written;
+		foreach(n, variant; request.variants)
+		{
+			_modern_lighting=saved_modern;
+			_specular=saved_specular;
+			_light_falloff=saved_falloff;
+			_anti_aliasing=saved_aa;
+			_compare=false;
+			string settings_json;
+			foreach(setting; variant.settings)
+			{
+				if (!ApplyCaptureSetting(setting[0], setting[1]))
+					test_out.writeln("capture ", request.name, ": unknown setting ", setting[0]);
+				settings_json~=(settings_json.length ? ", " : "")~JsonString(setting[0])~": "~JsonString(setting[1]);
+			}
+			_debug_view=variant.view;
+			UpdateLightListUbo(image_index);
+
+			const bool post=_anti_aliasing!=AntiAliasing.Off && variant.view==DebugView.Final;
+			FrameTarget target=FrameTarget(_capture_scene_pass, _capture_scene_framebuffer, _capture_present_pass,
+				_capture_present_framebuffer, variant.hud && variant.view==DebugView.Final, false);
+
+			VkCommandBuffer buffer=_capture_command_buffer;
+			vkResetCommandBuffer(buffer, 0);
+			const bool copy_depth=_scene_rendered && !post && depth_readable && !depth_written;
+			RecordFrameForCapture(buffer, image_index, target, copy_depth, width, height);
+			VkSubmitInfo submit_info={ commandBufferCount: 1, pCommandBuffers: &buffer };
+			vkQueueSubmit(_graphics_queue, 1, &submit_info, VK_NULL_ND_HANDLE);
+			vkQueueWaitIdle(_graphics_queue);
+
+			double[GpuStamp.max] stages;
+			ReadGpuStages(stages);
+
+			void* data;
+			vmaMapMemory(_capture_colour_memory, &data);
+			const(ubyte)[] pixels=(cast(const(ubyte)*)data)[0..cast(size_t)width*height*4];
+			const string file=format("%s_%s.png", request.name, variant.label);
+			try WritePng("captures\\"~file, width, height, pixels, bgra);
+			catch (Exception e) test_out.writeln("capture ", file, ": ", e.msg);
+			if (variant.view==DebugView.Id)
+				for (size_t i=0; i<pixels.length; i+=4)
+					ids_seen[bgra ? (pixels[i+2] | pixels[i+1] << 8 | pixels[i] << 16) : (pixels[i] | pixels[i+1] << 8 | pixels[i+2] << 16)]=true;
+			vmaUnmapMemory(_capture_colour_memory);
+
+			if (copy_depth)
+			{
+				vmaMapMemory(_capture_depth_memory, &data);
+				try write(format("captures\\%s_depth.f32", request.name), (cast(const(ubyte)*)data)[0..cast(size_t)width*height*4]);
+				catch (Exception e) test_out.writeln("capture depth: ", e.msg);
+				vmaUnmapMemory(_capture_depth_memory);
+				depth_written=true;
+			}
+
+			variants_json~=format("%s\n    {\"label\": %s, \"view\": %s, \"file\": %s, \"settings\": {%s}, \"hud\": %s, \"post\": %s, \"gpu_ms\": {\"sky_world\": %.4f, \"objects\": %.4f, \"post\": %.4f, \"2d\": %.4f}}",
+				n ? "," : "", JsonString(variant.label), JsonString(ViewName(variant.view)), JsonString(file), settings_json,
+				target.overlay, post, stages[0]/1000, stages[1]/1000, stages[2]/1000, stages[3]/1000);
+		}
+
+		try write(format("captures\\%s.json", request.name), CaptureJson(request.name, width, height, bgra,
+			depth_written ? format("%s_depth.f32", request.name) : null, variants_json, ids_seen));
+		catch (Exception e) test_out.writeln("capture json: ", e.msg);
+		test_out.writeln("capture ", request.name, ": ", request.variants.length, " variants, ", ids_seen.length, " ids");
+		test_out.flush();
+	}
+
+	// one variant: the frame into the capture image, then colour (and depth) copied to the readback buffers
+	void RecordFrameForCapture(VkCommandBuffer buffer, uint image_index, const FrameTarget target, bool copy_depth, uint width, uint height)
+	{
+		VkCommandBufferBeginInfo begin_info;
+		vkBeginCommandBuffer(buffer, &begin_info);
+		RecordFrameBody(buffer, image_index, target);
+
+		VkBufferImageCopy region={
+			imageSubresource: { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, mipLevel: 0, baseArrayLayer: 0, layerCount: 1 },
+			imageExtent: { width: width, height: height, depth: 1 }
+		};
+		vkCmdCopyImageToBuffer(buffer, _capture_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _capture_colour_buffer, 1, &region);
+
+		if (copy_depth)
+		{
+			const bool stencil=FindDepthFormat()==VK_FORMAT_D32_SFLOAT_S8_UINT;
+			VkImageMemoryBarrier to_copy={
+				srcAccessMask: VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT,
+				oldLayout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				newLayout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				srcQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+				dstQueueFamilyIndex: VK_QUEUE_FAMILY_IGNORED,
+				image: _depth_image,
+				subresourceRange: { aspectMask: VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0), levelCount: 1, layerCount: 1 }
+			};
+			vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &to_copy);
+			VkBufferImageCopy depth_region={
+				imageSubresource: { aspectMask: VK_IMAGE_ASPECT_DEPTH_BIT, mipLevel: 0, baseArrayLayer: 0, layerCount: 1 },
+				imageExtent: { width: width, height: height, depth: 1 }
+			};
+			vkCmdCopyImageToBuffer(buffer, _depth_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _capture_depth_buffer, 1, &depth_region);
+		}
+
+		VkMemoryBarrier to_host={ srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT, dstAccessMask: VK_ACCESS_HOST_READ_BIT };
+		vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, null, 0, null);
+		vkEndCommandBuffer(buffer);
+	}
+
+	// the capture's description: camera and matrices, settings, lights, variants, and what drew each id seen
+	string CaptureJson(string name, uint width, uint height, bool bgra, string depth_file, string variants_json, bool[uint] ids)
+	{
+		import std.format: format;
+		import std.algorithm: sort;
+		import std.conv: to;
+		import std.string: fromStringz;
+		import Main: g_RenderContext;
+		import SceneGeometry: DrawGroup, ObjectPipe, TextureMode, LightingKind;
+		import WorldModelDraw: g_LightmapOrigins;
+		import Objects.BaseObject: ObjectType;
+
+		string json="{\n";
+		json~=format("  \"name\": %s, \"width\": %d, \"height\": %d, \"pixel_order\": %s,\n", JsonString(name), width, height,
+			JsonString(bgra ? "bgra" : "rgba"));
+		json~=format("  \"viewport\": %s,\n", JsonFloats([_scene_viewport.x, _scene_viewport.y, _scene_viewport.width, _scene_viewport.height]));
+		json~=format("  \"camera\": {\"position\": %s, \"rotation\": %s, \"fov\": %s, \"near\": 0.1, \"far\": 15000},\n",
+			JsonFloats(camera_pos.vector), JsonFloats([camera_view.x, camera_view.y, camera_view.z, camera_view.w]), JsonFloats([fov_x, fov_y]));
+		json~=format("  \"matrices\": {\"layout\": \"column-major, clip = proj * view * world\", \"view\": %s, \"proj\": %s},\n",
+			JsonFloats(_view_matrix), JsonFloats(_proj_matrix));
+		json~=format("  \"depth\": %s,\n", depth_file ? format("{\"file\": %s, \"format\": \"float32 device depth 0..1, rows top to bottom\"}", JsonString(depth_file)) : "null");
+		json~=format("  \"settings\": {\"lighting\": %s, \"specular\": %.3f, \"falloff\": %.3f, \"aa\": %s, \"debug_light\": %.1f, \"fog\": %s, \"fog_range\": %s, \"fog_colour\": %s, \"fog_by_distance\": %s, \"saturate\": %s, \"global_light_scale\": %s},\n",
+			_modern_lighting, _specular, _light_falloff, _anti_aliasing!=AntiAliasing.Off, _debug_light, _fog_enable,
+			JsonFloats(_fog_range), JsonFloats(_fog_colour), _fog_by_distance, _saturate, JsonFloats(_global_light_scale));
+
+		json~="  \"lights\": [";
+		foreach(i, ref light; _world_lights[0..(_world_lights.length<MaxLightCount ? $ : MaxLightCount)])
+			json~=format("%s\n    {\"index\": %d, \"position\": %s, \"colour\": %s, \"radius\": %.2f, \"flags\": \"0x%x\"}", i ? "," : "", i,
+				JsonFloats(light.pos), JsonFloats(light.colour), light.radius, light.flags);
+		json~="\n  ],\n";
+
+		json~="  \"variants\": ["~variants_json~"\n  ],\n";
+
+		// ids: world polygons (index + 1) and object batches (IdObjectBase + draw-order index)
+		WorldBsp* bsp=(g_RenderContext && g_RenderContext.main_world) ? g_RenderContext.main_world.world_bsp : null;
+		uint[] sorted=ids.keys;
+		sort(sorted);
+		json~="  \"ids\": {";
+		bool first=true;
+		foreach(id; sorted)
+		{
+			string entry;
+			if (id==0)
+				entry="{\"kind\": \"none\"}";
+			else if (id<IdObjectBase)
+			{
+				if (bsp is null || id-1>=bsp.polygon_count)
+					continue;
+				Polygon* polygon=bsp.polygons[id-1];
+				string texture;
+				if (polygon.surface.texture_id<bsp.texture_count && bsp.textures)
+					texture=bsp.textures[polygon.surface.texture_id].fromStringz.idup;
+				float[3] normal=[0f, 0f, 0f];
+				if (polygon.surface.plane)
+					normal=polygon.surface.plane.vector.vector;
+				SharedTexture* shared_texture=polygon.surface.shared_texture;
+				RenderTexture render_texture=shared_texture ? cast(RenderTexture)shared_texture.render_data : null;
+				entry=format("{\"kind\": \"world\", \"polygon\": %d, \"texture\": %s, \"surface_flags\": \"0x%x\", \"lightmapped\": %s, \"fullbright\": %s, \"normal\": %s, \"centre\": %s}",
+					id-1, JsonString(texture), cast(uint)polygon.surface.flags, (polygon in g_LightmapOrigins)!is null,
+					render_texture && render_texture.fullbright, JsonFloats(normal), JsonFloats(polygon.center.vector));
+			}
+			else
+			{
+				size_t index=id-IdObjectBase;
+				entry=null;
+				foreach(group; 0..DrawGroup.max+1)
+				{
+					if (index<_objects.groups[group].length)
+					{
+						const batch=&_objects.groups[group][index];
+						string source="null";
+						if (LTObject* object=cast(LTObject*)batch.source)
+						{
+							string type;
+							try type=to!string(cast(ObjectType)object.type); catch (Exception) type=to!string(object.type);
+							source=format("{\"type\": %s, \"position\": %s, \"flags\": \"0x%x\", \"colour\": [%d, %d, %d, %d], \"address\": \"%s\"}",
+								JsonString(type), JsonFloats(object.pos), object.flags, object.r, object.g, object.b, object.a, cast(void*)object);
+						}
+						entry=format("{\"kind\": \"object\", \"group\": %s, \"pipe\": %s, \"mode\": %s, \"lighting\": %s, \"vertices\": %d, \"source\": %s}",
+							JsonString(to!string(cast(DrawGroup)group)), JsonString(to!string(batch.pipe)), JsonString(to!string(batch.mode)),
+							JsonString(to!string(batch.lighting.kind)), batch.vertex_count, source);
+						break;
+					}
+					index-=_objects.groups[group].length;
+				}
+				if (entry is null)
+					continue;
+			}
+			json~=format("%s\n    \"%d\": %s", first ? "" : ",", id, entry);
+			first=false;
+		}
+		json~="\n  }\n}\n";
+		return json;
+	}
+
 	//// GPU timing: timestamps around the frame's passes, read back after the frame's GPU wait and logged once a second
 	//// with the CPU timings (per-pass costs of the effects)
 
@@ -1556,15 +2170,25 @@ LAB_0004814b:
 	// after the frame's vkQueueWaitIdle, so the results are there
 	void ReadGpuTimer()
 	{
+		double[GpuStamp.max] stages;
+		if (ReadGpuStages(stages))
+			_gpu_time[]+=stages[];
+	}
+
+	// microseconds per stage of the last submission that wrote the timestamps
+	bool ReadGpuStages(out double[GpuStamp.max] stages)
+	{
+		stages[]=0.0;
 		if (_gpu_timer==VK_NULL_ND_HANDLE)
-			return;
+			return false;
 		ulong[GpuStamp.max+1] stamps;
 		if (vkGetQueryPoolResults(g_Device, _gpu_timer, 0, GpuStamp.max+1, stamps.sizeof, stamps.ptr, ulong.sizeof,
 			VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)
-			return;
+			return false;
 		foreach(size_t stage; 0..GpuStamp.max)
 			if (stamps[stage+1]>=stamps[stage])
-				_gpu_time[stage]+=(stamps[stage+1]-stamps[stage])*_gpu_tick_ns/1000.0;
+				stages[stage]=(stamps[stage+1]-stamps[stage])*_gpu_tick_ns/1000.0;
+		return true;
 	}
 
 	//// 2D layer
@@ -2206,6 +2830,8 @@ LAB_0004814b:
 
 			if (cast(uint)object.type<_object_type_counts.length)
 				_object_type_counts[object.type]++;
+			_objects.source=object;
+			scope(exit) _objects.source=null;
 
 			switch(object.type)
 			{
@@ -2370,6 +2996,8 @@ LAB_0004814b:
 		{
 			if (object is null || !(object.flags & ObjectFlag.Visible))
 				continue;
+			_objects.source=object;
+			scope(exit) _objects.source=null;
 
 			switch(object.type)
 			{
@@ -2546,6 +3174,15 @@ LAB_0004814b:
 		vmaUnmapMemory(_object_vertex_memory);
 	}
 
+	// object batches are numbered in draw-group order for the id view: the first batch of `group` is this + IdObjectBase
+	size_t BatchIdOffset(size_t group)
+	{
+		size_t offset=0;
+		foreach(earlier; 0..group)
+			offset+=_objects.groups[earlier].length;
+		return offset;
+	}
+
 	// recorded inside the render pass: the sky group before the world (sky = true), every other group after it
 	void RecordObjectDraws(VkCommandBuffer buffer, uint image_index, bool sky)
 	{
@@ -2566,7 +3203,10 @@ LAB_0004814b:
 		const size_t end_group=sky ? DrawGroup.Sky+1 : DrawGroup.max+1;
 		foreach(group; first_group..end_group)
 		{
-			foreach(ref batch; _objects.groups[group])
+			// the additive screen flash would cover every debug view
+			if (group==DrawGroup.LightAdd && _debug_view!=DebugView.Final)
+				continue;
+			foreach(batch_index, ref batch; _objects.groups[group])
 			{
 				if (!pipe_bound || batch.pipe!=bound_pipe)
 				{
@@ -2586,7 +3226,8 @@ LAB_0004814b:
 				// lines and the light-add poly are never fogged; the sky uses the sky fog range
 				const FogKind fog=batch.no_fog ? FogKind.None : group==DrawGroup.Sky ? FogKind.Sky :
 					(group==DrawGroup.LineSystems || group==DrawGroup.LightAdd) ? FogKind.None : FogKind.World;
-				PushBatchConstants(buffer, cast(float)batch.mode, fog, batch.lighting);
+				PushBatchConstants(buffer, cast(float)batch.mode, fog, batch.lighting,
+					cast(float)(IdObjectBase+BatchIdOffset(group)+batch_index));
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
@@ -3310,6 +3951,7 @@ private:
 		ubo.specular=_specular>0f ? _specular : 0f;
 		ubo.camera=[camera_pos.x, camera_pos.y, camera_pos.z, _light_falloff];
 		ubo.model_light=[_model_light_direction[0], _model_light_direction[1], _model_light_direction[2], 48f];
+		ubo.debug_view=_debug_view;
 
 		debug(FrameTrace) test_out.writeln(ubo);
 
@@ -3381,6 +4023,10 @@ private:
 			const float x_max=near*tan(fov_x*0.5f), y_max=near*tan(fov_y*0.5f);
 			ubo.proj=mat4.perspective(-x_max, x_max, -y_max, y_max, near, far).transposed(); // the frustum overload
 		}
+
+		// as the shaders get them (column-major), for debug captures
+		_view_matrix=*cast(float[16]*)&ubo.view;
+		_proj_matrix=*cast(float[16]*)&ubo.proj;
 
 		void* data;
 		//vkMapMemory(g_Device, _uniform_buffers_memory[image_index], 0, ubo.sizeof, 0, &data);
@@ -4078,7 +4724,8 @@ private:
 	void CreateDepthBuffer()
 	{
 		VkFormat depth_format=FindDepthFormat();
-		CreateVkImage(_extents.width, _extents.height, depth_format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _depth_image, _depth_image_memory);
+		// copied out by debug captures
+		CreateVkImage(_extents.width, _extents.height, depth_format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _depth_image, _depth_image_memory);
 		_depth_image_view=CreateImageView(_depth_image, depth_format, VK_IMAGE_ASPECT_DEPTH_BIT);
 	}
 

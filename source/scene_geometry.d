@@ -101,6 +101,7 @@ struct ObjectBatch
 	ObjectPipe pipe;
 	bool no_fog; // drawn with fog off whatever the group (model shadows)
 	BatchLighting lighting;
+	void* source; // the object that drew it (LTObject*), for debug captures; null for the light-add poly
 }
 
 struct ObjectGeometry
@@ -114,6 +115,7 @@ struct ObjectGeometry
 	ObjectPipe solid_pipe=ObjectPipe.Opaque, translucent_pipe=ObjectPipe.Blend;
 	// how batches opened from now on are lit; models and world models set it while they draw
 	BatchLighting lighting;
+	void* source; // the object batches opened from now on belong to (debug captures)
 
 	void Clear()
 	{
@@ -144,7 +146,7 @@ struct ObjectGeometry
 	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode, bool no_fog=false)
 	{
 		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe, no_fog: no_fog,
-			lighting: lighting };
+			lighting: lighting, source: source };
 		groups[group]~=batch;
 		_current=group;
 	}

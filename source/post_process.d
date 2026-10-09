@@ -196,100 +196,8 @@ struct PostProcess
 private:
 	void CreateRenderPasses(VkFormat depth_format)
 	{
-		// the scene: like the main render pass, but its colour is sampled afterwards
-		VkAttachmentDescription[2] scene_attachments=[
-			{
-				format: colour_format,
-				samples: VK_SAMPLE_COUNT_1_BIT,
-				loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
-				storeOp: VK_ATTACHMENT_STORE_OP_STORE,
-				stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-				finalLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-			},
-			{
-				format: depth_format,
-				samples: VK_SAMPLE_COUNT_1_BIT,
-				loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
-				storeOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-				finalLayout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-			}
-		];
-		VkAttachmentReference colour_ref={ attachment: 0, layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-		VkAttachmentReference depth_ref={ attachment: 1, layout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-		VkSubpassDescription scene_subpass={
-			pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
-			colorAttachmentCount: 1,
-			pColorAttachments: &colour_ref,
-			pDepthStencilAttachment: &depth_ref
-		};
-		VkSubpassDependency[2] scene_dependencies=[
-			{
-				// the previous frame's post pass read the image
-				srcSubpass: VK_SUBPASS_EXTERNAL,
-				dstSubpass: 0,
-				srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				srcAccessMask: 0,
-				dstStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-				dstAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
-			},
-			{
-				// this frame's post pass samples it
-				srcSubpass: 0,
-				dstSubpass: VK_SUBPASS_EXTERNAL,
-				srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				srcAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				dstStageMask: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				dstAccessMask: VK_ACCESS_SHADER_READ_BIT
-			}
-		];
-		VkRenderPassCreateInfo scene_info={
-			attachmentCount: scene_attachments.length,
-			pAttachments: scene_attachments.ptr,
-			subpassCount: 1,
-			pSubpasses: &scene_subpass,
-			dependencyCount: scene_dependencies.length,
-			pDependencies: scene_dependencies.ptr
-		};
-		VkCheck(vkCreateRenderPass(g_Device, &scene_info, null, &scene_pass), "vkCreateRenderPass (post scene)");
-
-		// the swapchain image: post.frag covers all of it, then the 2D layer
-		VkAttachmentDescription present_attachment={
-			format: colour_format,
-			samples: VK_SAMPLE_COUNT_1_BIT,
-			loadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			storeOp: VK_ATTACHMENT_STORE_OP_STORE,
-			stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
-			finalLayout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
-		};
-		VkSubpassDescription present_subpass={
-			pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
-			colorAttachmentCount: 1,
-			pColorAttachments: &colour_ref
-		};
-		VkSubpassDependency present_dependency={
-			srcSubpass: VK_SUBPASS_EXTERNAL,
-			dstSubpass: 0,
-			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			srcAccessMask: 0,
-			dstStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			dstAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-		};
-		VkRenderPassCreateInfo present_info={
-			attachmentCount: 1,
-			pAttachments: &present_attachment,
-			subpassCount: 1,
-			pSubpasses: &present_subpass,
-			dependencyCount: 1,
-			pDependencies: &present_dependency
-		};
-		VkCheck(vkCreateRenderPass(g_Device, &present_info, null, &present_pass), "vkCreateRenderPass (post present)");
+		scene_pass=MakeScenePass(colour_format, depth_format, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, false);
+		present_pass=MakeColourPass(colour_format, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 	}
 
 	void CreatePipeline()
@@ -333,4 +241,121 @@ private:
 		};
 		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &pipeline), "vkCreateGraphicsPipelines (post)");
 	}
+}
+
+// A render pass with the main pass' attachments (so the scene pipelines work in it): colour cleared, ending in
+// colour_final; depth cleared, kept when store_depth.
+VkRenderPass MakeScenePass(VkFormat colour_format, VkFormat depth_format, VkImageLayout colour_final, bool store_depth)
+{
+	VkAttachmentDescription[2] attachments=[
+		{
+			format: colour_format,
+			samples: VK_SAMPLE_COUNT_1_BIT,
+			loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
+			storeOp: VK_ATTACHMENT_STORE_OP_STORE,
+			stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+			finalLayout: colour_final
+		},
+		{
+			format: depth_format,
+			samples: VK_SAMPLE_COUNT_1_BIT,
+			loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR,
+			storeOp: store_depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+			finalLayout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+		}
+	];
+	VkAttachmentReference colour_ref={ attachment: 0, layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+	VkAttachmentReference depth_ref={ attachment: 1, layout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+	VkSubpassDescription subpass={
+		pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
+		colorAttachmentCount: 1,
+		pColorAttachments: &colour_ref,
+		pDepthStencilAttachment: &depth_ref
+	};
+	VkSubpassDependency[2] dependencies=[
+		{
+			// earlier reads of the images (the previous frame's post pass, a capture's copy)
+			srcSubpass: VK_SUBPASS_EXTERNAL,
+			dstSubpass: 0,
+			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			srcAccessMask: 0,
+			dstStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+			dstAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+		},
+		{
+			// later reads: the post pass samples the colour, a capture copies colour and depth
+			srcSubpass: 0,
+			dstSubpass: VK_SUBPASS_EXTERNAL,
+			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			srcAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			dstStageMask: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			dstAccessMask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
+		}
+	];
+	VkRenderPassCreateInfo info={
+		attachmentCount: attachments.length,
+		pAttachments: attachments.ptr,
+		subpassCount: 1,
+		pSubpasses: &subpass,
+		dependencyCount: dependencies.length,
+		pDependencies: dependencies.ptr
+	};
+	VkRenderPass pass;
+	VkCheck(vkCreateRenderPass(g_Device, &info, null, &pass), "vkCreateRenderPass (scene)");
+	return pass;
+}
+
+// A colour-only render pass, contents not loaded (a fullscreen pass covers everything), ending in final_layout
+VkRenderPass MakeColourPass(VkFormat format, VkImageLayout final_layout)
+{
+	VkAttachmentDescription attachment={
+		format: format,
+		samples: VK_SAMPLE_COUNT_1_BIT,
+		loadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		storeOp: VK_ATTACHMENT_STORE_OP_STORE,
+		stencilLoadOp: VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		stencilStoreOp: VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		initialLayout: VK_IMAGE_LAYOUT_UNDEFINED,
+		finalLayout: final_layout
+	};
+	VkAttachmentReference colour_ref={ attachment: 0, layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+	VkSubpassDescription subpass={
+		pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
+		colorAttachmentCount: 1,
+		pColorAttachments: &colour_ref
+	};
+	VkSubpassDependency[2] dependencies=[
+		{
+			srcSubpass: VK_SUBPASS_EXTERNAL,
+			dstSubpass: 0,
+			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			srcAccessMask: 0,
+			dstStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			dstAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+		},
+		{
+			srcSubpass: 0,
+			dstSubpass: VK_SUBPASS_EXTERNAL,
+			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			srcAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			dstStageMask: VK_PIPELINE_STAGE_TRANSFER_BIT,
+			dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT
+		}
+	];
+	VkRenderPassCreateInfo info={
+		attachmentCount: 1,
+		pAttachments: &attachment,
+		subpassCount: 1,
+		pSubpasses: &subpass,
+		dependencyCount: dependencies.length,
+		pDependencies: dependencies.ptr
+	};
+	VkRenderPass pass;
+	VkCheck(vkCreateRenderPass(g_Device, &info, null, &pass), "vkCreateRenderPass (colour)");
+	return pass;
 }

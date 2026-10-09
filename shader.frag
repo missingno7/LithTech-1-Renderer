@@ -61,6 +61,7 @@ void main()
 	vec3 vertex_light=modern ? modern_diffuse : dynamic_light_in;
 
 	vec3 colour;
+	vec3 debug_light, debug_dynamic=vertex_light; // for the debug views
 	if ((lightmapped_in>0.5 && lightmapped_in<1.5) || cloud)
 	{
 		vec3 light;
@@ -75,7 +76,9 @@ void main()
 			vec3 lightmap=texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_uv_in).rgb;
 			vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, true);
 			light=clamp(lightmap+texel_light, 0.0, 1.0)*pc.light_scale_mode.xyz;
+			debug_dynamic=texel_light;
 		}
+		debug_light=light;
 		vec3 fogged_light=mix(pc.fog_colour.rgb, light, fog);
 		vec3 fogged_texel=mix(pc.fog_colour.rgb, texel.rgb, fog);
 		// "Saturate" makes the texture pass SRCBLEND DESTCOLOR: src*dest + dest*src, twice the product; fullbright textures
@@ -88,12 +91,18 @@ void main()
 	else
 	{
 		vec3 light=clamp(colour_in*pc.light_scale_mode.xyz+vertex_light, 0.0, 1.0);
+		debug_light=light;
 		colour=mix(pc.fog_colour.rgb, texel.rgb*light, fog);
 		if (fullbright)
 			colour+=texel.rgb*texel.a;
 	}
 
-	colour+=modern_specular*Gloss(texel.rgb)*fog;
+	vec3 specular=modern_specular*Gloss(texel.rgb);
+	colour+=specular*fog;
 
-	colour_out=vec4(min(colour, vec3(1.0)), 1.0);
+	// the draw id (debug captures) rides in the last push constant
+	if (light_list.debug_view!=DEBUG_VIEW_NONE)
+		colour_out=DebugOutput(debug_light, debug_dynamic, normalize(normal_in), specular, world_position_in, pc.directional.w);
+	else
+		colour_out=vec4(min(colour, vec3(1.0)), 1.0);
 }

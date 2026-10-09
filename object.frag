@@ -18,7 +18,7 @@ layout(push_constant) uniform PushConstants {
 	// the modern lighting: rgb the model's ambient light (0..1, no dynamic lights in it); w: lighting kind, 0 pre-lit,
 	// 1 model, 2 world polies
 	vec4 ambient;
-	vec4 directional; // rgb: the model's directional light (light grid), towards light_list.model_light
+	vec4 directional; // rgb: the model's directional light (light grid), towards light_list.model_light; w: draw id (debug)
 } pc;
 
 layout(location=0) in vec4 colour_in;
@@ -55,6 +55,11 @@ void main()
 	{
 		// no texture bound: the diffuse colour alone
 		colour_out=vec4(Fog(colour_in.rgb, fog), colour_in.a);
+		if (light_list.debug_view!=DEBUG_VIEW_NONE)
+		{
+			if (colour_in.a<0.5) discard;
+			colour_out=DebugOutput(colour_in.rgb, vec3(0.0), vec3(0.0), vec3(0.0), world_position_in, pc.directional.w);
+		}
 		return;
 	}
 
@@ -64,12 +69,13 @@ void main()
 	float kind=pc.ambient.w;
 	bool modern=kind>0.5 && dot(normal_in, normal_in)>1e-6 && Modern();
 	vec3 modern_diffuse=vec3(0.0), modern_specular=vec3(0.0);
-	vec3 normal=modern ? normalize(normal_in) : vec3(0.0);
+	vec3 normal=dot(normal_in, normal_in)>1e-6 ? normalize(normal_in) : vec3(0.0);
 	if (modern)
 		ModernLights(world_position_in, normal, kind<1.5, modern_diffuse, modern_specular);
 
 	vec3 colour;
 	vec3 fullbright_add;
+	vec3 debug_light, debug_dynamic; // for the debug views
 	if (lightmap_in.z>0.5)
 	{
 		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
@@ -77,6 +83,8 @@ void main()
 		vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false);
 		vec3 light=clamp(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb+texel_light, 0.0, 1.0)*
 			colour_in.rgb;
+		debug_light=light;
+		debug_dynamic=texel_light;
 		vec3 fogged_texel=Fog(texel.rgb, fog);
 		colour=Fog(light, fog)*fogged_texel;
 		fullbright_add=fogged_texel*texel.a;
@@ -88,18 +96,23 @@ void main()
 	{
 		// D3D MODULATE(ALPHA): colour modulated by the texture
 		vec3 light=colour_in.rgb;
+		// a model: d3d.ren's 16-step ramp, ambient + directional * step / 16 with step = 8 + 7.94 (N.L), made smooth
+		float ramp=clamp(0.5+0.49609375*dot(normal, light_list.model_light.xyz), 0.0, 15.0/16.0);
+		vec3 model_static=pc.ambient.rgb+pc.directional.rgb*ramp;
+		// the classic dynamic part: what d3d.ren's ramp or vertex lights added over the static light
+		debug_dynamic=kind<0.5 ? vec3(0.0) : colour_in.rgb-(kind<1.5 ? model_static : base_colour_in);
 		if (modern && kind<1.5)
-		{
-			// a model: d3d.ren's 16-step ramp, ambient + directional * step / 16 with step = 8 + 7.94 (N.L), made smooth
-			float ramp=clamp(0.5+0.49609375*dot(normal, light_list.model_light.xyz), 0.0, 15.0/16.0);
-			light=clamp(pc.ambient.rgb+pc.directional.rgb*ramp+modern_diffuse, 0.0, 1.0);
-		}
+			light=clamp(model_static+modern_diffuse, 0.0, 1.0);
 		else if (modern)
 			light=clamp(base_colour_in+modern_diffuse, 0.0, 1.0);
+		if (modern)
+			debug_dynamic=modern_diffuse;
+		debug_light=light;
 		colour=Fog(light*texel.rgb, fog);
 		fullbright_add=texel.rgb*texel.a;
 	}
-	colour+=modern_specular*Gloss(texel.rgb)*fog;
+	vec3 specular=modern_specular*Gloss(texel.rgb);
+	colour+=specular*fog;
 
 	if (mode>2.5)
 	{
@@ -115,5 +128,12 @@ void main()
 	else
 	{
 		colour_out=vec4(colour, colour_in.a*texel.a);
+	}
+
+	// debug views replace the colour; mostly transparent texels leave what's behind
+	if (light_list.debug_view!=DEBUG_VIEW_NONE)
+	{
+		if (colour_out.a<0.5) discard;
+		colour_out=DebugOutput(debug_light, debug_dynamic, normal, specular, world_position_in, pc.directional.w);
 	}
 }

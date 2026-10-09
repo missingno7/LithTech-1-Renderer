@@ -24,6 +24,8 @@ layout(set=0, binding=2) uniform LightList {
 	float specular; // d_Specular, 0 = none
 	vec4 camera; // xyz: eye position; w: falloff exponent (d_LightFalloff)
 	vec4 model_light; // xyz: unit vector towards the models' fixed light; w: specular exponent
+	uint debug_view; // DEBUG_VIEW_*: the frame shows one lighting term instead of the colour (debug captures)
+	float debug_pad0, debug_pad1, debug_pad2;
 	LightObj lights[MAX_LIGHT_COUNT];
 } light_list;
 
@@ -105,4 +107,42 @@ void ModernLights(vec3 p, vec3 n, bool for_models, inout vec3 diffuse, inout vec
 float Gloss(vec3 texel)
 {
 	return light_list.specular*dot(texel, vec3(0.299, 0.587, 0.114));
+}
+
+// Debug captures (debug_capture.d) draw the frame again with one term per view instead of the colour, read back
+// losslessly; each encoding below is decoded by tools/analyze_capture.py.
+#define DEBUG_VIEW_NONE 0u
+#define DEBUG_VIEW_LIGHT 1u // the light the texel is multiplied by, 0..1 (as used, after clamping)
+#define DEBUG_VIEW_DYNAMIC 2u // the dynamic lights' part of it, signed: byte = 128 + d * 63.75 (0 exactly at 128)
+#define DEBUG_VIEW_NORMAL 3u // world-space normal * 0.5 + 0.5; 0.5 grey where none
+#define DEBUG_VIEW_ID 4u // which draw made the pixel: rgb = 24-bit id (debug_capture.d's id table)
+#define DEBUG_VIEW_SPECULAR 5u // the specular added on top
+#define DEBUG_VIEW_LIGHTS 6u // r = lights in range / 40, g = of those, lights facing the surface / 40
+
+vec4 DebugOutput(vec3 light, vec3 dynamic, vec3 normal, vec3 specular, vec3 p, float id)
+{
+	uint view=light_list.debug_view;
+	if (view==DEBUG_VIEW_LIGHT)
+		return vec4(clamp(light, 0.0, 1.0), 1.0);
+	if (view==DEBUG_VIEW_DYNAMIC)
+		return vec4(clamp((128.0+round(dynamic*63.75))/255.0, 0.0, 1.0), 1.0);
+	if (view==DEBUG_VIEW_NORMAL)
+		return vec4(normal*0.5+0.5, 1.0);
+	if (view==DEBUG_VIEW_ID)
+	{
+		uint i=uint(id+0.5);
+		return vec4(float(i & 255u), float((i >> 8) & 255u), float((i >> 16) & 255u), 255.0)/255.0;
+	}
+	if (view==DEBUG_VIEW_SPECULAR)
+		return vec4(clamp(specular, 0.0, 1.0), 1.0);
+	// DEBUG_VIEW_LIGHTS
+	float in_range=0.0, facing=0.0;
+	for(uint i=0; i<light_list.count; ++i)
+	{
+		vec3 to_light=light_list.lights[i].position-p;
+		if (dot(to_light, to_light)>=light_list.lights[i].radius*light_list.lights[i].radius) continue;
+		in_range+=1.0;
+		if (dot(normal, to_light)>0.0) facing+=1.0;
+	}
+	return vec4(in_range/40.0, facing/40.0, 0.0, 1.0);
 }
