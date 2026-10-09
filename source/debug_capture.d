@@ -22,7 +22,7 @@ module DebugCapture;
 import std.conv: to;
 import std.string: strip, split, indexOf, toLower;
 
-enum DebugView : uint { Final, Light, Dynamic, Normal, Id, Specular, Lights } // lighting.glsl DEBUG_VIEW_*
+enum DebugView : uint { Final, Light, Dynamic, Normal, Id, Specular, Lights, Shadow } // lighting.glsl DEBUG_VIEW_*
 
 // one rendering of the captured frame
 struct CaptureVariant
@@ -100,7 +100,7 @@ CaptureRequest* ParseCapture(string line)
 
 string ViewName(DebugView view)
 {
-	static immutable string[] names=["final", "light", "dynamic", "normal", "id", "specular", "lights"];
+	static immutable string[] names=["final", "light", "dynamic", "normal", "id", "specular", "lights", "shadow"];
 	return names[view];
 }
 

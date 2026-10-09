@@ -7,6 +7,7 @@ module SceneGeometry;
  +/
 
 import erupted;
+import StaticLighting: ModelRecord;
 
 struct ObjectVertex
 {
@@ -102,6 +103,7 @@ struct ObjectBatch
 	bool no_fog; // drawn with fog off whatever the group (model shadows)
 	BatchLighting lighting;
 	void* source; // the object that drew it (LTObject*), for debug captures; null for the light-add poly
+	int model=-1; // index into ObjectGeometry.models for a model's own passes (static lamp lighting and shadows)
 }
 
 struct ObjectGeometry
@@ -116,11 +118,17 @@ struct ObjectGeometry
 	// how batches opened from now on are lit; models and world models set it while they draw
 	BatchLighting lighting;
 	void* source; // the object batches opened from now on belong to (debug captures)
+	ModelRecord[] models; // the frame's models (static_lighting.d)
+	int model_index=-1; // the model batches opened from now on belong to
+	bool object_list; // drawing an object-list scene (the view weapon): its models cast no shadows
 
 	void Clear()
 	{
 		vertices.length=0;
 		vertices.assumeSafeAppend();
+		models.length=0;
+		models.assumeSafeAppend();
+		model_index=-1;
 		foreach(ref group; groups)
 		{
 			group.length=0;
@@ -146,7 +154,7 @@ struct ObjectGeometry
 	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode, bool no_fog=false)
 	{
 		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe, no_fog: no_fog,
-			lighting: lighting, source: source };
+			lighting: lighting, source: source, model: model_index };
 		groups[group]~=batch;
 		_current=group;
 	}

@@ -19,6 +19,7 @@ layout(push_constant) uniform PushConstants {
 	// 1 model, 2 world polies
 	vec4 ambient;
 	vec4 directional; // rgb: the model's directional light (light grid), towards light_list.model_light; w: draw id (debug)
+	vec4 extra; // x: the model's lamp set (static_lighting.d), -1 for none
 } pc;
 
 layout(location=0) in vec4 colour_in;
@@ -58,7 +59,8 @@ void main()
 		if (light_list.debug_view!=DEBUG_VIEW_NONE)
 		{
 			if (colour_in.a<0.5) discard;
-			colour_out=DebugOutput(colour_in.rgb, vec3(0.0), vec3(0.0), vec3(0.0), world_position_in, pc.directional.w);
+			colour_out=DebugOutput(colour_in.rgb, vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0), world_position_in,
+				pc.directional.w);
 		}
 		return;
 	}
@@ -73,6 +75,9 @@ void main()
 	if (modern)
 		ModernLights(world_position_in, normal, kind<1.5, modern_diffuse, modern_specular);
 
+	// world models lose the static light models hide from them, like the world (static_lighting.d)
+	vec3 shadow_loss=(kind>1.5 && ShadowsOn()) ? WorldShadowLoss(world_position_in, normal) : vec3(0.0);
+
 	vec3 colour;
 	vec3 fullbright_add;
 	vec3 debug_light, debug_dynamic; // for the debug views
@@ -81,8 +86,8 @@ void main()
 		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
 		// the vertex colour is GlobalLightScale here
 		vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false);
-		vec3 light=clamp(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb+texel_light, 0.0, 1.0)*
-			colour_in.rgb;
+		vec3 lightmap=Unshadowed(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb, shadow_loss);
+		vec3 light=clamp(lightmap+texel_light, 0.0, 1.0)*colour_in.rgb;
 		debug_light=light;
 		debug_dynamic=texel_light;
 		vec3 fogged_texel=Fog(texel.rgb, fog);
@@ -101,10 +106,33 @@ void main()
 		vec3 model_static=pc.ambient.rgb+pc.directional.rgb*ramp;
 		// the classic dynamic part: what d3d.ren's ramp or vertex lights added over the static light
 		debug_dynamic=kind<0.5 ? vec3(0.0) : colour_in.rgb-(kind<1.5 ? model_static : base_colour_in);
+		// with the level's lamps known, a model is lit by the actual lamps around it, each from its direction, shadowed
+		// where other models hide it; the light grid's light they don't account for stays as the camera-relative term
+		int lamp_set=int(pc.extra.x);
+		if (modern && kind<1.5 && lamp_set>=0 && static_lighting.counts.w!=0u && uint(lamp_set)<static_lighting.counts.y)
+		{
+			vec3 lamps=static_lighting.models[lamp_set].residual_count.rgb*ramp;
+			uint count=uint(static_lighting.models[lamp_set].residual_count.w);
+			bool shadows=ShadowsOn();
+			for(uint i=0u; i<count; ++i)
+			{
+				StaticLamp lamp=static_lighting.models[lamp_set].lamps[i];
+				vec3 c=LampAt(lamp, world_position_in);
+				if (c==vec3(0.0))
+					continue;
+				float facing=clamp(0.5+0.49609375*dot(normal, normalize(lamp.pos_radius.xyz-world_position_in)), 0.0, 15.0/16.0);
+				float hidden=shadows ? ModelLampShadow(lamp, lamp_set, world_position_in) : 0.0;
+				lamps+=c*facing*(1.0-hidden);
+				shadow_loss+=c*facing*hidden;
+			}
+			model_static=pc.ambient.rgb+lamps;
+		}
 		if (modern && kind<1.5)
 			light=clamp(model_static+modern_diffuse, 0.0, 1.0);
 		else if (modern)
-			light=clamp(base_colour_in+modern_diffuse, 0.0, 1.0);
+			light=clamp(Unshadowed(base_colour_in, shadow_loss)+modern_diffuse, 0.0, 1.0);
+		else if (kind>1.5)
+			light=Unshadowed(light, shadow_loss);
 		if (modern)
 			debug_dynamic=modern_diffuse;
 		debug_light=light;
@@ -134,6 +162,6 @@ void main()
 	if (light_list.debug_view!=DEBUG_VIEW_NONE)
 	{
 		if (colour_out.a<0.5) discard;
-		colour_out=DebugOutput(debug_light, debug_dynamic, normal, specular, world_position_in, pc.directional.w);
+		colour_out=DebugOutput(debug_light, debug_dynamic, normal, specular, shadow_loss, world_position_in, pc.directional.w);
 	}
 }

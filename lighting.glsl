@@ -25,7 +25,8 @@ layout(set=0, binding=2) uniform LightList {
 	vec4 camera; // xyz: eye position; w: falloff exponent (d_LightFalloff)
 	vec4 model_light; // xyz: unit vector towards the models' fixed light; w: specular exponent
 	uint debug_view; // DEBUG_VIEW_*: the frame shows one lighting term instead of the colour (debug captures)
-	float debug_pad0, debug_pad1, debug_pad2;
+	float effects_from_x; // the other modern effects (static lamp shadows) at and right of this x
+	float debug_pad1, debug_pad2;
 	LightObj lights[MAX_LIGHT_COUNT];
 } light_list;
 
@@ -70,6 +71,133 @@ vec3 ClassicTexelLight(vec3 p, vec3 n, bool check_backfacing)
 bool Modern()
 {
 	return gl_FragCoord.x>=light_list.modern_from_x;
+}
+
+// The level's static lamps (static_lighting.d): per model the lamps that light it, and the shadow pairs, each a lamp
+// and a model drawn from it into a tile of the shadow atlas. Lamp terms are in lightmap units: the bake was ambient +
+// colour * BrightScale * (1 - d/r) * cone, one-sided.
+struct StaticLamp
+{
+	vec4 pos_radius;
+	vec4 colour_index; // rgb: colour * BrightScale; w: the lamp's index in the level
+	vec4 spot; // xyz: direction; w: cos of half the FOV, or -2 for a point lamp
+};
+
+struct ShadowPair
+{
+	mat4 view_proj; // world -> the tile's clip space
+	StaticLamp lamp;
+	vec4 tile; // xy: corner in the atlas, z: size; w: the caster's model set
+};
+
+struct ModelLamps
+{
+	vec4 residual_count; // rgb: the light grid's directional light the lamps don't account for; w: lamp count
+	StaticLamp lamps[4];
+};
+
+layout(std430, set=0, binding=4) readonly buffer StaticLighting {
+	uvec4 counts; // shadow pairs, model sets, 1 if shadows are on, 1 if models are lit by the lamps
+	vec4 ambient; // rgb: the level's lightmap ambient; w: one shadow atlas texel
+	ShadowPair pairs[16];
+	ModelLamps models[128];
+} static_lighting;
+
+layout(set=0, binding=5) uniform sampler2DShadow shadow_atlas;
+
+bool ShadowsOn()
+{
+	return static_lighting.counts.z!=0u && static_lighting.counts.x!=0u && gl_FragCoord.x>=light_list.effects_from_x;
+}
+
+// a lamp's contribution at p as the bake computed it (without the facing test)
+vec3 LampAt(StaticLamp lamp, vec3 p)
+{
+	vec3 to=p-lamp.pos_radius.xyz;
+	float d=length(to);
+	if (d>=lamp.pos_radius.w)
+		return vec3(0.0);
+	float f=1.0-d/lamp.pos_radius.w;
+	if (lamp.spot.w>-1.5)
+	{
+		float c=d>0.001 ? dot(lamp.spot.xyz, to)/d : 1.0;
+		f*=max((c-lamp.spot.w)/(1.0-lamp.spot.w), 0.0);
+	}
+	return lamp.colour_index.rgb*f;
+}
+
+// how much pair k's model hides its lamp at p: 0 lit .. 1 shadowed. Nine bilinear depth-compare taps on a disk two
+// texels across (each tap already blends 2x2 texels), for soft edges rather than the tile's stair steps.
+const vec2 shadow_taps[9]=vec2[](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+	vec2(0.7, 0.7), vec2(-0.7, 0.7), vec2(0.7, -0.7), vec2(-0.7, -0.7));
+
+float PairShadow(uint k, vec3 p)
+{
+	vec4 clip=static_lighting.pairs[k].view_proj*vec4(p, 1.0);
+	if (clip.w<=0.001)
+		return 0.0;
+	vec3 ndc=clip.xyz/clip.w;
+	if (abs(ndc.x)>=1.0 || abs(ndc.y)>=1.0 || ndc.z<=0.0 || ndc.z>=1.0)
+		return 0.0;
+	vec4 tile=static_lighting.pairs[k].tile;
+	float texel=static_lighting.ambient.w;
+	vec2 uv=tile.xy+(ndc.xy*0.5+0.5)*tile.z;
+	vec2 low=tile.xy+vec2(2.5*texel), high=tile.xy+vec2(tile.z-2.5*texel);
+	float depth=ndc.z-0.0002;
+	float lit=0.0;
+	for(int i=0; i<9; ++i)
+		lit+=texture(shadow_atlas, vec3(clamp(uv+shadow_taps[i]*2.0*texel, low, high), depth));
+	return 1.0-lit/9.0;
+}
+
+// for the shadow debug view: (strongest raw pair shadow, 1 if any pair's frustum covers p)
+vec2 ShadowCoverage(vec3 p)
+{
+	float strongest=0.0, covered=0.0;
+	for(uint k=0u; k<static_lighting.counts.x; ++k)
+	{
+		vec4 clip=static_lighting.pairs[k].view_proj*vec4(p, 1.0);
+		if (clip.w<=0.001)
+			continue;
+		vec3 ndc=clip.xyz/clip.w;
+		if (abs(ndc.x)<1.0 && abs(ndc.y)<1.0 && ndc.z>0.0 && ndc.z<1.0)
+			covered=1.0;
+		strongest=max(strongest, PairShadow(k, p));
+	}
+	return vec2(strongest, covered);
+}
+
+// the static light a world surface (normal n) loses at p where models hide lamps from it
+vec3 WorldShadowLoss(vec3 p, vec3 n)
+{
+	vec3 loss=vec3(0.0);
+	for(uint k=0u; k<static_lighting.counts.x; ++k)
+	{
+		StaticLamp lamp=static_lighting.pairs[k].lamp;
+		vec3 to_lamp=lamp.pos_radius.xyz-p;
+		if (dot(to_lamp, to_lamp)>=lamp.pos_radius.w*lamp.pos_radius.w || dot(n, to_lamp)<=0.0)
+			continue;
+		float s=PairShadow(k, p);
+		if (s>0.0)
+			loss+=s*LampAt(lamp, p);
+	}
+	return loss;
+}
+
+// a baked light term (lightmap or pre-lit colour) with the shadowed lamps taken out; never below the level's ambient
+vec3 Unshadowed(vec3 baked, vec3 loss)
+{
+	return baked-min(loss, max(baked-static_lighting.ambient.rgb, vec3(0.0)));
+}
+
+// how much other models hide one of this model's lamps at p (set: this model's)
+float ModelLampShadow(StaticLamp lamp, int set, vec3 p)
+{
+	float shadow=0.0;
+	for(uint k=0u; k<static_lighting.counts.x; ++k)
+		if (static_lighting.pairs[k].lamp.colour_index.w==lamp.colour_index.w && int(static_lighting.pairs[k].tile.w)!=set)
+			shadow=max(shadow, PairShadow(k, p));
+	return shadow;
 }
 #endif
 
@@ -118,10 +246,16 @@ float Gloss(vec3 texel)
 #define DEBUG_VIEW_ID 4u // which draw made the pixel: rgb = 24-bit id (debug_capture.d's id table)
 #define DEBUG_VIEW_SPECULAR 5u // the specular added on top
 #define DEBUG_VIEW_LIGHTS 6u // r = lights in range / 40, g = of those, lights facing the surface / 40
+#define DEBUG_VIEW_SHADOW 7u // r: the static light taken away by the lamp shadows; g: the strongest raw shadow of any pair
+                             // at the pixel; b: 1 where any pair's frustum covers the pixel
 
-vec4 DebugOutput(vec3 light, vec3 dynamic, vec3 normal, vec3 specular, vec3 p, float id)
+vec4 DebugOutput(vec3 light, vec3 dynamic, vec3 normal, vec3 specular, vec3 shadow, vec3 p, float id)
 {
 	uint view=light_list.debug_view;
+#ifdef FRAGMENT_SHADER
+	if (view==DEBUG_VIEW_SHADOW)
+		return vec4(clamp(dot(shadow, vec3(0.299, 0.587, 0.114)), 0.0, 1.0), ShadowCoverage(p), 1.0);
+#endif
 	if (view==DEBUG_VIEW_LIGHT)
 		return vec4(clamp(light, 0.0, 1.0), 1.0);
 	if (view==DEBUG_VIEW_DYNAMIC)

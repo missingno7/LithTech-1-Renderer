@@ -16,6 +16,7 @@ layout(push_constant) uniform PushConstants {
 	vec4 fog_range; // x: near, y: far (FOGTABLESTART / FOGTABLEEND), z: depth mode, w: Saturate
 	vec4 cloud; // x, y: cloud x / z offset; z, w: 1 / (texture width * x scale), 1 / (texture height * z scale); 0 = none
 	vec4 ambient, directional; // object shaders only
+	vec4 extra; // object shaders only
 } pc;
 
 layout(location=0) in vec3 colour_in;
@@ -60,6 +61,10 @@ void main()
 		ModernLights(world_position_in, normalize(normal_in), false, modern_diffuse, modern_specular);
 	vec3 vertex_light=modern ? modern_diffuse : dynamic_light_in;
 
+	// where models hide the level's lamps, the baked light loses those lamps' terms (static_lighting.d)
+	vec3 shadow_loss=ShadowsOn() ? WorldShadowLoss(world_position_in, normalize(normal_in)) : vec3(0.0);
+	vec3 prelit=Unshadowed(colour_in, shadow_loss);
+
 	vec3 colour;
 	vec3 debug_light, debug_dynamic=vertex_light; // for the debug views
 	if ((lightmapped_in>0.5 && lightmapped_in<1.5) || cloud)
@@ -69,11 +74,11 @@ void main()
 		{
 			vec2 cloud_uv=vec2((world_position_in.x+pc.cloud.x)*pc.cloud.z, (world_position_in.z+pc.cloud.y)*pc.cloud.w);
 			light=texture(sampler2D(cloud_tex, tex_sampler), cloud_uv).rgb*
-				clamp(colour_in*pc.light_scale_mode.xyz+vertex_light, 0.0, 1.0);
+				clamp(prelit*pc.light_scale_mode.xyz+vertex_light, 0.0, 1.0);
 		}
 		else
 		{
-			vec3 lightmap=texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_uv_in).rgb;
+			vec3 lightmap=Unshadowed(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_uv_in).rgb, shadow_loss);
 			vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, true);
 			light=clamp(lightmap+texel_light, 0.0, 1.0)*pc.light_scale_mode.xyz;
 			debug_dynamic=texel_light;
@@ -90,7 +95,7 @@ void main()
 	}
 	else
 	{
-		vec3 light=clamp(colour_in*pc.light_scale_mode.xyz+vertex_light, 0.0, 1.0);
+		vec3 light=clamp(prelit*pc.light_scale_mode.xyz+vertex_light, 0.0, 1.0);
 		debug_light=light;
 		colour=mix(pc.fog_colour.rgb, texel.rgb*light, fog);
 		if (fullbright)
@@ -102,7 +107,8 @@ void main()
 
 	// the draw id (debug captures) rides in the last push constant
 	if (light_list.debug_view!=DEBUG_VIEW_NONE)
-		colour_out=DebugOutput(debug_light, debug_dynamic, normalize(normal_in), specular, world_position_in, pc.directional.w);
+		colour_out=DebugOutput(debug_light, debug_dynamic, normalize(normal_in), specular, shadow_loss, world_position_in,
+			pc.directional.w);
 	else
 		colour_out=vec4(min(colour, vec3(1.0)), 1.0);
 }

@@ -98,6 +98,16 @@ grid but without its 16 visible steps. The baked lightmaps and pre-lit colours a
 For comparisons, `d_Compare 1` draws the left half of the view the d3d.ren way and the right half with the current
 settings. `d_DebugLight <radius>` adds a steady light just ahead of the camera, so the lighting can be checked anywhere.
 
+### Lamp shadows and lamp lighting
+Blood II's level files still contain the lamps the lightmaps were baked from (the editor's `Light` and `DirLight`
+objects, which the engine skips). d_ren reads them when a level loads. With `d_Shadows 1`, models (characters, props)
+cast shadows from those lamps: each frame the strongest lamp/model pairs near the camera (`d_ShadowPairs`, default 8)
+get a small shadow map, and where a model blocks a lamp, the floor, walls and other models lose exactly that lamp's
+share of the baked light (the bake was fitted against the lightmaps: ambient + colour × BrightScale × (1 − d/r)). This
+replaces d3d.ren's flattened model shadow. With `d_Lighting 1`, models are also lit from the actual lamps around them
+(up to 4, each from its own direction, traced so lamps behind walls don't count), at no more total light than the
+original light grid gave them.
+
 ### Post-processing
 `d_AntiAliasing 1` turns on FXAA. With it on, the 3D scene is rendered to an offscreen image and post-processed before
 the 2D layer goes on top, so the HUD, menus and console stay sharp. With every post effect off, d_ren draws straight
@@ -122,6 +132,8 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_Specular` | 0.25 | Specular strength of the modern lighting; 0 turns it off. |
 | `d_LightFalloff` | 1 | Exponent of the modern lighting's falloff `(1 - d²/r²)^n`; 1 is d3d.ren's lightmap curve, higher is softer. |
 | `d_AntiAliasing` | 0 | 1: FXAA on the 3D scene (not the 2D layer). |
+| `d_Shadows` | 0 | 1: models cast soft shadows from the level's lamps (see *Lamp shadows*); 0: d3d.ren's flattened shadows. |
+| `d_ShadowPairs` | 8 | How many lamp/model shadow maps per frame (1..16). |
 | `d_Compare` | 0 | 1: left half of the view as d3d.ren with no post effects, right half with the current settings. |
 | `d_DebugLight` | 0 | Radius of a test light ahead of the camera; 0 = none. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |

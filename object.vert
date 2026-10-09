@@ -16,6 +16,7 @@ layout(push_constant) uniform PushConstants {
 	vec4 light_scale_mode, fog_colour, fog_range, cloud; // object.frag
 	vec4 ambient; // w: lighting kind, 0 pre-lit, 1 model, 2 world polies (world models)
 	vec4 directional;
+	vec4 extra;
 } pc;
 
 layout(location=0) in vec3 position_in;

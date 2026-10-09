@@ -217,6 +217,31 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	geometry.lighting=modern;
 	scope(exit) geometry.lighting=BatchLighting.init;
 
+	// the model's bounds and grid light, for the static lamps (static_lighting.d)
+	if (_mesh.length)
+	{
+		float[3] low=_mesh[0].pos, high=_mesh[0].pos;
+		foreach(ref vertex; _mesh)
+			foreach(axis; 0..3)
+			{
+				if (vertex.pos[axis]<low[axis]) low[axis]=vertex.pos[axis];
+				if (vertex.pos[axis]>high[axis]) high[axis]=vertex.pos[axis];
+			}
+		import std.math: sqrt;
+		const float[3] half=[(high[0]-low[0])*0.5f, (high[1]-low[1])*0.5f, (high[2]-low[2])*0.5f];
+		import StaticLighting: ModelRecord;
+		ModelRecord record={
+			object: object,
+			centre: [low[0]+half[0], low[1]+half[1], low[2]+half[2]],
+			radius: sqrt(half[0]*half[0]+half[1]*half[1]+half[2]*half[2]),
+			directional: modern.directional,
+			solid: !translucent && !geometry.object_list
+		};
+		geometry.model_index=cast(int)geometry.models.length;
+		geometry.models~=record;
+	}
+	scope(exit) geometry.model_index=-1;
+
 	if (chrome)
 	{
 		geometry.Begin(env.texture.texture_descriptor, group, pipe, TextureMode.Normal);
@@ -239,6 +264,7 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	// FLAG_SHADOW, after the model hook (d3d.ren calls the shadow pass from the model backend when that bit is set)
 	geometry.lighting=BatchLighting.init;
+	geometry.model_index=-1;
 	if (draw_flags & ObjectFlag.Shadow)
 		g_ShadowStats[0]++;
 	if (shadows && (draw_flags & ObjectFlag.Shadow))
