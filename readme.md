@@ -33,7 +33,7 @@ them by default (see *Fog* below).
 
 ## Not done yet
 - Model LOD (models are always drawn at full detail), the multiplayer skin tint pass, CoolFog, the screenshot key.
-- Line systems and cloud shadows are implemented but haven't been checked in-game yet.
+- Line systems are implemented but haven't been checked in-game yet.
 - There is no visibility culling: the whole level is drawn every frame. It is still fast.
 
 ## Using it

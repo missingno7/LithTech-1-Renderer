@@ -49,8 +49,7 @@ Console variables. They are written to autoexec.cfg after the first run and can 
 KNOWN LIMITATIONS
 -----------------
 - Not yet done: model detail levels (models are always drawn at full detail), the game's screenshot key.
-- Some effects (line systems, moving cloud shadows outdoors) are implemented but haven't been checked in every level
-  yet.
+- Line systems (beams and lines) are implemented but haven't been checked in-game yet.
 
 
 REPORTING PROBLEMS
