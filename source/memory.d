@@ -146,16 +146,28 @@ class Allocator
 		return g_Allocator;
 	}
 
+	// from the first memory type that has the properties; if the driver refuses a block there (small device-local
+	// heaps on integrated GPUs), from smaller blocks, then from the next matching type
 	VkResult Allocate(const VkMemoryRequirements mem_reqs, const VkMemoryPropertyFlags mem_props, out VkMappedMemoryRange memory_range)
 	{
-		const uint mem_type_index=FindMemoryType(g_PhysicalMemoryProps, mem_reqs.memoryTypeBits, mem_props);
-		if (mem_type_index==uint.max)
+		uint tried_types=0;
+		for (;;)
 		{
-			test_out.writeln("No memory type for bits ", mem_reqs.memoryTypeBits, ", properties ", mem_props);
-			test_out.flush();
-			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+			const uint mem_type_index=FindMemoryType(g_PhysicalMemoryProps, mem_reqs.memoryTypeBits & ~tried_types, mem_props);
+			if (mem_type_index==uint.max)
+			{
+				test_out.writeln("No memory type for bits ", mem_reqs.memoryTypeBits, ", properties ", mem_props);
+				test_out.flush();
+				return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+			}
+			if (AllocateFromType(mem_type_index, mem_reqs, memory_range))
+				return VK_SUCCESS;
+			tried_types|=1u << mem_type_index;
 		}
+	}
 
+	private bool AllocateFromType(uint mem_type_index, const VkMemoryRequirements mem_reqs, out VkMappedMemoryRange memory_range)
+	{
 		// linear buffers and optimal images can share a block, so keep them a granularity apart
 		VkDeviceSize alignment=mem_reqs.alignment;
 		const VkDeviceSize granularity=g_PhysicalDeviceProps.limits.bufferImageGranularity;
@@ -168,23 +180,35 @@ class Allocator
 		{
 			Allocation dedicated=Allocation.Create(mem_type_index, mem_reqs.size, true);
 			if (dedicated is null || !dedicated.Chunk(mem_reqs.size, 1, memory_range))
-				return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+				return false;
 			allocs[mem_type_index]~=dedicated;
-			return VK_SUCCESS;
+			return true;
 		}
 
 		foreach(block; allocs[mem_type_index])
 		{
 			if (!block.dedicated && block.Chunk(mem_reqs.size, alignment, memory_range))
-				return VK_SUCCESS;
+				return true;
 		}
 
-		Allocation new_block=Allocation.Create(mem_type_index, block_size, false);
-		if (new_block is null || !new_block.Chunk(mem_reqs.size, alignment, memory_range))
-			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-		allocs[mem_type_index]~=new_block;
-
-		return VK_SUCCESS;
+		for (VkDeviceSize size=block_size; ; size/=2)
+		{
+			if (size<mem_reqs.size+alignment)
+				size=mem_reqs.size+alignment;
+			Allocation new_block=Allocation.Create(mem_type_index, size, false);
+			if (new_block !is null)
+			{
+				if (!new_block.Chunk(mem_reqs.size, alignment, memory_range))
+				{
+					new_block.Release();
+					return false;
+				}
+				allocs[mem_type_index]~=new_block;
+				return true;
+			}
+			if (size<=mem_reqs.size+alignment || size<=4*1024*1024)
+				return false;
+		}
 	}
 
 	void Free(ref const VkMappedMemoryRange memory_range)
