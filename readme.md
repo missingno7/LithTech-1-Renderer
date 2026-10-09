@@ -152,7 +152,10 @@ For testing renderer changes without driving the game window by hand:
   settings, lights, per-variant GPU time, and what drew each pixel. Variant keys: `view` (`final`, `light`, `dynamic`,
   `normal`, `id`, `specular`, `lights`), `lighting`, `specular`, `falloff`, `aa`, `compare`, `hud`. For example
   `capture spot classic:lighting=0 modern:lighting=1 id:view=id`. In the game console, `d_Capture <name>` takes the
-  default set: the frame as shown, d3d.ren's lighting, the modern lighting, and every data view.
+  default set: the frame as shown, d3d.ren's lighting, the modern lighting, and the light and id views.
+- **Lighting dump:** `d_DumpLighting 1` writes the loaded level's lightmapped polygons and lightmaps, as loaded, to
+  `captures\<world>_lighting.bin`. `tools/lighting_fit.py` compares them with the static lights from the world file
+  (`tools/world_objects.py`) to work out how the lights were baked.
 - `tools/analyze_capture.py <captures folder> <name>` reads a capture: what's at the crosshair or a pixel (`--at X Y`)
   and which lights reach it, coverage and light terms per surface (`--surfaces`), and per-surface changes between two
   variants (`--diff A B`).

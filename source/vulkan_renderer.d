@@ -755,6 +755,66 @@ public:
 		+/
 	}
 
+	// Console "d_DumpLighting 1": the main world's lightmapped polygons and their lightmaps, exactly as loaded, to
+	// captures\<world>_lighting.bin, for fitting the static lights' bake (tools/lighting_fit.py). Per polygon, little
+	// endian: uint index, uint surface flags, float[4] plane (normal, distance), float[3] lightmap origin, float[3] u and
+	// float[3] v lightmap axes (texel coordinate = dot(p - origin, axis) / 20 + 0.5, worldbsp.d GenerateLightmapUvs),
+	// uint vertex count, float[3] per vertex, ushort width, ushort height, ushort texels (RGB565, rows). The file starts
+	// with "DRLM", uint version 1, uint polygon count.
+	void DumpLighting()
+	{
+		import std.stdio: File;
+		import std.path: baseName, stripExtension;
+		import std.string: replace;
+		import Main: g_RenderContext;
+
+		WorldBsp* bsp=(g_RenderContext && g_RenderContext.main_world) ? g_RenderContext.main_world.world_bsp : null;
+		if (bsp is null)
+		{
+			test_out.writeln("d_DumpLighting: no world loaded");
+			return;
+		}
+		string world=LoadedWorldFile();
+		string name=world.length ? world.replace("\\", "/").baseName.stripExtension : "world";
+		try
+		{
+			import std.file: mkdirRecurse;
+			mkdirRecurse("captures");
+			auto file=File("captures\\"~name~"_lighting.bin", "wb");
+			uint count=0;
+			foreach(polygon; bsp.polygons[0..bsp.polygon_count])
+				if (polygon && polygon.surface && polygon.surface.plane && polygon.lightmap_data && (polygon.surface.flags & SurfaceFlags.LightMap))
+					count++;
+			file.rawWrite("DRLM");
+			file.rawWrite([1u, count]);
+			foreach(i, polygon; bsp.polygons[0..bsp.polygon_count])
+			{
+				if (!(polygon && polygon.surface && polygon.surface.plane && polygon.lightmap_data && (polygon.surface.flags & SurfaceFlags.LightMap)))
+					continue;
+				const auto plane=polygon.surface.plane;
+				file.rawWrite([cast(uint)i, cast(uint)polygon.surface.flags]);
+				file.rawWrite([plane.vector.x, plane.vector.y, plane.vector.z, plane.distance]);
+				file.rawWrite(polygon.polygon_list.vector[]);
+				file.rawWrite(polygon.surface.opq_map[3].vector[]);
+				file.rawWrite(polygon.surface.opq_map[4].vector[]);
+				auto vertices=polygon.DiskVerts();
+				file.rawWrite([cast(uint)vertices.length]);
+				foreach(ref vertex; vertices)
+				{
+					const float[3] position=vertex.vertex_data.xyz.vector;
+					file.rawWrite(position[]);
+				}
+				const ushort w=polygon.lightmap_data[0], h=polygon.lightmap_data[1];
+				file.rawWrite([w, h]);
+				file.rawWrite((cast(const(ushort)*)(polygon.lightmap_data+2))[0..w*h]);
+			}
+			test_out.writeln("d_DumpLighting: ", count, " lightmapped polygons of ", world, " to captures\\", name, "_lighting.bin");
+		}
+		catch (Exception e)
+			test_out.writeln("d_DumpLighting: ", e.msg);
+		test_out.flush();
+	}
+
 	// The world file the single-player server loaded, e.g. "Worlds_steamtunnels.dat" (null if it can't be read):
 	// g_pServerMgr (CLIENT.EXE RVA 0x91728) +0x1a4 m_pWorldFile, a UsedFile whose first field is the hash element
 	// keyed by the file name, the key at +0x16 (blood2_recon servermgr_lt1.h, dhashtable.cpp HashElement). The world
@@ -1744,6 +1804,7 @@ LAB_0004814b:
 	DebugView _debug_view; // the view the frame being recorded shows
 	float[16] _view_matrix, _proj_matrix; // the last frame's, as the shaders got them
 	CaptureRequest* _capture_request;
+	IdSet _capture_ids;
 	MonoTime _next_command_poll;
 
 	VkImage _capture_image;
@@ -1773,8 +1834,15 @@ LAB_0004814b:
 			_next_command_poll=now+dur!"msecs"(250);
 			_command_queue~=PollCommandFile("d_ren_cmd.txt");
 
-			// the same from the game's console: "d_Capture <name>" takes the default capture
+			// the same from the game's console: "d_Capture <name>" takes the default capture; "d_DumpLighting 1" writes the
+			// level's lightmaps
 			import Main: _renderer;
+			const string dump=ConsoleString("d_DumpLighting");
+			if (dump.length && dump!="0" && _renderer)
+			{
+				_renderer.RunConsoleString("d_DumpLighting 0");
+				DumpLighting();
+			}
 			const string capture=ConsoleString("d_Capture");
 			if (capture.length && capture!="0" && _renderer)
 			{
@@ -1969,7 +2037,8 @@ LAB_0004814b:
 		}
 
 		string variants_json;
-		bool[uint] ids_seen;
+		_capture_ids.Clear();
+		bool ids_wanted;
 		bool depth_written;
 		foreach(n, variant; request.variants)
 		{
@@ -2010,14 +2079,17 @@ LAB_0004814b:
 			try WritePng("captures\\"~file, width, height, pixels, bgra);
 			catch (Exception e) test_out.writeln("capture ", file, ": ", e.msg);
 			if (variant.view==DebugView.Id)
+			{
+				ids_wanted=true;
 				for (size_t i=0; i<pixels.length; i+=4)
-					ids_seen[bgra ? (pixels[i+2] | pixels[i+1] << 8 | pixels[i] << 16) : (pixels[i] | pixels[i+1] << 8 | pixels[i+2] << 16)]=true;
+					_capture_ids.Add(bgra ? (pixels[i+2] | pixels[i+1] << 8 | pixels[i] << 16) : (pixels[i] | pixels[i+1] << 8 | pixels[i+2] << 16));
+			}
 			vmaUnmapMemory(_capture_colour_memory);
 
 			if (copy_depth)
 			{
 				vmaMapMemory(_capture_depth_memory, &data);
-				try write(format("captures\\%s_depth.f32", request.name), (cast(const(ubyte)*)data)[0..cast(size_t)width*height*4]);
+				try WriteRaw(format("captures\\%s_depth.f32", request.name), (cast(const(ubyte)*)data)[0..cast(size_t)width*height*4]);
 				catch (Exception e) test_out.writeln("capture depth: ", e.msg);
 				vmaUnmapMemory(_capture_depth_memory);
 				depth_written=true;
@@ -2029,9 +2101,9 @@ LAB_0004814b:
 		}
 
 		try write(format("captures\\%s.json", request.name), CaptureJson(request.name, width, height, bgra,
-			depth_written ? format("%s_depth.f32", request.name) : null, variants_json, ids_seen));
+			depth_written ? format("%s_depth.f32", request.name) : null, variants_json, ids_wanted ? _capture_ids.Ids() : null));
 		catch (Exception e) test_out.writeln("capture json: ", e.msg);
-		test_out.writeln("capture ", request.name, ": ", request.variants.length, " variants, ", ids_seen.length, " ids");
+		test_out.writeln("capture ", request.name, ": ", request.variants.length, " variants");
 		test_out.flush();
 	}
 
@@ -2075,7 +2147,7 @@ LAB_0004814b:
 	}
 
 	// the capture's description: camera and matrices, settings, lights, variants, and what drew each id seen
-	string CaptureJson(string name, uint width, uint height, bool bgra, string depth_file, string variants_json, bool[uint] ids)
+	string CaptureJson(string name, uint width, uint height, bool bgra, string depth_file, string variants_json, uint[] sorted)
 	{
 		import std.format: format;
 		import std.algorithm: sort;
@@ -2110,8 +2182,6 @@ LAB_0004814b:
 
 		// ids: world polygons (index + 1) and object batches (IdObjectBase + draw-order index)
 		WorldBsp* bsp=(g_RenderContext && g_RenderContext.main_world) ? g_RenderContext.main_world.world_bsp : null;
-		uint[] sorted=ids.keys;
-		sort(sorted);
 		json~="  \"ids\": {";
 		bool first=true;
 		foreach(id; sorted)
