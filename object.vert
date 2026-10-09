@@ -17,6 +17,7 @@ layout(location=0) out vec4 colour_out;
 layout(location=1) out vec2 uv_out;
 layout(location=2) out vec3 lightmap_out;
 layout(location=3) out float eye_depth_out; // for D3D-style table fog
+layout(location=4) out vec3 world_position_out; // for the per-texel lights of lightmapped world models
 
 void main()
 {
@@ -26,4 +27,5 @@ void main()
 	uv_out=uv_in;
 	lightmap_out=lightmap_in;
 	eye_depth_out=abs(view_pos.z);
+	world_position_out=position_in;
 }

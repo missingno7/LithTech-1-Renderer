@@ -16,8 +16,40 @@ layout(location=0) in vec4 colour_in;
 layout(location=1) in vec2 uv_in; // normalised, like D3D TL vertices (model UVs are stored that way)
 layout(location=2) in vec3 lightmap_in;
 layout(location=3) in float eye_depth_in;
+layout(location=4) in vec3 world_position_in;
 
 layout(location=0) out vec4 colour_out;
+
+#define MAX_LIGHT_COUNT 40
+
+struct LightObj
+{
+	vec3 position; float flags;
+	vec3 colour;
+	float radius;
+};
+
+layout(set=0, binding=2) uniform LightList {
+	uint count; float light_saturate, pad1, pad2;
+	LightObj lights[MAX_LIGHT_COUNT];
+} light_list;
+
+// the per-texel dynamic lights of a lightmapped poly (shader.frag DynamicLightmap; blood2_recon port_notes/world.md
+// 5.2), for solid world models
+vec3 DynamicLightmap()
+{
+	vec3 light=vec3(0.0);
+	for(uint i=0; i<light_list.count; ++i)
+	{
+		LightObj obj=light_list.lights[i];
+		vec3 to_light=obj.position-world_position_in;
+		float d2=dot(to_light, to_light), r2=obj.radius*obj.radius;
+		if (d2>=r2) continue;
+		float k=floor((1.0-d2/r2)*63.0);
+		light+=(2.0*obj.colour-1.0)*min(1.0, light_list.light_saturate*k/63.0);
+	}
+	return light;
+}
 
 float FogFactor()
 {
@@ -53,7 +85,9 @@ void main()
 	if (lightmap_in.z>0.5)
 	{
 		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
-		vec3 light=texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb*colour_in.rgb;
+		// the vertex colour is GlobalLightScale here
+		vec3 light=clamp(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb+DynamicLightmap(), 0.0, 1.0)*
+			colour_in.rgb;
 		vec3 fogged_texel=Fog(texel.rgb, fog);
 		colour=Fog(light, fog)*fogged_texel;
 		fullbright_add=fogged_texel*texel.a;

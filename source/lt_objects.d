@@ -25,6 +25,7 @@ enum ObjectFlag : uint
 	RotateableSprite=0x8,
 	GlowSprite=0x20, // sprites; on polygrids 0x20 means "environment map only"
 	PolyGridEnvOnly=0x20,
+	EnvironmentMap=0x20, // models: FLAG_ENVIRONMENTMAP, chrome
 	ReallyClose=0x40,
 	SpriteBias=0x40,
 	SpriteNoZ=0x80,
@@ -133,6 +134,15 @@ import WorldBsp: Node;
 // plane of the hit: normal x, y, z and distance (n . p = distance), facing a
 bool TraceSegment(Node* root, const float[3] a, const float[3] b, out float[4] hit_plane)
 {
+	Node* hit_node;
+	float[3] hit_point;
+	return TraceSegment(root, a, b, hit_plane, hit_node, hit_point);
+}
+
+// also the node whose splitter was hit (its polygon is the surface hit) and the point where the segment enters solid
+bool TraceSegment(Node* root, const float[3] a, const float[3] b, out float[4] hit_plane, out Node* hit_node,
+	out float[3] hit_point)
+{
 	struct Deferred
 	{
 		Node* far_side;
@@ -171,6 +181,8 @@ bool TraceSegment(Node* root, const float[3] a, const float[3] b, out float[4] h
 				hit_plane=[normal[0], normal[1], normal[2], distance];
 			else
 				hit_plane=[-normal[0], -normal[1], -normal[2], -distance];
+			hit_node=last_crossing;
+			hit_point=start;
 			return true;
 		}
 

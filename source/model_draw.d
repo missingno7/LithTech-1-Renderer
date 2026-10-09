@@ -6,15 +6,14 @@ module ModelDraw;
  + the vertex dispatch at 0x10e7c (16-step light ramp) and d3d_model_mesh.cpp (faces, per-face UVs).
  + Output is world-space triangles; the GPU does projection, clipping and depth instead of d3d.ren's CPU TL path.
  +
- + Not ported yet: LOD selection and collapse (always full detail), CoolFog, tint pass and
- + environment-map passes, shadows, the "really close" weapon pass.
+ + Not ported: LOD selection and collapse (always full detail), CoolFog, the tint pass.
  +/
 
 import LTObjects;
 import SceneGeometry;
 import RendererTypes: SceneDesc, ModelHookData;
 import Texture: SharedTexture, RenderTexture;
-import WorldBsp: MainWorld, WorldBsp, Node;
+import WorldBsp: MainWorld, WorldBsp, Node, SurfaceFlags;
 import erupted: VkDescriptorSet;
 
 // ModelInstance, port ABI 4.2 (offsets from the object)
@@ -84,10 +83,37 @@ enum : size_t
 
 alias ModelHookFn=extern(C) void function(ModelHookData*, void*);
 
+// Environment maps ("chrome"; port_notes/model.md, Render state per pass): a model with FLAG_ENVIRONMENTMAP, or every
+// model with EnvMapAll, is drawn first with the world's environment map (RenderStruct +0xdc, Blood II levels set
+// spritetextures\chrome.dtx on high detail), then its skin is blended over it with SRCALPHA / INVSRCALPHA, so the object
+// alpha (Blood II's "chrome value") sets how much skin covers the chrome. EnvMapAll draws the environment map alone.
+// The environment UVs project the world-space normal: u = (n . pose row 0) * EnvUScale + EnvUAdd, likewise v with row 1
+// (d3d.ren 0x10de0), with EnvUScale = (1/254) / EnvScale and EnvUAdd = EnvPanSpeed * camera x + 0.5 (z for v).
+struct ModelEnvSettings
+{
+	RenderTexture texture; // null: no environment map
+	bool enable; // console EnvMapEnable
+	bool all; // console EnvMapAll
+	float[2] scale; // EnvUScale, EnvVScale
+	float[2] add; // EnvUAdd, EnvVAdd
+}
+
+// CloudMapLight (d3d.ren 0x10680): a model standing on a cloud-shadowed floor (surface flag 0x8000) has its directional
+// light dimmed by the cloud map's grey level under it. Blood II's detail settings turn it off.
+struct CloudLightSettings
+{
+	bool enable;
+	const(ubyte)[] intensity; // the cloud texture's top mip as grey levels, (r + g + b) / 3 of its palette
+	uint width, height;
+	float[2] offset, scale; // GLOBALPAN_SKYSHADOW x / z offset and scale
+	WorldBsp* bsp;
+}
+__gshared CloudLightSettings g_CloudLight;
+
 // d3d.ren draws every model through this; geometry goes into `geometry` in world space
 void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, MainWorld* world,
 	const float[3] light_direction, const DynamicLight[] lights, const ModelShadowSettings* shadows,
-	scope RenderTexture delegate(SharedTexture*) resolve_texture)
+	const ModelEnvSettings* env, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	void* model=At!(void*)(object, ModelDataOffset);
 	void* prev_anim=At!(void*)(object, ModelPrevAnimOffset);
@@ -138,7 +164,12 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	// solid iff the object is fully opaque (d3d_ProcessModel)
 	const bool translucent=object.a!=0xFF;
 	RenderTexture skin=resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset));
-	geometry.Begin(skin ? skin.texture_descriptor : VkDescriptorSet.init, translucent, skin && skin.fullbright);
+	const bool chrome=env && env.texture && env.enable && (env.all || (object.flags & ObjectFlag.EnvironmentMap));
+
+	_mesh.length=0;
+	_mesh.assumeSafeAppend();
+	_env_uvs.length=0;
+	_env_uvs.assumeSafeAppend();
 
 	foreach(face_index; 0..face_count)
 	{
@@ -164,11 +195,42 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 				colour: ramp[step],
 				uv: [face_uvs[face_index*6+corner*2], face_uvs[face_index*6+corner*2+1]]
 			};
-			geometry.Add(vertex);
+			_mesh~=vertex;
+
+			if (chrome)
+			{
+				const float[3] n=[source.nx, source.ny, source.nz]; // unscaled int8, like d3d.ren
+				_env_uvs~=[
+					(n[0]*node.m[0][0]+n[1]*node.m[0][1]+n[2]*node.m[0][2])*env.scale[0]+env.add[0],
+					(n[0]*node.m[1][0]+n[1]*node.m[1][1]+n[2]*node.m[1][2])*env.scale[1]+env.add[1]];
+			}
 		}
 	}
 
-	geometry.End();
+	const DrawGroup group=translucent ? geometry.translucent_group : geometry.solid_group;
+	const ObjectPipe pipe=translucent ? geometry.translucent_pipe : geometry.solid_pipe;
+	const TextureMode skin_mode=(skin && skin.fullbright) ? TextureMode.Fullbright : TextureMode.Normal;
+	const VkDescriptorSet skin_texture=skin ? skin.texture_descriptor : VkDescriptorSet.init;
+
+	if (chrome)
+	{
+		geometry.Begin(env.texture.texture_descriptor, group, pipe, TextureMode.Normal);
+		foreach(i, vertex; _mesh)
+		{
+			vertex.uv=_env_uvs[i];
+			geometry.Add(vertex);
+		}
+		geometry.End();
+	}
+
+	if (!chrome || !env.all)
+	{
+		// over the environment map the skin is blended, still writing depth in the solid queue
+		geometry.Begin(skin_texture, group, (chrome && !translucent) ? ObjectPipe.BlendDepthWrite : pipe, skin_mode);
+		foreach(ref vertex; _mesh)
+			geometry.Add(vertex);
+		geometry.End();
+	}
 
 	// FLAG_SHADOW, after the model hook (d3d.ren calls the shadow pass from the model backend when that bit is set)
 	if (draw_flags & ObjectFlag.Shadow)
@@ -308,6 +370,8 @@ private:
 
 Mat4[] _pose;
 bool[256] _node_visible;
+ObjectVertex[] _mesh; // the model's triangles, drawn once per pass
+float[2][] _env_uvs; // and their environment-map UVs
 
 debug void DumpModelOnce(LTObject* object, void* model, uint matrix_count)
 {
@@ -530,6 +594,31 @@ void BlendVertexAnimation(void* model, void* anim_a, void* anim_b, uint frame_a,
 	}
 }
 
+// d3d.ren 0x10680: the factor CloudMapLight puts on the directional light, 1 when it doesn't apply. The floor is
+// looked for 200 units below; the factor grows with the height above it.
+float CloudLight(const float[3] pos)
+{
+	with (g_CloudLight)
+	{
+		if (!enable || intensity.length==0 || bsp is null || bsp.root_node is null || scale[0]==0f || scale[1]==0f)
+			return 1f;
+
+		float[4] plane;
+		Node* node;
+		float[3] hit;
+		if (!TraceSegment(cast(Node*)bsp.root_node, pos, [pos[0], pos[1]-200f, pos[2]], plane, node, hit))
+			return 1f;
+		if (node is null || node.polygons is null || node.polygons.surface is null ||
+			!(node.polygons.surface.flags & SurfaceFlags.PanningSky))
+			return 1f;
+
+		const int x=cast(int)((offset[0]+pos[0])/scale[0]) & (width-1);
+		const int y=cast(int)((offset[1]+pos[2])/scale[1]) & (height-1);
+		float light=(pos[1]-hit[1])*0.0025f+intensity[x+y*width]*(1f/255f);
+		return light<0.2f ? 0.2f : light>1f ? 1f : light;
+	}
+}
+
 // d3d_model_frame_lighting.cpp ours_SetupModelFrameState + the 16-entry ramp of the vertex dispatch (0x10e7c)
 float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights,
 	out uint draw_flags)
@@ -577,6 +666,9 @@ float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, con
 			if (directional[i]>cap)
 				directional[i]=cap;
 		}
+
+		const float cloud=CloudLight(object.pos);
+		directional[]*=cloud;
 	}
 
 	float[4][16] ramp;

@@ -101,7 +101,7 @@ enum SurfaceFlags : uint
 	AlwaysLightMap=0x800,
 	DirectionalLight=0x1000,
 
-	Unknown=0x8000, // checked by renderer but unclear function
+	PanningSky=0x8000, // cloud shadows: the GLOBALPAN_SKYSHADOW texture moves over it (blood2_recon port_notes/sky.md)
 }
 
 struct Surface
@@ -344,4 +344,4 @@ struct WorldBsp
 
 	static assert(this.sizeof==360);
 	static assert(owner_obj.offsetof==216);
-}
+}

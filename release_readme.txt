@@ -48,10 +48,9 @@ Console variables. They are written to autoexec.cfg after the first run and can 
 
 KNOWN LIMITATIONS
 -----------------
-- Not yet done: chrome (environment-mapped) models, dynamic lights on lightmapped walls are softer than the original,
-  moving cloud shadows outdoors, model detail levels, the game's screenshot key.
-- The sky, water and some effects (line systems) are implemented but haven't been checked against the original in
-  every level yet.
+- Not yet done: model detail levels (models are always drawn at full detail), the game's screenshot key.
+- Some effects (line systems, moving cloud shadows outdoors) are implemented but haven't been checked in every level
+  yet.
 
 
 REPORTING PROBLEMS

@@ -14,9 +14,12 @@ them by default (see *Fog* below).
 
 ## What it renders
 - **World:** lightmaps (two-pass, including Blood II's `Saturate 1` doubling), pre-lit Gouraud surfaces, fullbright
-  textures, dynamic lights.
+  textures. Dynamic lights (muzzle flashes, explosions) light lightmapped walls per texel with d3d.ren's quadratic
+  falloff, and Gouraud surfaces per vertex.
+- **Cloud shadows:** outdoor levels with a panning sky move a cloud texture over the surfaces flagged for it.
 - **Models:** animated characters and weapons (keyframe blending, per-vertex animation, hidden nodes), lit by the
   light grid, the camera-relative directional light and dynamic lights, with fullbright skins and the model hook.
+  Chrome: weapons and props flagged for it get the level's environment map under their skin (high detail).
 - **World models and containers** (doors, lifts, the train): lightmapped like the world when solid, blended when
   translucent.
 - **Sprites:** billboards, glow sprites, z-biased and no-Z sprites, rotatable sprites, and decals clipped to their wall
@@ -29,8 +32,8 @@ them by default (see *Fog* below).
 - Objects are drawn in the order of d3d.ren's object queues.
 
 ## Not done yet
-- Model LOD, model environment maps, the multiplayer skin tint pass, CoolFog.
-- The sky, polygrids and line systems are implemented but haven't been checked in-game yet.
+- Model LOD (models are always drawn at full detail), the multiplayer skin tint pass, CoolFog, the screenshot key.
+- Line systems and cloud shadows are implemented but haven't been checked in-game yet.
 - There is no visibility culling: the whole level is drawn every frame. It is still fast.
 
 ## Using it

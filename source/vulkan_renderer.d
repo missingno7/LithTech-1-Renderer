@@ -64,15 +64,16 @@ enum uint MaxLightCount=40;
 
 struct LightObj
 {
-	this(vec3 pos, vec3 colour, float radius)
+	this(vec3 pos, vec3 colour, float radius, bool dont_light_backfacing)
 	{
 		this.pos=pos;
 		this.colour=colour;
 		this.radius=radius;
+		this.flags=dont_light_backfacing ? 1f : 0f;
 	}
 
 	vec3 pos;
-	private float pad;
+	float flags; // 1: FLAG_DONTLIGHTBACKFACING
 	vec3 colour;
 	float radius;
 }
@@ -80,7 +81,8 @@ struct LightObj
 struct LightListUbo
 {
 	uint count;
-	private float[3] pad;
+	float light_saturate=1f; // console LightSaturate, for the per-texel lightmap lights
+	private float[2] pad;
 	LightObj[MaxLightCount] lights;
 }
 
@@ -100,7 +102,8 @@ struct Vertex
 	vec3 colour;
 	vec2 uv;
 	vec2 lightmap_uv; // in the lightmap atlas, normalised
-	float lightmapped; // 1 = lit by the lightmap, 0 = by the pre-lit colour
+	float lightmapped; // 1 = lit by the lightmap, 0 = by the pre-lit colour, 2 = cloud-shadowed (surface flag 0x8000)
+	vec3 normal; // the surface plane's, for FLAG_DONTLIGHTBACKFACING lights
 
 	static VkVertexInputBindingDescription GetBindingDescription()
 	{
@@ -413,16 +416,86 @@ public:
 	bool _widescreen=true; // console "d_Widescreen": Hor+ FOV correction (RenderScene)
 	float[2] _game_fov; // the scene's FOVs as the game gave them, for the log
 
+	// Cloud shadows (blood2_recon port_notes/sky.md, Panning sky): Blood II levels with PanSky set a cloud texture and
+	// move it every frame (GLOBALPAN_SKYSHADOW, RenderStruct +0xe0). World surfaces with flag 0x8000 that aren't
+	// lightmapped show it instead of a lightmap: cloud x vertex light, then the texture over it like the lightmap pass.
+	// u = (x + x offset) / (cloud width * x scale), v likewise with z (r_UpdatePanningSkyUV).
+	float[4] _cloud_pan; // x / z offset, u / v scale; 0 scale = no cloud texture
+	VkDescriptorSet _cloud_descriptor; // VK_NULL_ND_HANDLE: the dummy texture
+
+	void UpdateCloudPan()
+	{
+		import Main: _renderer, EnsureTextureBound;
+
+		_cloud_pan[]=0f;
+		_cloud_descriptor=VK_NULL_ND_HANDLE;
+		if (_renderer is null)
+			return;
+		const GlobalPan pan=_renderer.global_pans[GlobalPanType.SkyShadow];
+		RenderTexture cloud=pan.texture_ref ? EnsureTextureBound(cast(SharedTexture*)pan.texture_ref) : null;
+		if (cloud is null || cloud.width==0 || cloud.height==0 || pan.scale.x==0f || pan.scale.y==0f)
+			return;
+		_cloud_pan=[pan.offset.x, pan.offset.y, 1f/(cloud.width*pan.scale.x), 1f/(cloud.height*pan.scale.y)];
+		_cloud_descriptor=cloud.texture_descriptor;
+	}
+
+	// CloudMapLight needs the cloud texture's grey levels on the CPU (d3d_draw.cpp r_UpdateCloudMapIntensity), rebuilt
+	// when the texture changes
+	SharedTexture* _cloud_intensity_texture;
+	ubyte[] _cloud_intensity;
+	uint[2] _cloud_intensity_size;
+
+	void UpdateCloudLight(MainWorld* world, bool enable)
+	{
+		import Main: _renderer;
+		import ModelDraw: g_CloudLight, CloudLightSettings;
+
+		const GlobalPan pan=_renderer.global_pans[GlobalPanType.SkyShadow];
+		SharedTexture* texture=cast(SharedTexture*)pan.texture_ref;
+		if (texture !is _cloud_intensity_texture)
+		{
+			_cloud_intensity_texture=texture;
+			_cloud_intensity=null;
+			if (texture)
+				if (TextureData* data=_renderer.GetTexture(texture, null))
+				{
+					const auto mip=&data.mipmap_data[0];
+					if (mip.pixels && data.palette && mip.width>0 && mip.height>0)
+					{
+						_cloud_intensity=new ubyte[mip.width*mip.height];
+						foreach(y; 0..mip.height)
+							foreach(x; 0..mip.width)
+							{
+								const Colour c=data.palette.colours[mip.pixels[y*mip.stride+x]];
+								_cloud_intensity[y*mip.width+x]=cast(ubyte)((c.r+c.g+c.b)/3);
+							}
+						_cloud_intensity_size=[mip.width, mip.height];
+					}
+					_renderer.FreeTexture(texture);
+				}
+		}
+
+		CloudLightSettings settings={
+			enable: enable,
+			intensity: _cloud_intensity,
+			width: _cloud_intensity_size[0], height: _cloud_intensity_size[1],
+			offset: [pan.offset.x, pan.offset.y], scale: [pan.scale.x, pan.scale.y],
+			bsp: world ? world.world_bsp : null
+		};
+		g_CloudLight=settings;
+	}
+
 	// shader.frag / object.frag push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
-	// 3 world fullbright), fog colour and switch, fog range
+	// 3 world fullbright), fog colour and switch, fog range, cloud panning
 	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World)
 	{
 		const float[2] range=fog==FogKind.Sky ? _sky_fog_range : _fog_range;
 		const bool fog_on=_fog_enable && fog!=FogKind.None && range[0]!=range[1];
-		const float[12] constants=[
+		const float[16] constants=[
 			_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], texture_mode,
 			_fog_colour[0], _fog_colour[1], _fog_colour[2], fog_on ? 1f : 0f,
-			range[0], range[1], _fog_by_distance ? 1f : 0f, _saturate ? 1f : 0f
+			range[0], range[1], _fog_by_distance ? 1f : 0f, _saturate ? 1f : 0f,
+			_cloud_pan[0], _cloud_pan[1], _cloud_pan[2], _cloud_pan[3]
 		];
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
 	}
@@ -786,6 +859,7 @@ LAB_0004814b:
 		{
 			UpdateUniformBuffer(image_index);
 			UpdateLightListUbo(image_index);
+			UpdateCloudPan();
 			Mark(Timing.Uniforms);
 
 			void SetCommandBuffer(size_t image_index)
@@ -837,6 +911,8 @@ LAB_0004814b:
 				vkCmdSetLineWidth(buffer, 1f);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
+				VkDescriptorSet cloud_texture=_cloud_descriptor!=VK_NULL_ND_HANDLE ? _cloud_descriptor : _texture_descriptor;
+				vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 2, 1, &cloud_texture, 0, null);
 				PushBatchConstants(buffer, 0f);
 
 				if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
@@ -1821,15 +1897,26 @@ LAB_0004814b:
 			return EnsureTextureBound(texture);
 		}
 
-		// the frame's dynamic lights (d3d_CalcLightAdd's list), gathered from the world; object-list scenes reuse them
+		// the frame's dynamic lights, gathered from the world; object-list scenes reuse them. d3d.ren (0x241d0) skips
+		// FLAG_FOGLIGHT (0x80) lights, links the rest to world (and world model) polies, and keeps those without
+		// FLAG_ONLYLIGHTWORLD (0x20), at most 40, for objects (d3d_CalcLightAdd's list). Console DynamicLight 0: none.
 		if (normal_mode && world && world.world_bsp)
 		{
 			_scene_lights.length=0;
 			_scene_lights.assumeSafeAppend();
-			ForEachWorldObject(world.world_bsp, (LTObject* object) {
-				if (object.type==ObjectType.Light && (object.flags & ObjectFlag.Visible) && !(object.flags & ObjectFlag.SkyObject))
-					_scene_lights~=DynamicLight(object.pos, [cast(float)object.r, cast(float)object.g, cast(float)object.b], At!float(object, LightRadiusOffset));
-			});
+			_world_lights.length=0;
+			_world_lights.assumeSafeAppend();
+			if (ConsoleFloat("DynamicLight", 1f)!=0f)
+				ForEachWorldObject(world.world_bsp, (LTObject* object) {
+					if (object.type!=ObjectType.Light || !(object.flags & ObjectFlag.Visible) || (object.flags & ObjectFlag.SkyObject) ||
+						(object.flags & 0x80))
+						return;
+					const light=DynamicLight(object.pos, [cast(float)object.r, cast(float)object.g, cast(float)object.b],
+						At!float(object, LightRadiusOffset));
+					_world_lights~=light;
+					if (!(object.flags & 0x20) && _scene_lights.length<40)
+						_scene_lights~=light;
+				});
 		}
 
 		import std.math: tan;
@@ -1862,6 +1949,21 @@ LAB_0004814b:
 			near_z: 0.1f
 		};
 
+		// chrome: the level's environment map and its UV transform, set up per scene like d3d_RenderScene
+		import ModelDraw: ModelEnvSettings;
+		ModelEnvSettings model_env;
+		model_env.enable=ConsoleFloat("EnvMapEnable", 0f)!=0f;
+		model_env.all=ConsoleFloat("EnvMapAll", 0f)!=0f;
+		if (model_env.enable && _renderer.envmap_texture)
+			model_env.texture=ResolveTexture(_renderer.envmap_texture);
+		{
+			const float env_scale=ConsoleFloat("EnvScale", 1f), pan_speed=ConsoleFloat("EnvPanSpeed", 0.0005f);
+			model_env.scale[]=(1f/254f)/(env_scale!=0f ? env_scale : 1f);
+			model_env.add=[pan_speed*scene_desc.camera_position.x+0.5f, pan_speed*scene_desc.camera_position.z+0.5f];
+		}
+
+		UpdateCloudLight(world, ConsoleFloat("CloudMapLight", 1f)!=0f);
+
 		void Process(LTObject* object)
 		{
 			if (object is null || !(object.flags & ObjectFlag.Visible) || (object in _objects_seen))
@@ -1875,12 +1977,13 @@ LAB_0004814b:
 			{
 				case ObjectType.Model:
 					_objects.Route(DrawGroup.SolidModels, ObjectPipe.Opaque, DrawGroup.TranslucentModels, ObjectPipe.Blend);
-					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &model_shadows, &ResolveTexture);
+					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &model_shadows, &model_env,
+						&ResolveTexture);
 					break;
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
 					_objects.Route(DrawGroup.SolidWorldModels, ObjectPipe.Opaque, DrawGroup.TranslucentWorldModels, ObjectPipe.Blend);
-					DrawWorldModel(_objects, object, scene_desc, _scene_lights, &ResolveTexture);
+					DrawWorldModel(_objects, object, scene_desc, _world_lights, &ResolveTexture);
 					break;
 				case ObjectType.Sprite:
 					if (draw_sprites)
@@ -1984,7 +2087,8 @@ LAB_0004814b:
 		_objects.End();
 	}
 
-	DynamicLight[] _scene_lights;
+	DynamicLight[] _scene_lights; // lights for objects
+	DynamicLight[] _world_lights; // lights for world model polies
 	int _sky_object_count; // of the last normal scene, for the log
 
 	// d3d.ren r_DrawSky / sky-object pass (port_notes/sky.md): the sky objects seen from a sky camera that moves through
@@ -2720,12 +2824,14 @@ private:
 		CreateDescriptorSetLayout();
 		CreateTextureDescriptorLayout();
 
-		VkDescriptorSetLayout[] pipeline_descriptor_layouts=[_descriptor_set_layout, _texture_descriptor_layout];
-		// per texture batch: GlobalLightScale and texture mode, fog colour, fog range (shader.frag / object.frag)
+		// set 2: the cloud texture of cloud-shadowed world surfaces (shader.frag)
+		VkDescriptorSetLayout[] pipeline_descriptor_layouts=[_descriptor_set_layout, _texture_descriptor_layout, _texture_descriptor_layout];
+		// per texture batch: GlobalLightScale and texture mode, fog colour, fog range, cloud panning (shader.frag /
+		// object.frag)
 		VkPushConstantRange push_constant_range={
 			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT,
 			offset: 0,
-			size: float.sizeof*12
+			size: float.sizeof*16
 		};
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: pipeline_descriptor_layouts.length,
@@ -2927,9 +3033,19 @@ private:
 		import Objects.Light;
 		import WorldBsp: WorldBsp;
 
+		import Main: _renderer;
+
+		float ConsoleFloat(const(char)* name, float default_value)
+		{
+			void* variable=_renderer ? _renderer.GetConsoleVar(name) : null;
+			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
+		}
+
+		// the lights d3d.ren links to world polies (d3d_world_light_add.cpp, 0x241d0): all visible lights but FogLight
+		// ones (flag 0x80), including FLAG_ONLYLIGHTWORLD ones; console DynamicLight 0 turns them off
 		LightListUbo ubo;
-		// iterate lights, set count
-		if (g_RenderContext !is null) // FIXME: pls kill me
+		ubo.light_saturate=ConsoleFloat("LightSaturate", 1f);
+		if (g_RenderContext !is null && ConsoleFloat("DynamicLight", 1f)!=0f)
 		{
 			debug(FrameTrace) test_out.writeln("--- Updating Light List");
 
@@ -2949,9 +3065,10 @@ private:
 
 						if ((obj.flags & ObjectFlags.Visible) && !(obj.flags & ObjectFlags.SkyObject) && obj.type_id==ObjectType.Light)
 						{
-							if (ubo.count<40 && !(obj.flags & ObjectFlags.OnlyLightWorld) && !(obj.flags & ObjectFlags.FogLight))
+							if (ubo.count<MaxLightCount && !(obj.flags & ObjectFlags.FogLight))
 							{
-								ubo.lights[ubo.count++]=LightObj(obj.position, vec3(obj.colour[0]/255f, obj.colour[1]/255f, obj.colour[2]/255f), obj.ToLight().radius);
+								ubo.lights[ubo.count++]=LightObj(obj.position, vec3(obj.colour[0]/255f, obj.colour[1]/255f, obj.colour[2]/255f),
+									obj.ToLight().radius, (obj.flags & ObjectFlags.DontLightBackfaces)!=0);
 							}
 						}
 						curr=curr.prev;
@@ -3067,7 +3184,7 @@ private:
 			binding: 2,
 			descriptorType: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			descriptorCount: 1,
-			stageFlags: VK_SHADER_STAGE_VERTEX_BIT,
+			stageFlags: VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, // vertex lights, per-texel lightmap lights
 			pImmutableSamplers: null
 		};
 
@@ -3751,6 +3868,7 @@ private:
 		_vertex_index_buffer=VK_NULL_ND_HANDLE;
 		index_count=0;
 		_animated_polygons.length=0; // the level's polygons are about to go away
+		_cloud_intensity_texture=null; // the next level's cloud texture may reuse the address
 
 		DestroyLightmapAtlas();
 	}
@@ -3823,6 +3941,12 @@ private:
 						lightmap_uv.y=(vertex.lightmap_uv.y+(*lightmap_origin)[1])/_lightmap_atlas_height;
 						lightmapped=1f;
 					}
+					// d3d.ren's dispatch: the lightmap flag first, then the panning-sky one (r_SetPolyFunctions)
+					else if (polygon.surface.flags & SurfaceFlags.PanningSky)
+						lightmapped=2f;
+
+					if (polygon.surface.plane)
+						normal=polygon.surface.plane.vector;
 				}
 
 				vert_buffer~=new_vert;
