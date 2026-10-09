@@ -19,7 +19,7 @@ $glslang = Join-Path $Toolchains "glslang\bin\glslang.exe"
 if (-not (Test-Path $glslang)) { $glslang = (Get-Command glslangValidator, glslang -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
 
 # shaders: compiled to SPIR-V here, embedded into the DLL by the D build (import(), dub.sdl stringImportPaths)
-$shaders = @{ "shader.vert" = "vert.spv"; "shader.frag" = "frag.spv"; "overlay.vert" = "overlay_vert.spv"; "overlay.frag" = "overlay_frag.spv"; "object.vert" = "object_vert.spv"; "object.frag" = "object_frag.spv" }
+$shaders = @{ "shader.vert" = "vert.spv"; "shader.frag" = "frag.spv"; "overlay.vert" = "overlay_vert.spv"; "overlay.frag" = "overlay_frag.spv"; "object.vert" = "object_vert.spv"; "object.frag" = "object_frag.spv"; "post.frag" = "post_frag.spv" }
 foreach ($src in $shaders.Keys) {
 	& $glslang -V $src -o $shaders[$src]; if ($LASTEXITCODE) { throw "$src failed" }
 }

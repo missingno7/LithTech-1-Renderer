@@ -62,3 +62,14 @@ Phase order, adjusted so that each step delivers something visible and unlocks t
 
 Lighting stays in gamma space. The lightmaps, textures and light colours were all tuned in it, and moving to linear
 lighting would change the look of every level. Revisit this only with the HDR post pipeline.
+
+## Status
+
+| Step | State | Measured cost (GPU timestamps) |
+|---|---|---|
+| GPU timing, `d_GPU` | done | – |
+| `d_Lighting 1` (per-pixel lights, specular) | done, default off until checked in-game | iGPU at 4K: +0.7 ms with no lights, about +1.3 ms per light covering the view |
+| Offscreen target + post pass, `d_AntiAliasing 1` (FXAA) | done, default off | RTX 4090 at 4K: 0.1 ms; iGPU at 4K: +5.5 ms per frame including the extra copy |
+
+The iGPU presents through the NVIDIA card's display, so its swapchain writes are unusually slow. Its post-pass numbers
+overstate the cost on a GPU that drives the display itself.

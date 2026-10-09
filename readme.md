@@ -98,6 +98,11 @@ grid but without its 16 visible steps. The baked lightmaps and pre-lit colours a
 For comparisons, `d_Compare 1` draws the left half of the view the d3d.ren way and the right half with the current
 settings. `d_DebugLight <radius>` adds a steady light just ahead of the camera, so the lighting can be checked anywhere.
 
+### Post-processing
+`d_AntiAliasing 1` turns on FXAA. With it on, the 3D scene is rendered to an offscreen image and post-processed before
+the 2D layer goes on top, so the HUD, menus and console stay sharp. With every post effect off, d_ren draws straight
+into the swapchain as before.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
@@ -116,7 +121,8 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_Lighting` | 0 | 1: per-pixel dynamic lights with N·L and specular (see *Modern lighting*). |
 | `d_Specular` | 0.25 | Specular strength of the modern lighting; 0 turns it off. |
 | `d_LightFalloff` | 1 | Exponent of the modern lighting's falloff `(1 - d²/r²)^n`; 1 is d3d.ren's lightmap curve, higher is softer. |
-| `d_Compare` | 0 | 1: left half of the view as d3d.ren, right half with the current settings. |
+| `d_AntiAliasing` | 0 | 1: FXAA on the 3D scene (not the 2D layer). |
+| `d_Compare` | 0 | 1: left half of the view as d3d.ren with no post effects, right half with the current settings. |
 | `d_DebugLight` | 0 | Radius of a test light ahead of the camera; 0 = none. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |
 | `DrawSky`, `DrawSprites`, `DrawParticles`, `DrawPolyGrids`, `DrawLineSystems`, `LightAddPoly` | 1 | Turn object types off. |

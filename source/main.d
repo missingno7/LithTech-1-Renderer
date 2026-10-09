@@ -289,6 +289,7 @@ void RegisterRendererOptions()
 		["d_DebugClear", "0"], // 1: holes in the world shown in blue
 		["d_GPU", "0"],        // which Vulkan adapter, by its index in vk_test.txt's device list
 		["d_Lighting", "0"],   // 0: dynamic lights like d3d.ren; 1: per pixel with N.L and specular
+		["d_AntiAliasing", "0"], // 0: none; 1: FXAA
 	];
 
 	if (_renderer is null || _renderer.GetConsoleVar is null || _renderer.RunConsoleString is null)

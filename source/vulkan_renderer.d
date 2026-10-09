@@ -22,6 +22,7 @@ import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
 import SceneGeometry: ObjectGeometry, BatchLighting;
 import LTObjects: LTObject, DynamicLight;
 import EffectsDraw: EffectView;
+import PostProcess: PostProcess, AntiAliasing;
 
 File test_out; //import Main: test_out;
 
@@ -263,6 +264,7 @@ public:
 		vkDeviceWaitIdle(g_Device);
 		DestroyOverlay();
 		DestroyObjectRendering();
+		_post.Destroy();
 		if (_gpu_timer!=VK_NULL_ND_HANDLE)
 			vkDestroyQueryPool(g_Device, _gpu_timer, null);
 
@@ -390,6 +392,9 @@ public:
 		CreateOverlay();
 		CreateObjectPipelines();
 		CreateGpuTimer();
+		_post.Create(_format, FindDepthFormat());
+		_post.CreateTargets(_extents, _depth_image_view, SwapchainViews());
+		_overlay_pipeline_present=CreateOverlayPipeline(_post.present_pass);
 
 		///
 		VkSemaphoreCreateInfo semaphore_info;
@@ -422,6 +427,8 @@ public:
 	bool _modern_lighting, _compare;
 	float _specular=0.25f, _light_falloff=1f;
 	float _debug_light=0f; // console d_DebugLight, for the log
+	// post-processing (post_process.d): console d_AntiAliasing 1 = FXAA
+	AntiAliasing _anti_aliasing;
 	bool _widescreen=true; // console "d_Widescreen": Hor+ FOV correction (RenderScene)
 	float[2] _game_fov; // the scene's FOVs as the game gave them, for the log
 
@@ -539,6 +546,7 @@ public:
 		_compare=ConsoleFloat("d_Compare", 0f)!=0f;
 		_specular=ConsoleFloat("d_Specular", 0.25f);
 		_light_falloff=ConsoleFloat("d_LightFalloff", 1f);
+		_anti_aliasing=ConsoleFloat("d_AntiAliasing", 0f)>=1f ? AntiAliasing.Fxaa : AntiAliasing.Off;
 		if (!(_light_falloff>0.1f && _light_falloff<8f))
 			_light_falloff=1f;
 	}
@@ -597,6 +605,7 @@ public:
 			vkDestroyFramebuffer(g_Device, buffer.framebuffer, null);
 			vkDestroyImageView(g_Device, buffer.view, null);
 		}
+		_post.DestroyTargets();
 		vkDestroyImageView(g_Device, _depth_image_view, null);
 		DestroyAllocImage(g_Allocator, _depth_image);
 		vkDestroySwapchainKHR(g_Device, _swapchain, null);
@@ -608,6 +617,7 @@ public:
 			VkCheck(VK_ERROR_INITIALIZATION_FAILED, "swapchain image count changed on recreate");
 		CreateDepthBuffer();
 		CreateFramebuffers();
+		_post.CreateTargets(_extents, _depth_image_view, SwapchainViews());
 		UpdateFrameViewport();
 
 		test_out.writeln("Swapchain recreated: ", _extents.width, "x", _extents.height);
@@ -893,9 +903,11 @@ LAB_0004814b:
 
 				auto buffer=_command_buffers[image_index];
 
+				// with a post effect on, the scene goes to the offscreen image and the post pass draws it into the swapchain
+				const bool post=_scene_rendered && _anti_aliasing!=AntiAliasing.Off;
 				VkRenderPassBeginInfo render_pass_begin_info={
-					renderPass: _render_pass,
-					framebuffer: _buffers[image_index].framebuffer,
+					renderPass: post ? _post.scene_pass : _render_pass,
+					framebuffer: post ? _post.scene_framebuffer : _buffers[image_index].framebuffer,
 					renderArea: {
 						offset: { 0, 0 },
 						extent: _extents
@@ -998,7 +1010,20 @@ LAB_0004814b:
 
 				RecordObjectDraws(buffer, image_index, false);
 				Stamp(buffer, GpuStamp.Objects);
-				RecordOverlayDraw(buffer);
+
+				if (post)
+				{
+					vkCmdEndRenderPass(buffer);
+					VkRenderPassBeginInfo present_begin_info={
+						renderPass: _post.present_pass,
+						framebuffer: _post.present_framebuffers[image_index],
+						renderArea: { offset: { 0, 0 }, extent: _extents }
+					};
+					vkCmdBeginRenderPass(buffer, &present_begin_info, VK_SUBPASS_CONTENTS_INLINE);
+					_post.Record(buffer, _anti_aliasing, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f);
+				}
+				Stamp(buffer, GpuStamp.Post);
+				RecordOverlayDraw(buffer, post ? _overlay_pipeline_present : _overlay_pipeline);
 				Stamp(buffer, GpuStamp.Overlay);
 
 				vkCmdEndRenderPass(buffer);
@@ -1432,8 +1457,8 @@ LAB_0004814b:
 			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d lights: %d fog: %s %s %s", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
 				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count,
 				_world_lights.length, _fog_enable, _fog_range, _fog_colour);
-			test_out.writefln("  lighting: %s, compare %s, specular %.2f, falloff %.2f, debug light %.0f", _modern_lighting ? "modern" : "d3d.ren",
-				_compare, _specular, _light_falloff, _debug_light);
+			test_out.writefln("  lighting: %s, compare %s, specular %.2f, falloff %.2f, debug light %.0f; anti-aliasing %s", _modern_lighting ? "modern" : "d3d.ren",
+				_compare, _specular, _light_falloff, _debug_light, _anti_aliasing);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
 			if (_interval_count>0)
@@ -1473,8 +1498,8 @@ LAB_0004814b:
 			if (_gpu_timer!=VK_NULL_ND_HANDLE)
 			{
 				double Ms(size_t stage) { return _gpu_time[stage]/1000.0/_fps_frames; }
-				test_out.writefln("  GPU ms per frame: sky + world %.3f, objects %.3f, 2D %.3f, total %.3f",
-					Ms(0), Ms(1), Ms(2), Ms(0)+Ms(1)+Ms(2));
+				test_out.writefln("  GPU ms per frame: sky + world %.3f, objects %.3f, post %.3f, 2D %.3f, total %.3f",
+					Ms(0), Ms(1), Ms(2), Ms(3), Ms(0)+Ms(1)+Ms(2)+Ms(3));
 				_gpu_time[]=0;
 			}
 			{
@@ -1495,7 +1520,7 @@ LAB_0004814b:
 	//// GPU timing: timestamps around the frame's passes, read back after the frame's GPU wait and logged once a second
 	//// with the CPU timings (per-pass costs of the effects)
 
-	enum GpuStamp { Start, World, Objects, Overlay }
+	enum GpuStamp { Start, World, Objects, Post, Overlay }
 	VkQueryPool _gpu_timer; // VK_NULL_ND_HANDLE: the queue has no timestamps
 	double _gpu_tick_ns; // nanoseconds per timestamp tick
 	double[GpuStamp.max] _gpu_time=0.0; // microseconds per stage, summed over the log interval
@@ -1722,6 +1747,8 @@ LAB_0004814b:
 	VkDescriptorSet _overlay_descriptor;
 	VkPipelineLayout _overlay_pipeline_layout;
 	VkPipeline _overlay_pipeline;
+	VkPipeline _overlay_pipeline_present; // the same for the post pass' present pass
+	PostProcess _post;
 	VkShaderModule _overlay_vert_shader;
 	VkShaderModule _overlay_frag_shader;
 
@@ -1831,14 +1858,13 @@ LAB_0004814b:
 		};
 		VkCheck(vkCreatePipelineLayout(g_Device, &pipeline_layout_info, null, &_overlay_pipeline_layout), "vkCreatePipelineLayout (overlay)");
 
-		CreateOverlayPipeline();
-	}
-
-	void CreateOverlayPipeline()
-	{
 		_overlay_vert_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("overlay_vert.spv"));
 		_overlay_frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("overlay_frag.spv"));
+		_overlay_pipeline=CreateOverlayPipeline(_render_pass);
+	}
 
+	VkPipeline CreateOverlayPipeline(VkRenderPass render_pass)
+	{
 		VkPipelineShaderStageCreateInfo[] shader_stages=[
 			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _overlay_vert_shader, pName: "main" },
 			{ stage: VK_SHADER_STAGE_FRAGMENT_BIT, module_: _overlay_frag_shader, pName: "main" }
@@ -1905,16 +1931,27 @@ LAB_0004814b:
 			pColorBlendState: &colour_blend_info,
 			pDynamicState: &dynamic_state_info,
 			layout: _overlay_pipeline_layout,
-			renderPass: _render_pass,
+			renderPass: render_pass,
 			basePipelineIndex: -1
 		};
 
-		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &_overlay_pipeline), "vkCreateGraphicsPipelines (overlay)");
+		VkPipeline pipeline;
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &pipeline), "vkCreateGraphicsPipelines (overlay)");
+		return pipeline;
+	}
+
+	const(VkImageView)[] SwapchainViews()
+	{
+		VkImageView[] views;
+		foreach(ref buffer; _buffers)
+			views~=buffer.view;
+		return views;
 	}
 
 	void DestroyOverlay()
 	{
 		vkDestroyPipeline(g_Device, _overlay_pipeline, null);
+		vkDestroyPipeline(g_Device, _overlay_pipeline_present, null);
 		vkDestroyPipelineLayout(g_Device, _overlay_pipeline_layout, null);
 		vkDestroyShaderModule(g_Device, _overlay_vert_shader, null);
 		vkDestroyShaderModule(g_Device, _overlay_frag_shader, null);
@@ -1989,10 +2026,10 @@ LAB_0004814b:
 		vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
 	}
 
-	// recorded inside the render pass, after the 3D scene
-	void RecordOverlayDraw(VkCommandBuffer buffer)
+	// recorded inside the render pass, after the 3D scene (and its post-processing)
+	void RecordOverlayDraw(VkCommandBuffer buffer, VkPipeline pipeline)
 	{
-		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _overlay_pipeline);
+		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
 		SetViewport(buffer, _frame_viewport); // the 2D layer covers the mode's whole area
 
@@ -4291,7 +4328,8 @@ class Shader
 	// 4-byte aligned, which embedded string data isn't guaranteed to be.
 	static ubyte[] ReadShader(string file_name)
 	{
-		static immutable string[] names=[ "vert.spv", "frag.spv", "object_vert.spv", "object_frag.spv", "overlay_vert.spv", "overlay_frag.spv" ];
+		static immutable string[] names=[ "vert.spv", "frag.spv", "object_vert.spv", "object_frag.spv", "overlay_vert.spv", "overlay_frag.spv",
+			"post_frag.spv" ];
 		static foreach(name; names)
 			if (file_name==name)
 				return cast(ubyte[])(cast(const(ubyte)[])import(name)).dup;
