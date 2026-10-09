@@ -102,14 +102,15 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_Widescreen` | 1 | Hor+ FOV correction; 0 projects the game's FOV as given, like d3d.ren. |
 | `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
+| `d_GPU` | 0 | Which Vulkan adapter to use, by its index in the device list at the top of `vk_test.txt`. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |
 | `DrawSky`, `DrawSprites`, `DrawParticles`, `DrawPolyGrids`, `DrawLineSystems`, `LightAddPoly` | 1 | Turn object types off. |
 
 The renderer also reads the game's own `FogEnable`, `FogNearZ`/`FogFarZ`, `FogR/G/B`, `SkyFogNearZ`/`SkyFogFarZ` and
 `Saturate`, the same way d3d.ren does.
 
-Logs: `vk_test.txt` (Vulkan setup; once a second: fps, object statistics, a per-stage frame time breakdown, frame
-pacing, how often the camera moved, and the game speed) and `test.txt` (engine calls, a
+Logs: `vk_test.txt` (Vulkan setup; once a second: fps, object statistics, a per-stage frame time breakdown on the CPU
+and per pass on the GPU, frame pacing, how often the camera moved, and the game speed) and `test.txt` (engine calls, a
 once-a-second heartbeat, and any exception thrown inside the renderer). Both are in the game folder.
 
 ## Building

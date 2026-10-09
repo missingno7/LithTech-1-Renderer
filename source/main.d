@@ -287,6 +287,7 @@ void RegisterRendererOptions()
 		["d_Widescreen", "1"], // Hor+ FOV correction
 		["d_FogMode", "0"],    // 0: fog like d3d.ren (device depth); 1: by eye distance
 		["d_DebugClear", "0"], // 1: holes in the world shown in blue
+		["d_GPU", "0"],        // which Vulkan adapter, by its index in vk_test.txt's device list
 	];
 
 	if (_renderer is null || _renderer.GetConsoleVar is null || _renderer.RunConsoleString is null)

@@ -267,6 +267,8 @@ public:
 		vkDeviceWaitIdle(g_Device);
 		DestroyOverlay();
 		DestroyObjectRendering();
+		if (_gpu_timer!=VK_NULL_ND_HANDLE)
+			vkDestroyQueryPool(g_Device, _gpu_timer, null);
 
 		DestroyAllocBuffer(g_Allocator, _vertex_buffer);
 
@@ -391,6 +393,7 @@ public:
 
 		CreateOverlay();
 		CreateObjectPipelines();
+		CreateGpuTimer();
 
 		///
 		VkSemaphoreCreateInfo semaphore_info;
@@ -891,6 +894,11 @@ LAB_0004814b:
 				VkCommandBufferBeginInfo command_buffer_begin_info;
 
 				vkBeginCommandBuffer(buffer, &command_buffer_begin_info);
+				if (_gpu_timer!=VK_NULL_ND_HANDLE)
+				{
+					vkCmdResetQueryPool(buffer, _gpu_timer, 0, GpuStamp.max+1);
+					vkCmdWriteTimestamp(buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _gpu_timer, GpuStamp.Start);
+				}
 				RecordOverlayCopy(buffer);
 				RecordAnimatedSurfaceUpdates(buffer);
 				vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
@@ -973,9 +981,12 @@ LAB_0004814b:
 					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
 					DrawPolygons(false);
 				}
+				Stamp(buffer, GpuStamp.World);
 
 				RecordObjectDraws(buffer, image_index, false);
+				Stamp(buffer, GpuStamp.Objects);
 				RecordOverlayDraw(buffer);
+				Stamp(buffer, GpuStamp.Overlay);
 
 				vkCmdEndRenderPass(buffer);
 				vkEndCommandBuffer(buffer);
@@ -1030,6 +1041,7 @@ LAB_0004814b:
 
 		vkQueueWaitIdle(_graphics_queue);
 		Mark(Timing.GpuWait);
+		ReadGpuTimer();
 
 		if (res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR || res==VK_ERROR_SURFACE_LOST_KHR)
 			RecreateSwapchain();
@@ -1443,6 +1455,13 @@ LAB_0004814b:
 					Ms(Timing.ObjectUpload), Ms(Timing.Record), Ms(Timing.Submit), Ms(Timing.Present), Ms(Timing.GpuWait));
 				_timing[]=0;
 			}
+			if (_gpu_timer!=VK_NULL_ND_HANDLE)
+			{
+				double Ms(size_t stage) { return _gpu_time[stage]/1000.0/_fps_frames; }
+				test_out.writefln("  GPU ms per frame: sky + world %.3f, objects %.3f, 2D %.3f, total %.3f",
+					Ms(0), Ms(1), Ms(2), Ms(0)+Ms(1)+Ms(2));
+				_gpu_time[]=0;
+			}
 			{
 				import ModelDraw: g_ShadowStats;
 				test_out.writefln("  model shadows per frame: flagged %d, floor found %d, floor-like %d",
@@ -1456,6 +1475,56 @@ LAB_0004814b:
 			_fps_frames=0;
 			_fps_start=now;
 		}
+	}
+
+	//// GPU timing: timestamps around the frame's passes, read back after the frame's GPU wait and logged once a second
+	//// with the CPU timings (per-pass costs of the effects)
+
+	enum GpuStamp { Start, World, Objects, Overlay }
+	VkQueryPool _gpu_timer; // VK_NULL_ND_HANDLE: the queue has no timestamps
+	double _gpu_tick_ns; // nanoseconds per timestamp tick
+	double[GpuStamp.max] _gpu_time=0.0; // microseconds per stage, summed over the log interval
+
+	void CreateGpuTimer()
+	{
+		uint family_count;
+		vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &family_count, null);
+		VkQueueFamilyProperties[] families=new VkQueueFamilyProperties[family_count];
+		vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &family_count, families.ptr);
+		const uint family=GetQueueFamily().graphics_family;
+		if (family>=family_count || families[family].timestampValidBits==0 || g_PhysicalDeviceProps.limits.timestampPeriod<=0f)
+		{
+			test_out.writeln("GPU timing: no timestamps on this queue");
+			return;
+		}
+
+		VkQueryPoolCreateInfo info={
+			queryType: VK_QUERY_TYPE_TIMESTAMP,
+			queryCount: GpuStamp.max+1
+		};
+		if (vkCreateQueryPool(g_Device, &info, null, &_gpu_timer)!=VK_SUCCESS)
+			_gpu_timer=VK_NULL_ND_HANDLE;
+		_gpu_tick_ns=g_PhysicalDeviceProps.limits.timestampPeriod;
+	}
+
+	void Stamp(VkCommandBuffer buffer, GpuStamp stamp)
+	{
+		if (_gpu_timer!=VK_NULL_ND_HANDLE)
+			vkCmdWriteTimestamp(buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _gpu_timer, stamp);
+	}
+
+	// after the frame's vkQueueWaitIdle, so the results are there
+	void ReadGpuTimer()
+	{
+		if (_gpu_timer==VK_NULL_ND_HANDLE)
+			return;
+		ulong[GpuStamp.max+1] stamps;
+		if (vkGetQueryPoolResults(g_Device, _gpu_timer, 0, GpuStamp.max+1, stamps.sizeof, stamps.ptr, ulong.sizeof,
+			VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS)
+			return;
+		foreach(size_t stage; 0..GpuStamp.max)
+			if (stamps[stage+1]>=stamps[stage])
+				_gpu_time[stage]+=(stamps[stage+1]-stamps[stage])*_gpu_tick_ns/1000.0;
 	}
 
 	//// 2D layer
@@ -2552,9 +2621,23 @@ private:
 			//test_out.writeln(features);
 		}
 
-		g_PhysicalDevice=devices[0];
+		// console d_GPU: the adapter's index in the list above (0, the driver's first, by default)
+		size_t index=0;
+		{
+			import Main: _renderer;
+			void* variable=_renderer ? _renderer.GetConsoleVar("d_GPU") : null;
+			const float wanted=variable ? _renderer.GetVarValueFloat(variable) : 0f;
+			if (wanted>=1f && wanted<device_count)
+				index=cast(size_t)wanted;
+		}
+		g_PhysicalDevice=devices[index];
 
+		vkGetPhysicalDeviceProperties(g_PhysicalDevice, &g_PhysicalDeviceProps); // limits, for the allocator and timestamps
 		vkGetPhysicalDeviceMemoryProperties(g_PhysicalDevice, &g_PhysicalMemoryProps);
+		{
+			import std.string: fromStringz;
+			test_out.writeln("Using device ", index, ": ", g_PhysicalDeviceProps.deviceName.ptr.fromStringz);
+		}
 	}
 
 	struct QueueFamily
