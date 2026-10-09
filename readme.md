@@ -151,7 +151,8 @@ For testing renderer changes without driving the game window by hand:
   and writes `captures\<name>_<label>.png`, the depth (`<name>_depth.f32`) and `<name>.json`: camera and matrices,
   settings, lights, per-variant GPU time, and what drew each pixel. Variant keys: `view` (`final`, `light`, `dynamic`,
   `normal`, `id`, `specular`, `lights`), `lighting`, `specular`, `falloff`, `aa`, `compare`, `hud`. For example
-  `capture spot classic:lighting=0 modern:lighting=1 id:view=id`.
+  `capture spot classic:lighting=0 modern:lighting=1 id:view=id`. In the game console, `d_Capture <name>` takes the
+  default set: the frame as shown, d3d.ren's lighting, the modern lighting, and every data view.
 - `tools/analyze_capture.py <captures folder> <name>` reads a capture: what's at the crosshair or a pixel (`--at X Y`)
   and which lights reach it, coverage and light terms per surface (`--surfaces`), and per-surface changes between two
   variants (`--diff A B`).

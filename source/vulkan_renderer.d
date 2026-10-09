@@ -1743,6 +1743,15 @@ LAB_0004814b:
 		{
 			_next_command_poll=now+dur!"msecs"(250);
 			_command_queue~=PollCommandFile("d_ren_cmd.txt");
+
+			// the same from the game's console: "d_Capture <name>" takes the default capture
+			import Main: _renderer;
+			const string capture=ConsoleString("d_Capture");
+			if (capture.length && capture!="0" && _renderer)
+			{
+				_command_queue~="capture "~capture;
+				_renderer.RunConsoleString("d_Capture 0");
+			}
 		}
 
 		while (_command_queue.length && now>=_command_resume && _capture_request is null)

@@ -11,8 +11,9 @@ module DebugCapture;
  + which renders the next 3D frame again once per variant into an offscreen image and writes, to `captures\` in the
  + game folder, `<name>_<label>.png` per variant, `<name>_depth.f32` (the scene's depth, float per pixel) and
  + `<name>.json`: camera, projection, settings, the light list, per-variant GPU times, and for the ids seen in "id"
- + views what drew them. The presented frame is untouched. Without variants the default set is the final image plus
- + the light, dynamic, normal and id views with the current settings.
+ + views what drew them. The presented frame is untouched. Without variants (and from the game console with
+ + `d_Capture <name>`) the default set is: the frame as shown, d3d.ren's lighting, the modern lighting, and the light,
+ + dynamic, normal, specular, lights and id views.
  +
  + Variant keys: view (final, light, dynamic, normal, id, specular, lights), lighting, specular, falloff, aa,
  + compare, hud (final views only). tools/analyze_capture.py decodes the views.
@@ -56,7 +57,11 @@ CaptureRequest* ParseCapture(string line)
 
 	if (words.length==2)
 	{
-		foreach(view; [DebugView.Final, DebugView.Light, DebugView.Dynamic, DebugView.Normal, DebugView.Id])
+		// the frame as shown (with the 2D layer), d3d.ren's lighting against the modern one, and the data views
+		request.variants~=CaptureVariant("shown", DebugView.Final, null, true);
+		request.variants~=CaptureVariant("classic", DebugView.Final, [["lighting", "0"], ["aa", "0"]], false);
+		request.variants~=CaptureVariant("modern", DebugView.Final, [["lighting", "1"]], false);
+		foreach(view; [DebugView.Light, DebugView.Dynamic, DebugView.Normal, DebugView.Specular, DebugView.Lights, DebugView.Id])
 			request.variants~=CaptureVariant(ViewName(view), view, null, false);
 		return request;
 	}
