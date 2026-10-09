@@ -103,44 +103,48 @@ def main():
 
     polygons = read_dump(args.dump)
     _, objects = read_objects(args.world)
-    lights = [l for l in lights_from(objects) if l["kind"] == "Light"]
-    print("%d lightmapped polygons, %d point lights" % (len(polygons), len(lights)))
-
+    lights = lights_from(objects)
+    print("%d lightmapped polygons, %d point lights, %d spot lights" % (len(polygons),
+        sum(l["kind"] == "Light" for l in lights), sum(l["kind"] == "DirLight" for l in lights)))
     positions = np.array([l["pos"] for l in lights])
     radii = np.array([l["radius"] for l in lights])
 
-    rows = []  # (d/r, n.l, brightness / light colour, light index)
-    total = 0
+    samples = []
     for poly in polygons:
         s = texel_samples(poly)
-        if s is None:
-            continue
-        points, colours = s
-        total += len(points)
-        if len(points) == 0:
-            continue
-        to = positions[None, :, :] - points[:, None, :]
-        d = np.linalg.norm(to, axis=-1)
-        reach = d < radii[None, :]
-        single = reach.sum(axis=1) == 1
-        for k in np.nonzero(single)[0]:
+        if s is not None and len(s[0]):
+            d = np.linalg.norm(positions[None] - s[0][:, None], axis=-1)
+            samples.append((poly, s[0], s[1], d, d < radii[None]))
+    print("%d texels inside their polygons" % sum(len(x[1]) for x in samples))
+
+    # the ambient: texels no light (point or spot) reaches have one value per level
+    unlit = np.concatenate([colours[reach.sum(axis=1) == 0] for _, _, colours, _, reach in samples])
+    ambient = np.median(unlit, axis=0) if len(unlit) else np.zeros(3)
+    print("ambient (%d texels no light reaches): %s / 255" % (len(unlit), np.round(ambient * 255).astype(int)))
+
+    # texels reached by exactly one point light: (texel - ambient) / (colour * BrightScale) in the light's strongest
+    # channel, unsaturated texels only
+    rows = []  # d/r, N.L, relative brightness
+    for poly, points, colours, d, reach in samples:
+        for k in np.nonzero(reach.sum(axis=1) == 1)[0]:
             li = int(np.nonzero(reach[k])[0][0])
             light = lights[li]
-            ndl = float(to[k, li] @ poly["normal"]) / max(d[k, li], 1e-6)
+            if light["kind"] != "Light":
+                continue
             colour = light["inner"] * light["scale"]
             c = int(np.argmax(colour))
-            if colour[c] < 0.05:
+            if colour[c] < 0.1 or colours[k][c] >= 0.95:
                 continue
-            rows.append((d[k, li] / radii[li], ndl, colours[k][c] / colour[c], li))
-    print("%d texels inside polygons, %d lit by exactly one light" % (total, len(rows)))
+            ndl = float((light["pos"] - points[k]) @ poly["normal"]) / max(d[k, li], 1e-6)
+            rows.append((d[k, li] / radii[li], ndl, (colours[k][c] - ambient[c]) / colour[c]))
+    print("%d texels lit by exactly one point light" % len(rows))
     if not rows:
         return
     a = np.array(rows)
 
-    # brightness relative to the light's (scaled) colour, binned by distance / radius and N.L
     d_bins = np.linspace(0, 1, 11)
     n_bins = [-1.0, 0.0, 0.25, 0.5, 0.75, 1.01]
-    print("\nmedian texel / light colour (count) by distance / radius (rows) and N.L (columns)")
+    print("\nmedian (texel - ambient) / light colour (count), by distance / radius (rows) and N.L (columns)")
     print("  d/r    " + "  ".join("%-14s" % ("%.2f..%.2f" % (n_bins[j], n_bins[j + 1])) for j in range(len(n_bins) - 1)))
     for i in range(len(d_bins) - 1):
         line = "  %.1f-%.1f" % (d_bins[i], d_bins[i + 1])
@@ -149,20 +153,14 @@ def main():
             line += "  %6.3f (%5d)" % (np.median(a[m, 2]), m.sum()) if m.sum() >= 5 else "  %-14s" % "-"
         print(line)
 
-    # candidate falloffs over the facing texels, fitted with one scale each; lower residual = better
-    facing = a[a[:, 1] > 0.2]
-    x, nl, y = facing[:, 0], facing[:, 1], facing[:, 2]
-    unshadowed = y > 0.02  # drop texels the bake shadowed
-    x, nl, y = x[unshadowed], nl[unshadowed], y[unshadowed]
-    print("\ncandidate formulas on %d facing, unshadowed texels (least-squares scale, mean abs residual):" % len(y))
-    candidates = {
-        "1 - d/r": 1 - x, "(1 - d/r) * N.L": (1 - x) * nl,
-        "1 - (d/r)^2": 1 - x * x, "(1 - (d/r)^2) * N.L": (1 - x * x) * nl,
-        "(1 - d/r)^2": (1 - x) ** 2, "(1 - d/r)^2 * N.L": (1 - x) ** 2 * nl,
-    }
-    for name, f in candidates.items():
-        k = float(f @ y / max(f @ f, 1e-9))
-        print("  %-24s scale %.3f  residual %.4f" % (name, k, np.mean(np.abs(k * f - y))))
+    # candidate falloffs on the facing texels the bake didn't shadow, one scale each (median ratio)
+    facing = a[a[:, 1] > 0.0]
+    x, y = facing[:, 0], facing[:, 2]
+    lit = y > 0.05
+    print("\ncandidate falloffs on %d facing texels (%.0f%% read as shadowed and are left out):" % (len(y), 100 * np.mean(~lit)))
+    for name, f in {"1 - d/r": 1 - x, "1 - (d/r)^2": 1 - x * x, "(1 - d/r)^2": (1 - x) ** 2, "(1 - d/r)^1.5": (1 - x) ** 1.5}.items():
+        k = float(np.median(y[lit] / np.maximum(f[lit], 1e-3)))
+        print("  %-14s scale %.3f  mean abs error %.4f" % (name, k, np.mean(np.abs(k * f[lit] - y[lit]))))
 
 
 if __name__ == "__main__":

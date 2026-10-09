@@ -43,8 +43,15 @@ and skips them (LoadObjects, blood2_recon S_Object.cpp), but the objects and the
 OuterColor, BrightScale, ClipLight = shadowed in the bake, LightObjects = lights models), 171 `DirLight` objects
 (spotlights: Rotation as Euler angles, FOV, radius), 1 `ObjectLight`, and 7 `Water` volumes (surface height, texture,
 alpha, underwater fog). With them, models can be lit from the real lamps' directions, static lights can give specular
-and model shadows, and polygrids inside a `Water` volume can be told apart from other polygrids. Still to establish: the
-bake formula (fit against captures of lightmapped surfaces), and how d_ren finds the loaded world's file at run time.
+and model shadows, and polygrids inside a `Water` volume can be told apart from other polygrids. d_ren finds the loaded world's file
+through the in-process server (verified: `Worlds_steamtunnels.dat`).
+
+The bake, fitted with `tools/lighting_fit.py` against the whole steam tunnels lightmap set (`d_DumpLighting`, 381,665
+texels, 58,202 within reach of exactly one lamp): **lightmap = ambient + Σ lamps colour × BrightScale × (1 − d/r)** on
+surfaces facing the lamp, no N·L term, with geometry occlusion. Scale 0.97, mean error 0.03 (the RGB565 step); the
+quadratic and steeper falloffs fit 2–3× worse. The ambient is a constant per level (steam tunnels: RGB 8, 20, 16), the
+value of every texel no lamp reaches. About 28% of in-range facing texels read as shadowed. Spot lights (`DirLight`) are
+not fitted yet.
 
 ## Plan
 
