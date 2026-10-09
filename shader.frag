@@ -62,7 +62,9 @@ void main()
 	vec3 vertex_light=modern ? modern_diffuse : dynamic_light_in;
 
 	// where models hide the level's lamps, the baked light loses those lamps' terms (static_lighting.d)
-	vec3 shadow_loss=ShadowsOn() ? WorldShadowLoss(world_position_in, normalize(normal_in)) : vec3(0.0);
+	bool lightmapped=lightmapped_in>0.5 && lightmapped_in<1.5;
+	vec3 baked=lightmapped ? texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_uv_in).rgb : colour_in;
+	vec3 shadow_loss=ShadowsOn() ? WorldShadowLoss(world_position_in, normalize(normal_in), baked, -1) : vec3(0.0);
 	vec3 prelit=Unshadowed(colour_in, shadow_loss);
 
 	vec3 colour;
@@ -78,7 +80,7 @@ void main()
 		}
 		else
 		{
-			vec3 lightmap=Unshadowed(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_uv_in).rgb, shadow_loss);
+			vec3 lightmap=Unshadowed(baked, shadow_loss);
 			vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, true);
 			light=clamp(lightmap+texel_light, 0.0, 1.0)*pc.light_scale_mode.xyz;
 			debug_dynamic=texel_light;

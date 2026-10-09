@@ -24,9 +24,9 @@ import LTObjects: Normalised, Dot, TraceSegment;
 import WorldBsp: WorldBsp, Node;
 
 enum uint LampsPerModel=4;
-enum uint MaxShadowPairs=16;
+enum uint MaxShadowPairs=64;
 enum uint MaxModelSets=128;
-enum uint ShadowAtlasTiles=4; // per side: 16 tiles
+enum uint ShadowAtlasTiles=8; // per side: 64 tiles
 
 // lighting.glsl StaticLamp (std430)
 struct GpuLamp
@@ -41,7 +41,7 @@ struct GpuShadowPair
 {
 	float[16] view_proj; // world -> the tile's clip space, column-major
 	GpuLamp lamp;
-	float[4] tile; // xy: the tile's corner in the atlas (0..1), z: its size; w: the caster's model set
+	float[4] tile; // xy: the tile's corner in the atlas (0..1), z: its size; w: the caster (its ModelRecord index)
 }
 
 // lighting.glsl ModelLamps
@@ -139,6 +139,7 @@ struct ModelRecord
 	float radius;
 	float[3] directional; // the light grid's directional light (0..1) the modern lighting uses
 	bool solid; // casts shadows
+	bool world_model; // a door, crate, masked wall...: casts shadows, isn't lit by the lamps (it's lightmapped)
 }
 
 // a shadow map to draw this frame
@@ -175,21 +176,65 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 	PairCandidate[] pair_candidates;
 	Candidate[] candidates;
 
+	static float Luminance(const float[3] c) { return c[0]*0.299f+c[1]*0.587f+c[2]*0.114f; }
+
 	foreach(m, ref model; models)
 	{
-		if (gpu.counts[1]>=MaxModelSets)
-			break;
-
+		// ranked by the lamp's light at the near side of the model's bounding sphere (doors and walls are big)
 		candidates.length=0;
 		foreach(l, ref lamp; lamps)
 		{
-			const float[3] c=lamp.At(model.centre);
-			const float strength=c[0]*0.299f+c[1]*0.587f+c[2]*0.114f;
+			float[3] to_lamp=[lamp.pos[0]-model.centre[0], lamp.pos[1]-model.centre[1], lamp.pos[2]-model.centre[2]];
+			const float distance=sqrt(Dot(to_lamp, to_lamp));
+			if (distance>=lamp.radius+model.radius)
+				continue;
+			if (model.world_model)
+			{
+				// a world model's shadow shows only where the lamp still reaches past it: ranked by the lamp's light
+				// at the far side of its bounding sphere (a lamp under a grate lights the grate but nothing beyond it)
+				const float[3] far_point=distance>0.001f ? [model.centre[0]-to_lamp[0]/distance*model.radius,
+					model.centre[1]-to_lamp[1]/distance*model.radius, model.centre[2]-to_lamp[2]/distance*model.radius] : model.centre;
+				const float behind=Luminance(lamp.At(far_point));
+				if (behind>0.004f)
+					candidates~=Candidate(cast(uint)l, behind, lamp.At(model.centre));
+				continue;
+			}
+			const float step=model.world_model ? min(model.radius, distance*0.9f) : 0f;
+			const float[3] near_point=distance>0.001f ? [model.centre[0]+to_lamp[0]/distance*step,
+				model.centre[1]+to_lamp[1]/distance*step, model.centre[2]+to_lamp[2]/distance*step] : model.centre;
+			const float[3] c=lamp.At(near_point);
+			const float strength=Luminance(c);
 			if (strength>0.004f)
-				candidates~=Candidate(cast(uint)l, strength, c);
+				candidates~=Candidate(cast(uint)l, strength, lamp.At(model.centre));
 		}
 		candidates.sort!((a, b) => a.strength>b.strength);
 
+		const float[3] to_camera=[model.centre[0]-settings.camera[0], model.centre[1]-settings.camera[1],
+			model.centre[2]-settings.camera[2]];
+		const float camera_distance=sqrt(Dot(to_camera, to_camera))-model.radius;
+		const float near=1f/(1f+(camera_distance>0f ? camera_distance : 0f)/400f);
+		// tiny models (attachments, the player's own invisible bits at the eye) aren't worth a shadow
+		const bool casts=model.solid && settings.max_pairs && model.radius>=8f;
+
+		// world models: shadow casters only, from their two strongest visible lamps
+		if (model.world_model)
+		{
+			uint pairs=0;
+			foreach(ref candidate; candidates[0..min($, 6)])
+			{
+				if (pairs>=2 || !casts)
+					break;
+				const Lamp* lamp=&lamps[candidate.lamp];
+				if (!lamp.clip || (settings.bsp && settings.bsp.root_node && WorldModelLampHidden(settings.bsp, model, lamp.pos)))
+					continue;
+				pair_candidates~=PairCandidate(cast(uint)m, candidate.lamp, candidate.strength*near);
+				pairs++;
+			}
+			continue;
+		}
+
+		if (gpu.counts[1]>=MaxModelSets)
+			continue;
 		// the strongest ones the model can see (traced from the model: a lamp fixture may sit inside a wall)
 		const uint set=gpu.counts[1]++;
 		model_sets[m]=cast(int)set;
@@ -205,17 +250,10 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 				continue;
 			gpu_set.lamps[count++]=lamp.Gpu();
 			covered[]+=candidate.contribution[];
-			// tiny models (attachments, the player's own invisible bits at the eye) aren't worth a shadow
-			if (model.solid && lamp.clip && settings.max_pairs && model.radius>=8f)
-			{
-				const float[3] to_camera=[model.centre[0]-settings.camera[0], model.centre[1]-settings.camera[1],
-					model.centre[2]-settings.camera[2]];
-				const float near=1f/(1f+sqrt(Dot(to_camera, to_camera))/400f);
+			if (casts && lamp.clip)
 				pair_candidates~=PairCandidate(cast(uint)m, candidate.lamp, candidate.strength*near);
-			}
 		}
 		// no more light than the grid had at the centre (the grid was baked from the same lamps)
-		static float Luminance(const float[3] c) { return c[0]*0.299f+c[1]*0.587f+c[2]*0.114f; }
 		const float grid=Luminance(model.directional), lamp_sum=Luminance(covered);
 		const float scale=lamp_sum>grid ? grid/(lamp_sum>1e-4f ? lamp_sum : 1e-4f) : 1f;
 		foreach(i; 0..count)
@@ -244,7 +282,7 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 		pair.view_proj=view_proj;
 		pair.lamp=lamp.Gpu();
 		pair.tile=[(k%ShadowAtlasTiles)/cast(float)ShadowAtlasTiles, (k/ShadowAtlasTiles)/cast(float)ShadowAtlasTiles,
-			1f/ShadowAtlasTiles, cast(float)model_sets[candidate.model]];
+			1f/ShadowAtlasTiles, cast(float)candidate.model];
 		draws~=ShadowPairDraw(candidate.model, view_proj, k);
 	}
 	gpu.counts[0]=cast(uint)draws.length;
@@ -260,6 +298,33 @@ bool LampHidden(WorldBsp* bsp, const float[3] p, const float[3] lamp)
 		return false;
 	const float[3] gap=[hit[0]-lamp[0], hit[1]-lamp[1], hit[2]-lamp[2]];
 	return Dot(gap, gap)>24f*24f;
+}
+
+// a world model is big and often flush with the world (a grate in a ceiling hole, a door in its frame): hidden only
+// when the lamp is hidden from its centre and from four points across its face, each nudged towards the lamp
+bool WorldModelLampHidden(WorldBsp* bsp, ref const ModelRecord model, const float[3] lamp)
+{
+	import std.math: sqrt, abs;
+
+	float[3] to_lamp=[lamp[0]-model.centre[0], lamp[1]-model.centre[1], lamp[2]-model.centre[2]];
+	const float distance=sqrt(Dot(to_lamp, to_lamp));
+	if (distance<0.001f)
+		return false;
+	to_lamp[]/=distance;
+	const float[3] up_hint=abs(to_lamp[1])>0.95f ? [1f, 0f, 0f] : [0f, 1f, 0f];
+	const float[3] right=Normalised(Cross(up_hint, to_lamp));
+	const float[3] up=Cross(to_lamp, right);
+	const float spread=model.radius*0.5f, nudge=2f;
+	static immutable float[2][5] offsets=[[0f, 0f], [1f, 0f], [-1f, 0f], [0f, 1f], [0f, -1f]];
+	foreach(ref o; offsets)
+	{
+		float[3] p;
+		foreach(c; 0..3)
+			p[c]=model.centre[c]+to_lamp[c]*nudge+(right[c]*o[0]+up[c]*o[1])*spread;
+		if (!LampHidden(bsp, p, lamp))
+			return false;
+	}
+	return true;
 }
 
 // A perspective view from the lamp fitted around the model's bounding sphere, out to the lamp's radius (receivers

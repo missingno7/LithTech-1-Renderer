@@ -528,7 +528,7 @@ public:
 	enum uint PushConstantFloats=28;
 
 	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World,
-		const BatchLighting lighting=BatchLighting.init, float draw_id=0f, float model_set=-1f)
+		const BatchLighting lighting=BatchLighting.init, float draw_id=0f, float model_set=-1f, float caster=-1f)
 	{
 		const float[2] range=fog==FogKind.Sky ? _sky_fog_range : _fog_range;
 		const bool fog_on=_fog_enable && fog!=FogKind.None && range[0]!=range[1];
@@ -539,7 +539,7 @@ public:
 			_cloud_pan[0], _cloud_pan[1], _cloud_pan[2], _cloud_pan[3],
 			lighting.ambient[0], lighting.ambient[1], lighting.ambient[2], cast(float)lighting.kind,
 			lighting.directional[0], lighting.directional[1], lighting.directional[2], draw_id,
-			model_set, 0f, 0f, 0f
+			model_set, caster, 0f, 0f
 		];
 		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
 			constants.sizeof, constants.ptr);
@@ -572,7 +572,7 @@ public:
 		_anti_aliasing=ConsoleFloat("d_AntiAliasing", 0f)>=1f ? AntiAliasing.Fxaa : AntiAliasing.Off;
 		_shadows=ConsoleFloat("d_Shadows", 0f)!=0f;
 		{
-			const float pairs=ConsoleFloat("d_ShadowPairs", 8f);
+			const float pairs=ConsoleFloat("d_ShadowPairs", 16f);
 			_shadow_pair_limit=pairs<1f ? 1 : pairs>MaxShadowPairs ? MaxShadowPairs : cast(uint)pairs;
 		}
 		if (!(_light_falloff>0.1f && _light_falloff<8f))
@@ -1279,7 +1279,7 @@ LAB_0004814b:
 			RecordOverlayCopy(buffer);
 			RecordAnimatedSurfaceUpdates(buffer);
 		}
-		RecordShadowAtlas(buffer);
+		RecordShadowAtlas(buffer, image_index);
 		vkCmdBeginRenderPass(buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
 		// dynamic state of the world pipeline
@@ -2164,6 +2164,9 @@ LAB_0004814b:
 				target.overlay, post, stages[0]/1000, stages[1]/1000, stages[2]/1000, stages[3]/1000);
 		}
 
+		// the shadow pairs in the JSON are the game's own (a "shadows=0" variant leaves none)
+		_shadows=saved_shadows;
+		UpdateStaticLighting(image_index);
 		try write(format("captures\\%s.json", request.name), CaptureJson(request.name, width, height, bgra,
 			depth_written ? format("%s_depth.f32", request.name) : null, variants_json, ids_wanted ? _capture_ids.Ids() : null));
 		catch (Exception e) test_out.writeln("capture json: ", e.msg);
@@ -2367,10 +2370,10 @@ LAB_0004814b:
 	ShadowPairDraw[] _shadow_draws;
 	int[] _model_sets; // per model of the frame: its lamp set, or -1
 	bool _shadows; // console d_Shadows
-	uint _shadow_pair_limit=8; // console d_ShadowPairs
+	uint _shadow_pair_limit=16; // console d_ShadowPairs
 	ulong _shadow_pair_sum, _model_set_sum, _shadow_draw_calls; // for the log
 
-	enum uint ShadowAtlasSize=2048;
+	enum uint ShadowAtlasSize=4096; // 8 x 8 tiles of 512
 	VkBuffer[] _static_buffers;
 	VkMappedMemoryRange[] _static_memory;
 	VkImage _shadow_atlas;
@@ -2379,9 +2382,8 @@ LAB_0004814b:
 	VkSampler _shadow_sampler;
 	VkRenderPass _shadow_pass;
 	VkFramebuffer _shadow_framebuffer;
-	VkPipelineLayout _shadow_layout;
 	VkPipeline _shadow_pipeline;
-	VkShaderModule _shadow_vert;
+	VkShaderModule _shadow_vert, _shadow_frag;
 
 	void CreateStaticLighting()
 	{
@@ -2463,20 +2465,22 @@ LAB_0004814b:
 		};
 		VkCheck(vkCreateFramebuffer(g_Device, &framebuffer_info, null, &_shadow_framebuffer), "vkCreateFramebuffer (shadows)");
 
-		// the model's posed triangles (the object vertex buffer, positions only) through the pair's matrix
-		VkPushConstantRange push_range={ stageFlags: VK_SHADER_STAGE_VERTEX_BIT, offset: 0, size: float.sizeof*16 };
-		VkPipelineLayoutCreateInfo layout_info={ pushConstantRangeCount: 1, pPushConstantRanges: &push_range };
-		VkCheck(vkCreatePipelineLayout(g_Device, &layout_info, null, &_shadow_layout), "vkCreatePipelineLayout (shadows)");
-
+		// the caster's triangles (the object vertex buffer) through the pair's matrix, with the scenes' pipeline layout
+		// (set 0's sampler, set 1's texture, the matrix and mode in the push constants): masked world models leave out
+		// their see-through texels (shadow.frag)
 		_shadow_vert=Shader.CreateShaderModule(g_Device, Shader.ReadShader("shadow_vert.spv"));
-		VkPipelineShaderStageCreateInfo stage={ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _shadow_vert, pName: "main" };
+		_shadow_frag=Shader.CreateShaderModule(g_Device, Shader.ReadShader("shadow_frag.spv"));
+		VkPipelineShaderStageCreateInfo[2] stages=[
+			{ stage: VK_SHADER_STAGE_VERTEX_BIT, module_: _shadow_vert, pName: "main" },
+			{ stage: VK_SHADER_STAGE_FRAGMENT_BIT, module_: _shadow_frag, pName: "main" }
+		];
 		auto binding=ObjectVertex.GetBindingDescription();
-		VkVertexInputAttributeDescription position=ObjectVertex.GetAttributeDescriptions()[0];
+		VkVertexInputAttributeDescription[3] attributes=ObjectVertex.GetAttributeDescriptions()[0..3];
 		VkPipelineVertexInputStateCreateInfo vertex_input={
 			vertexBindingDescriptionCount: 1,
 			pVertexBindingDescriptions: &binding,
-			vertexAttributeDescriptionCount: 1,
-			pVertexAttributeDescriptions: &position
+			vertexAttributeDescriptionCount: attributes.length,
+			pVertexAttributeDescriptions: attributes.ptr
 		};
 		VkPipelineInputAssemblyStateCreateInfo assembly={ topology: VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
 		VkPipelineViewportStateCreateInfo viewport_state={ viewportCount: 1, scissorCount: 1 };
@@ -2498,8 +2502,8 @@ LAB_0004814b:
 		VkDynamicState[2] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR ];
 		VkPipelineDynamicStateCreateInfo dynamic={ dynamicStateCount: dynamic_states.length, pDynamicStates: dynamic_states.ptr };
 		VkGraphicsPipelineCreateInfo pipeline_info={
-			stageCount: 1,
-			pStages: &stage,
+			stageCount: stages.length,
+			pStages: stages.ptr,
 			pVertexInputState: &vertex_input,
 			pInputAssemblyState: &assembly,
 			pViewportState: &viewport_state,
@@ -2508,7 +2512,7 @@ LAB_0004814b:
 			pDepthStencilState: &depth,
 			pColorBlendState: &blend,
 			pDynamicState: &dynamic,
-			layout: _shadow_layout,
+			layout: _pipeline_layout,
 			renderPass: _shadow_pass,
 			basePipelineIndex: -1
 		};
@@ -2519,8 +2523,8 @@ LAB_0004814b:
 	void DestroyStaticLighting()
 	{
 		vkDestroyPipeline(g_Device, _shadow_pipeline, null);
-		vkDestroyPipelineLayout(g_Device, _shadow_layout, null);
 		vkDestroyShaderModule(g_Device, _shadow_vert, null);
+		vkDestroyShaderModule(g_Device, _shadow_frag, null);
 		vkDestroyFramebuffer(g_Device, _shadow_framebuffer, null);
 		vkDestroyRenderPass(g_Device, _shadow_pass, null);
 		vkDestroySampler(g_Device, _shadow_sampler, null);
@@ -2566,7 +2570,7 @@ LAB_0004814b:
 
 	// outside any render pass, before the scene: the shadow pairs' models into their atlas tiles (always run: it also
 	// keeps the atlas in the layout the scene's descriptors expect)
-	void RecordShadowAtlas(VkCommandBuffer buffer)
+	void RecordShadowAtlas(VkCommandBuffer buffer, uint image_index)
 	{
 		import SceneGeometry: DrawGroup, TextureMode, ObjectPipe;
 
@@ -2582,22 +2586,40 @@ LAB_0004814b:
 		if (_shadow_draws.length && _object_vertex_buffer!=VK_NULL_ND_HANDLE && _objects.vertices.length)
 		{
 			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _shadow_pipeline);
+			vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 			VkDeviceSize offset=0;
 			vkCmdBindVertexBuffers(buffer, 0, 1, &_object_vertex_buffer, &offset);
+			VkDescriptorSet bound_texture=VK_NULL_ND_HANDLE;
 			const float tile=ShadowAtlasSize/ShadowAtlasTiles;
+			static immutable DrawGroup[4] caster_groups=[DrawGroup.SolidModels, DrawGroup.TranslucentModels,
+				DrawGroup.SolidWorldModels, DrawGroup.TranslucentWorldModels];
 			foreach(ref draw; _shadow_draws)
 			{
 				const VkViewport viewport=VkViewport((draw.tile%ShadowAtlasTiles)*tile, (draw.tile/ShadowAtlasTiles)*tile, tile, tile, 0f, 1f);
 				SetViewport(buffer, viewport);
-				vkCmdPushConstants(buffer, _shadow_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, draw.view_proj.sizeof, draw.view_proj.ptr);
-				// the model's own textured passes (not its flattened shadow or other objects)
-				foreach(group; [DrawGroup.SolidModels, DrawGroup.TranslucentModels])
+				// the caster's own textured passes (not a model's flattened shadow or other objects)
+				foreach(group; caster_groups)
 					foreach(ref batch; _objects.groups[group])
-						if (batch.model==cast(int)draw.model && batch.mode!=TextureMode.Untextured)
+					{
+						if (batch.model!=cast(int)draw.model || batch.mode==TextureMode.Untextured)
+							continue;
+						// translucent world models (bars, grates) leave out their see-through texels; a fullbright
+						// texture's alpha marks its fullbright texels, never opacity
+						const bool masked=group==DrawGroup.TranslucentWorldModels && batch.mode==TextureMode.Normal;
+						float[20] constants;
+						constants[0..16]=draw.view_proj[];
+						constants[16..20]=[masked ? 1f : 0f, 0f, 0f, 0f];
+						vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+							constants.sizeof, constants.ptr);
+						VkDescriptorSet texture=batch.texture!=VK_NULL_ND_HANDLE ? batch.texture : _texture_descriptor;
+						if (texture!=bound_texture)
 						{
-							vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
-							_shadow_draw_calls++;
+							vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &texture, 0, null);
+							bound_texture=texture;
 						}
+						vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
+						_shadow_draw_calls++;
+					}
 			}
 		}
 		vkCmdEndRenderPass(buffer);
@@ -3702,7 +3724,7 @@ LAB_0004814b:
 					(group==DrawGroup.LineSystems || group==DrawGroup.LightAdd) ? FogKind.None : FogKind.World;
 				const float model_set=(batch.model>=0 && batch.model<_model_sets.length) ? cast(float)_model_sets[batch.model] : -1f;
 				PushBatchConstants(buffer, cast(float)batch.mode, fog, batch.lighting,
-					cast(float)(IdObjectBase+BatchIdOffset(group)+batch_index), model_set);
+					cast(float)(IdObjectBase+BatchIdOffset(group)+batch_index), model_set, cast(float)batch.model);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
@@ -5525,7 +5547,7 @@ class Shader
 	static ubyte[] ReadShader(string file_name)
 	{
 		static immutable string[] names=[ "vert.spv", "frag.spv", "object_vert.spv", "object_frag.spv", "overlay_vert.spv", "overlay_frag.spv",
-			"post_frag.spv", "shadow_vert.spv" ];
+			"post_frag.spv", "shadow_vert.spv", "shadow_frag.spv" ];
 		static foreach(name; names)
 			if (file_name==name)
 				return cast(ubyte[])(cast(const(ubyte)[])import(name)).dup;

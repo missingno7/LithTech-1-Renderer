@@ -87,7 +87,7 @@ lighting would change the look of every level. Revisit this only with the HDR po
 | GPU timing, `d_GPU` | done | – |
 | `d_Lighting 1` (per-pixel lights, specular) | done, default off until checked in-game | iGPU at 4K: +0.7 ms with no lights, about +1.3 ms per light covering the view |
 | Offscreen target + post pass, `d_AntiAliasing 1` (FXAA) | done, default off | RTX 4090 at 4K: 0.1 ms; iGPU at 4K: +5.5 ms per frame including the extra copy |
-| Static lamps from the world file; models lit by them (`d_Lighting 1`); lamp shadows from models (`d_Shadows 1`) | done, default off, first in-game check pending | RTX 4090 at 1280×720: whole frame 0.31 ms with 8 shadow pairs |
+| Static lamps from the world file; models lit by them (`d_Lighting 1`); lamp shadows from models and world models, alpha-tested bars and grates (`d_Shadows 1`) | done, default off, checked in game | RTX 4090 at 1280×720: whole frame 0.31 ms with 8 shadow pairs; 16 pairs ≈ 24–33 shadow draw calls per frame |
 
 The iGPU presents through the NVIDIA card's display, so its swapchain writes are unusually slow. Its post-pass numbers
 overstate the cost on a GPU that drives the display itself.

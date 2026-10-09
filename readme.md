@@ -101,10 +101,12 @@ settings. `d_DebugLight <radius>` adds a steady light just ahead of the camera, 
 ### Lamp shadows and lamp lighting
 Blood II's level files still contain the lamps the lightmaps were baked from (the editor's `Light` and `DirLight`
 objects, which the engine skips). d_ren reads them when a level loads. With `d_Shadows 1`, models (characters, props)
-cast shadows from those lamps: each frame the strongest lamp/model pairs near the camera (`d_ShadowPairs`, default 8)
-get a small shadow map, and where a model blocks a lamp, the floor, walls and other models lose exactly that lamp's
-share of the baked light (the bake was fitted against the lightmaps: ambient + colour × BrightScale × (1 − d/r)). This
-replaces d3d.ren's flattened model shadow. With `d_Lighting 1`, models are also lit from the actual lamps around them
+and world models (doors, crates and other destructible brushes, bars and grates) cast shadows from those lamps: each
+frame the strongest lamp/caster pairs near the camera (`d_ShadowPairs`, default 16) get a small shadow map, and where a
+caster blocks a lamp, the floor, walls and other models lose exactly that lamp's share of the baked light (the bake was
+fitted against the lightmaps: ambient + colour × BrightScale × (1 − d/r)). Masked world models (bars, grates, fences)
+are alpha-tested into their shadow maps, so light passes between the bars, and a world model takes its shadows from the
+lamps that still light what lies behind it. This replaces d3d.ren's flattened model shadow. With `d_Lighting 1`, models are also lit from the actual lamps around them
 (up to 4, each from its own direction, traced so lamps behind walls don't count), at no more total light than the
 original light grid gave them.
 
@@ -133,7 +135,7 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_LightFalloff` | 1 | Exponent of the modern lighting's falloff `(1 - d²/r²)^n`; 1 is d3d.ren's lightmap curve, higher is softer. |
 | `d_AntiAliasing` | 0 | 1: FXAA on the 3D scene (not the 2D layer). |
 | `d_Shadows` | 0 | 1: models cast soft shadows from the level's lamps (see *Lamp shadows*); 0: d3d.ren's flattened shadows. |
-| `d_ShadowPairs` | 8 | How many lamp/model shadow maps per frame (1..16). |
+| `d_ShadowPairs` | 16 | How many lamp/caster shadow maps per frame (1..64). |
 | `d_Compare` | 0 | 1: left half of the view as d3d.ren with no post effects, right half with the current settings. |
 | `d_DebugLight` | 0 | Radius of a test light ahead of the camera; 0 = none. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |

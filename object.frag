@@ -19,7 +19,7 @@ layout(push_constant) uniform PushConstants {
 	// 1 model, 2 world polies
 	vec4 ambient;
 	vec4 directional; // rgb: the model's directional light (light grid), towards light_list.model_light; w: draw id (debug)
-	vec4 extra; // x: the model's lamp set (static_lighting.d), -1 for none
+	vec4 extra; // x: the model's lamp set (static_lighting.d), -1 for none; y: its model record (a shadow caster), -1 none
 } pc;
 
 layout(location=0) in vec4 colour_in;
@@ -76,7 +76,9 @@ void main()
 		ModernLights(world_position_in, normal, kind<1.5, modern_diffuse, modern_specular);
 
 	// world models lose the static light models hide from them, like the world (static_lighting.d)
-	vec3 shadow_loss=(kind>1.5 && ShadowsOn()) ? WorldShadowLoss(world_position_in, normal) : vec3(0.0);
+	int caster=int(pc.extra.y);
+	vec3 baked_world=lightmap_in.z>0.5 ? texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb : base_colour_in;
+	vec3 shadow_loss=(kind>1.5 && ShadowsOn()) ? WorldShadowLoss(world_position_in, normal, baked_world, caster) : vec3(0.0);
 
 	vec3 colour;
 	vec3 fullbright_add;
@@ -86,7 +88,7 @@ void main()
 		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
 		// the vertex colour is GlobalLightScale here
 		vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false);
-		vec3 lightmap=Unshadowed(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb, shadow_loss);
+		vec3 lightmap=Unshadowed(baked_world, shadow_loss);
 		vec3 light=clamp(lightmap+texel_light, 0.0, 1.0)*colour_in.rgb;
 		debug_light=light;
 		debug_dynamic=texel_light;
@@ -121,7 +123,7 @@ void main()
 				if (c==vec3(0.0))
 					continue;
 				float facing=clamp(0.5+0.49609375*dot(normal, normalize(lamp.pos_radius.xyz-world_position_in)), 0.0, 15.0/16.0);
-				float hidden=shadows ? ModelLampShadow(lamp, lamp_set, world_position_in) : 0.0;
+				float hidden=shadows ? ModelLampShadow(lamp, caster, world_position_in) : 0.0;
 				lamps+=c*facing*(1.0-hidden);
 				shadow_loss+=c*facing*hidden;
 			}

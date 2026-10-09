@@ -291,6 +291,7 @@ void RegisterRendererOptions()
 		["d_Lighting", "0"],   // 0: dynamic lights like d3d.ren; 1: per pixel with N.L and specular
 		["d_AntiAliasing", "0"], // 0: none; 1: FXAA
 		["d_Shadows", "0"],    // 0: d3d.ren's flattened model shadows; 1: models cast shadows from the level's lamps
+		["d_ShadowPairs", "16"], // lamp shadow maps per frame (1..64)
 	];
 
 	if (_renderer is null || _renderer.GetConsoleVar is null || _renderer.RunConsoleString is null)

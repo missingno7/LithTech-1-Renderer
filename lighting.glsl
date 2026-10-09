@@ -87,7 +87,7 @@ struct ShadowPair
 {
 	mat4 view_proj; // world -> the tile's clip space
 	StaticLamp lamp;
-	vec4 tile; // xy: corner in the atlas, z: size; w: the caster's model set
+	vec4 tile; // xy: corner in the atlas, z: size; w: the caster (its index in the frame's model records)
 };
 
 struct ModelLamps
@@ -99,7 +99,7 @@ struct ModelLamps
 layout(std430, set=0, binding=4) readonly buffer StaticLighting {
 	uvec4 counts; // shadow pairs, model sets, 1 if shadows are on, 1 if models are lit by the lamps
 	vec4 ambient; // rgb: the level's lightmap ambient; w: one shadow atlas texel
-	ShadowPair pairs[16];
+	ShadowPair pairs[64];
 	ModelLamps models[128];
 } static_lighting;
 
@@ -167,19 +167,29 @@ vec2 ShadowCoverage(vec3 p)
 	return vec2(strongest, covered);
 }
 
-// the static light a world surface (normal n) loses at p where models hide lamps from it
-vec3 WorldShadowLoss(vec3 p, vec3 n)
+// The static light a world surface (normal n) loses at p where models hide lamps from it. `baked` is the surface's baked
+// light there (lightmap or pre-lit colour): a pair only takes away light the bake shows arrived, so where the bake
+// already had the lamp blocked (a closed door's own baked shadow, say) nothing is taken twice. `caster`: the surface's
+// own model record (world models don't shadow themselves), -1 for the world.
+vec3 WorldShadowLoss(vec3 p, vec3 n, vec3 baked, int caster)
 {
 	vec3 loss=vec3(0.0);
+	float received=dot(max(baked-static_lighting.ambient.rgb, vec3(0.0)), vec3(0.299, 0.587, 0.114));
 	for(uint k=0u; k<static_lighting.counts.x; ++k)
 	{
+		if (int(static_lighting.pairs[k].tile.w)==caster)
+			continue;
 		StaticLamp lamp=static_lighting.pairs[k].lamp;
 		vec3 to_lamp=lamp.pos_radius.xyz-p;
 		if (dot(to_lamp, to_lamp)>=lamp.pos_radius.w*lamp.pos_radius.w || dot(n, to_lamp)<=0.0)
 			continue;
+		vec3 c=LampAt(lamp, p);
+		float expected=dot(c, vec3(0.299, 0.587, 0.114));
+		if (expected<=0.0)
+			continue;
 		float s=PairShadow(k, p);
 		if (s>0.0)
-			loss+=s*LampAt(lamp, p);
+			loss+=s*c*smoothstep(0.25, 0.75, received/expected);
 	}
 	return loss;
 }
@@ -190,12 +200,12 @@ vec3 Unshadowed(vec3 baked, vec3 loss)
 	return baked-min(loss, max(baked-static_lighting.ambient.rgb, vec3(0.0)));
 }
 
-// how much other models hide one of this model's lamps at p (set: this model's)
-float ModelLampShadow(StaticLamp lamp, int set, vec3 p)
+// how much other models hide one of this model's lamps at p (caster: this model's record)
+float ModelLampShadow(StaticLamp lamp, int caster, vec3 p)
 {
 	float shadow=0.0;
 	for(uint k=0u; k<static_lighting.counts.x; ++k)
-		if (static_lighting.pairs[k].lamp.colour_index.w==lamp.colour_index.w && int(static_lighting.pairs[k].tile.w)!=set)
+		if (static_lighting.pairs[k].lamp.colour_index.w==lamp.colour_index.w && int(static_lighting.pairs[k].tile.w)!=caster)
 			shadow=max(shadow, PairShadow(k, p));
 	return shadow;
 }

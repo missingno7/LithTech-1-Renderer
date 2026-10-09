@@ -41,10 +41,39 @@ void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* sc
 	geometry.lighting=BatchLighting(LightingKind.WorldPolies);
 	scope(exit) geometry.lighting=BatchLighting.init;
 
+	// doors, crates, masked walls cast shadows from the level's lamps (static_lighting.d): the batches belong to a
+	// model record, whose bounds come from the emitted vertices
+	const size_t first_vertex=geometry.vertices.length;
+	geometry.model_index=cast(int)geometry.models.length;
+	scope(exit) geometry.model_index=-1;
+
 	foreach(polygon; emitter.original.polygons[0..emitter.original.polygon_count])
 		emitter.Emit(geometry, polygon, resolve_texture);
 
 	emitter.Finish(geometry);
+
+	if (geometry.vertices.length>first_vertex)
+	{
+		import std.math: sqrt;
+		import StaticLighting: ModelRecord;
+		float[3] low=geometry.vertices[first_vertex].pos, high=low;
+		foreach(ref vertex; geometry.vertices[first_vertex..$])
+			foreach(axis; 0..3)
+			{
+				if (vertex.pos[axis]<low[axis]) low[axis]=vertex.pos[axis];
+				if (vertex.pos[axis]>high[axis]) high[axis]=vertex.pos[axis];
+			}
+		const float[3] half=[(high[0]-low[0])*0.5f, (high[1]-low[1])*0.5f, (high[2]-low[2])*0.5f];
+		ModelRecord record={
+			object: object,
+			centre: [low[0]+half[0], low[1]+half[1], low[2]+half[2]],
+			radius: sqrt(half[0]*half[0]+half[1]*half[1]+half[2]*half[2]),
+			directional: [0f, 0f, 0f],
+			solid: true, // see-through texels are left out of the shadow map instead
+			world_model: true
+		};
+		geometry.models~=record;
+	}
 }
 
 // d3d.ren sky-object pass (0x1b9c0): the original BSP back to front from the sky camera, skipping invisible surfaces
