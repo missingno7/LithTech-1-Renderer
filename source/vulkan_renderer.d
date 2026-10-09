@@ -296,8 +296,10 @@ public:
 		vkDestroyDevice(g_Device, null);
 		vkDestroySurfaceKHR(g_VkInstance, _surface, null);
 		vkDestroyInstance(g_VkInstance, null);
-		ShowCursor(TRUE);
-		RemoveMouseInputFix(); // before the DLL can unload: the import must not point into it
+		ReleaseCursor();
+		// before the DLL can unload: the imports must not point into it
+		RemoveMouseInputFix();
+		RemoveCursorGuard();
 		{
 			import core.sys.windows.mmsystem: timeEndPeriod;
 			timeEndPeriod(1);
@@ -325,9 +327,12 @@ public:
 			_screen_width=(_renderer && _renderer.screen_width>0) ? _renderer.screen_width : Width;
 			_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
 			SetupWindow(cast(HWND)window);
+			InstallCursorGuard(cast(HWND)window);
+			BringToForeground(cast(HWND)window);
 
-			// d3d.ren hides the cursor for the renderer's lifetime (d3d_init.cpp, shown again in d3d_FreeDDraw)
-			ShowCursor(FALSE);
+			// d3d.ren hides the cursor for the renderer's lifetime (d3d_init.cpp, shown again in d3d_FreeDDraw); d_ren
+			// hides it while the game has focus
+			UpdateCursorCapture();
 		}
 
 		EnumerateVkExtensions();
@@ -825,6 +830,8 @@ LAB_0004814b:
 		if (_t_frame_end!=MonoTime.init)
 			_timing[Timing.Game]+=(t_begin-_t_frame_end).total!"usecs"; // includes RenderScene, subtracted when logged
 
+		UpdateCursorCapture();
+
 		// presentation options, every frame (menus have no scene); a vsync change rebuilds the swapchain
 		ReadPresentSettings();
 		if (_vsync!=_swapchain_vsync)
@@ -1095,8 +1102,6 @@ LAB_0004814b:
 	void InstallMouseInputFix()
 	{
 		import Main: _renderer;
-		import core.stdc.string: strcmp;
-		import core.sys.windows.winnt: IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_IMPORT_DESCRIPTOR, IMAGE_DIRECTORY_ENTRY_IMPORT;
 
 		void* variable=_renderer ? _renderer.GetConsoleVar("d_MouseFix") : null;
 		if (variable && _renderer.GetVarValueFloat(variable)==0f)
@@ -1104,17 +1109,38 @@ LAB_0004814b:
 		if (_tick_count_import !is null)
 			return;
 
+		{
+			import core.sys.windows.mmsystem: timeGetTime;
+			_tick_count_offset=GetTickCount()-timeGetTime()-16;
+		}
+		_tick_count_import=PatchImport("kernel32.dll", "GetTickCount", cast(void*)&FineTickCount, _original_tick_count);
+		if (_tick_count_import)
+			test_out.writeln("Mouse input fix: GetTickCount -> timeGetTime (1 ms)");
+	}
+
+	void RemoveMouseInputFix()
+	{
+		RestoreImport(_tick_count_import, _original_tick_count);
+	}
+
+	// points CLIENT.EXE's import of dll!name at replacement; returns the patched slot (null if not found) and the
+	// original function
+	static void** PatchImport(const(char)* dll_name, const(char)* function_name, void* replacement, out void* original)
+	{
+		import core.stdc.string: strcmp;
+		import core.sys.windows.winnt: IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_IMPORT_DESCRIPTOR, IMAGE_DIRECTORY_ENTRY_IMPORT;
+
 		ubyte* image=cast(ubyte*)GetModuleHandleA(null);
 		auto dos=cast(IMAGE_DOS_HEADER*)image;
 		auto nt=cast(IMAGE_NT_HEADERS32*)(image+dos.e_lfanew);
 		const auto directory=nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 		if (directory.VirtualAddress==0)
-			return;
+			return null;
 
 		for (auto descriptor=cast(IMAGE_IMPORT_DESCRIPTOR*)(image+directory.VirtualAddress); descriptor.Name; ++descriptor)
 		{
 			const char* dll=cast(const char*)(image+descriptor.Name);
-			if (lstrcmpiA(dll, "kernel32.dll")!=0)
+			if (lstrcmpiA(dll, dll_name)!=0)
 				continue;
 
 			uint* names=cast(uint*)(image+(descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk));
@@ -1124,37 +1150,110 @@ LAB_0004814b:
 				if (names[i] & 0x80000000)
 					continue; // by ordinal
 				const char* name=cast(const char*)(image+names[i]+2);
-				if (strcmp(name, "GetTickCount")!=0)
+				if (strcmp(name, function_name)!=0)
 					continue;
 
 				uint old_protect;
 				if (!VirtualProtect(&slots[i], (void*).sizeof, PAGE_READWRITE, &old_protect))
-					return;
-				{
-					import core.sys.windows.mmsystem: timeGetTime;
-					_tick_count_offset=GetTickCount()-timeGetTime()-16;
-				}
-				_original_tick_count=slots[i];
-				slots[i]=cast(void*)&FineTickCount;
+					return null;
+				original=slots[i];
+				slots[i]=replacement;
 				VirtualProtect(&slots[i], (void*).sizeof, old_protect, &old_protect);
-				_tick_count_import=&slots[i];
-				test_out.writeln("Mouse input fix: GetTickCount -> timeGetTime (1 ms)");
-				return;
+				return &slots[i];
 			}
+		}
+		return null;
+	}
+
+	// puts the original back before the DLL can unload: the import must not point into it
+	static void RestoreImport(ref void** slot, void* original)
+	{
+		if (slot is null)
+			return;
+		uint old_protect;
+		if (VirtualProtect(slot, (void*).sizeof, PAGE_READWRITE, &old_protect))
+		{
+			*slot=original;
+			VirtualProtect(slot, (void*).sizeof, old_protect, &old_protect);
+		}
+		slot=null;
+	}
+
+	//// Focus and the cursor, like a modern game
+	////
+	//// The engine moves the cursor to the middle of its window every frame unless it has had WM_ACTIVATEAPP(FALSE)
+	//// (blood2_recon client.cpp main loop). A game that starts behind another window never had focus, so it never gets
+	//// that message and keeps pulling the cursor to the middle of the screen: the user can't reach the window to click
+	//// it. d_ren makes it two states, like a modern game: with focus the cursor is hidden and held in the middle (the
+	//// engine's mouse look needs that); without focus it is visible and free, CLIENT.EXE's SetCursorPos calls doing
+	//// nothing. It also asks for the foreground when the window is set up. Losing focus by Alt+Tab is still the
+	//// engine's (it unloads the renderer and loads it again on return).
+
+	__gshared HWND _game_window;
+	__gshared void** _cursor_pos_import; // CLIENT.EXE's IAT slot for USER32!SetCursorPos
+	__gshared void* _original_cursor_pos;
+	__gshared bool _cursor_captured; // the game has focus: cursor hidden and centred
+
+	static extern(Windows) BOOL CapturedSetCursorPos(int x, int y) nothrow @nogc
+	{
+		if (!_cursor_captured)
+			return TRUE;
+		alias SetCursorPosFn=extern(Windows) BOOL function(int, int) nothrow @nogc;
+		return (cast(SetCursorPosFn)_original_cursor_pos)(x, y);
+	}
+
+	void InstallCursorGuard(HWND window)
+	{
+		_game_window=window;
+		if (_cursor_pos_import is null)
+			_cursor_pos_import=PatchImport("user32.dll", "SetCursorPos", cast(void*)&CapturedSetCursorPos, _original_cursor_pos);
+		test_out.writeln("Cursor guard: ", _cursor_pos_import ? "on" : "SetCursorPos import not found");
+	}
+
+	void RemoveCursorGuard()
+	{
+		RestoreImport(_cursor_pos_import, _original_cursor_pos);
+	}
+
+	// the game in front, if Windows lets it: a process may take the foreground when it was started by the foreground
+	// process (the launcher); sharing the foreground thread's input state covers the cases where that permission is gone
+	void BringToForeground(HWND window)
+	{
+		HWND foreground=GetForegroundWindow();
+		if (foreground==window)
+			return;
+
+		const uint this_thread=GetCurrentThreadId();
+		const uint foreground_thread=foreground ? GetWindowThreadProcessId(foreground, null) : 0;
+		const bool attached=foreground_thread && foreground_thread!=this_thread &&
+			AttachThreadInput(this_thread, foreground_thread, TRUE);
+		BringWindowToTop(window);
+		SetForegroundWindow(window);
+		if (attached)
+			AttachThreadInput(this_thread, foreground_thread, FALSE);
+
+		test_out.writeln("Foreground: ", GetForegroundWindow()==window ? "game window" : "another window (Windows refused)");
+	}
+
+	// the one focus state, checked every frame: captured (hidden, centred) or free (visible, left alone). ShowCursor
+	// counts per thread, and this is the window's thread.
+	void UpdateCursorCapture()
+	{
+		const bool focused=_game_window && GetForegroundWindow()==_game_window;
+		if (focused!=_cursor_captured)
+		{
+			ShowCursor(focused ? FALSE : TRUE);
+			_cursor_captured=focused;
 		}
 	}
 
-	void RemoveMouseInputFix()
+	void ReleaseCursor()
 	{
-		if (_tick_count_import is null)
-			return;
-		uint old_protect;
-		if (VirtualProtect(_tick_count_import, (void*).sizeof, PAGE_READWRITE, &old_protect))
+		if (_cursor_captured)
 		{
-			*_tick_count_import=_original_tick_count;
-			VirtualProtect(_tick_count_import, (void*).sizeof, old_protect, &old_protect);
+			ShowCursor(TRUE);
+			_cursor_captured=false;
 		}
-		_tick_count_import=null;
 	}
 
 	//// Game speed above 100 fps

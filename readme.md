@@ -81,6 +81,13 @@ moved in only 64 of 240 frames (keyboard turning uses a different clock and was 
 points the engine's `GetTickCount` import at a 1 ms clock while the renderer is loaded, and the view follows the mouse
 in every frame. The original import is restored when the renderer shuts down.
 
+### Focus and the cursor
+The engine pulls the cursor to the middle of its window every frame until it has been told it lost focus, which never
+happens if the game starts behind another window: the cursor stays stuck in the middle of the screen. d_ren gives it the
+two states of a modern game: with focus the cursor is hidden and held in the middle (mouse look needs that), without
+focus it's visible and free. The game also asks for the foreground when it starts. Alt+Tab is still handled by the
+engine, which unloads the renderer and loads it again on return.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
