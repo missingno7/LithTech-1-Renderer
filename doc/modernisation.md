@@ -50,8 +50,12 @@ The bake, fitted with `tools/lighting_fit.py` against the whole steam tunnels li
 texels, 58,202 within reach of exactly one lamp): **lightmap = ambient + Σ lamps colour × BrightScale × (1 − d/r)** on
 surfaces facing the lamp, no N·L term, with geometry occlusion. Scale 0.97, mean error 0.03 (the RGB565 step); the
 quadratic and steeper falloffs fit 2–3× worse. The ambient is a constant per level (steam tunnels: RGB 8, 20, 16), the
-value of every texel no lamp reaches. About 28% of in-range facing texels read as shadowed. Spot lights (`DirLight`) are
-not fitted yet.
+value of every texel no lamp reaches. About 28% of in-range facing texels read as shadowed. City hub (8,565 polygons,
+315 point and 225 spot lights) gives the same: `1 − d/r`, scale 1.03, error 0.038, its own ambient (16, 20, 16). Spot
+lights (`DirLight`): forward = (sin yaw · cos pitch, −sin pitch, cos yaw · cos pitch) from the Euler angles (the other
+pitch sign puts the lit texels outside the cones; yaw isn't pinned down by these levels' mostly vertical spots), and
+the cone factor is (cos θ − cos h) / (1 − cos h) with h half the FOV (scale 0.98, error 0.024, FOVs 30°..180°), times
+the same `1 − d/r`.
 
 ## Plan
 
