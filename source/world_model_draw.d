@@ -4,8 +4,8 @@ module WorldModelDraw;
  + World models (doors, lifts, signs, ...) and containers, after blood2_recon docs/seed_pass/port_notes/worldmodels.md:
  + the original BSP's polygons drawn through the engine-built local -> world transform.
  + - Solid world models are drawn like the world: lightmapped polygons (surface flag 0x80) as LM x GlobalLightScale x
- +   texture, the others with their pre-lit vertex colours x GlobalLightScale plus the dynamic lights, and fullbright
- +   texels added on top.
+ +   texture, the others with their pre-lit vertex colours x GlobalLightScale plus the dynamic lights (added by
+ +   object.vert / object.frag), and fullbright texels added on top.
  + - Translucent ones (first surface of the current BSP has flag 0x8) take one Gouraud-style pass with the object's
  +   alpha: no lightmaps, no fullbright pass.
  +
@@ -30,12 +30,16 @@ enum : size_t
 __gshared uint[2][Polygon*] g_LightmapOrigins;
 __gshared float[2] g_LightmapAtlasScale=[1f, 1f];
 
-void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, const DynamicLight[] lights,
+void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene,
 	scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	WorldModelPolygons emitter;
-	if (!emitter.Setup(object, scene, [0f, 0f, 0f], false, lights))
+	if (!emitter.Setup(object, scene, [0f, 0f, 0f], false))
 		return;
+
+	// the dynamic lights are added on the GPU, from the frame's light list
+	geometry.lighting=BatchLighting(LightingKind.WorldPolies);
+	scope(exit) geometry.lighting=BatchLighting.init;
 
 	foreach(polygon; emitter.original.polygons[0..emitter.original.polygon_count])
 		emitter.Emit(geometry, polygon, resolve_texture);
@@ -48,7 +52,7 @@ void DrawSkyWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc*
 	const float[3] offset, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	WorldModelPolygons emitter;
-	if (!emitter.Setup(object, scene, offset, true, null))
+	if (!emitter.Setup(object, scene, offset, true))
 		return;
 
 	Node*[500] pending; // the native walk's fixed stack
@@ -91,13 +95,12 @@ private struct WorldModelPolygons
 	float alpha;
 	float[3] scale;
 	float[3] offset;
-	const(DynamicLight)[] lights;
 
 	RenderTexture batch_texture;
 	TextureMode batch_mode;
 	bool batch_open;
 
-	bool Setup(LTObject* object, SceneDesc* scene, const float[3] offset_, bool sky_, const DynamicLight[] lights_)
+	bool Setup(LTObject* object, SceneDesc* scene, const float[3] offset_, bool sky_)
 	{
 		WorldData* data=At!(WorldData*)(object, WorldModelDataOffset);
 		if (data is null)
@@ -116,7 +119,6 @@ private struct WorldModelPolygons
 		scale=scene.global_light_scale.vector;
 		offset=offset_;
 		sky=sky_;
-		lights=lights_;
 		return true;
 	}
 
@@ -155,6 +157,14 @@ private struct WorldModelPolygons
 		const float u_scale=(texture && texture.width) ? 1f/texture.width : 1f/64;
 		const float v_scale=(texture && texture.height) ? 1f/texture.height : 1f/64;
 
+		// the plane's normal in world space, for the dynamic lights
+		float[3] normal=[0f, 0f, 0f];
+		if (!sky && polygon.surface.plane)
+		{
+			const auto plane=polygon.surface.plane.vector;
+			normal=Normalised(transform.TransformVector([plane.x, plane.y, plane.z]), [0f, 0f, 0f]);
+		}
+
 		ObjectVertex Vertex(size_t i)
 		{
 			const auto source=&vertices[i];
@@ -163,6 +173,7 @@ private struct WorldModelPolygons
 			ObjectVertex vertex;
 			vertex.pos=[world_pos[0]+offset[0], world_pos[1]+offset[1], world_pos[2]+offset[2]];
 			vertex.uv=[source.uv.x*u_scale, source.uv.y*v_scale];
+			vertex.normal=normal;
 
 			if (lightmap_origin)
 			{
@@ -173,22 +184,13 @@ private struct WorldModelPolygons
 			}
 			else
 			{
-				// pre-lit colour is stored b, g, r, a; scaled, plus the dynamic lights' (2c - 255)(1 - d/r) in world space
-				float[3] colour=[source.colour[2]*scale[0], source.colour[1]*scale[1], source.colour[0]*scale[2]];
-				if (!sky)
-					foreach(ref light; lights)
-					{
-						import std.math: sqrt;
-						const float dx=light.pos[0]-world_pos[0], dy=light.pos[1]-world_pos[1], dz=light.pos[2]-world_pos[2];
-						const float distance=sqrt(dx*dx+dy*dy+dz*dz);
-						if (distance<light.radius)
-							foreach(channel; 0..3)
-								colour[channel]+=(2f*light.colour[channel]-255f)*(1f-distance/light.radius);
-					}
+				// pre-lit colour is stored b, g, r, a; scaled. Outside the sky the vertex shader adds the dynamic lights and
+				// clamps the sum, as d3d.ren did.
+				const float[3] colour=[source.colour[2]*scale[0], source.colour[1]*scale[1], source.colour[0]*scale[2]];
 				foreach(channel; 0..3)
 				{
 					const float c=colour[channel]/255f;
-					vertex.colour[channel]=c<0f ? 0f : c>1f ? 1f : c;
+					vertex.colour[channel]=c<0f ? 0f : (c>1f && sky) ? 1f : c;
 				}
 				vertex.colour[3]=alpha;
 			}

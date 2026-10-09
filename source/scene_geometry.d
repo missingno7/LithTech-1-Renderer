@@ -14,6 +14,7 @@ struct ObjectVertex
 	float[4] colour; // 0..1, alpha included
 	float[2] uv; // normalised (0..1 across the texture), as d3d.ren hands them to D3D
 	float[3] lightmap=[0f, 0f, 0f]; // atlas u, v (normalised) and 1 if lightmapped (solid world models)
+	float[3] normal=[0f, 0f, 0f]; // world space, unit length, for the per-pixel lighting of models and world models
 
 	static VkVertexInputBindingDescription GetBindingDescription()
 	{
@@ -25,13 +26,14 @@ struct ObjectVertex
 		return description;
 	}
 
-	static VkVertexInputAttributeDescription[4] GetAttributeDescriptions()
+	static VkVertexInputAttributeDescription[5] GetAttributeDescriptions()
 	{
 		return [
 			VkVertexInputAttributeDescription(0, 0, VK_FORMAT_R32G32B32_SFLOAT, pos.offsetof),
 			VkVertexInputAttributeDescription(1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, colour.offsetof),
 			VkVertexInputAttributeDescription(2, 0, VK_FORMAT_R32G32_SFLOAT, uv.offsetof),
-			VkVertexInputAttributeDescription(3, 0, VK_FORMAT_R32G32B32_SFLOAT, lightmap.offsetof)
+			VkVertexInputAttributeDescription(3, 0, VK_FORMAT_R32G32B32_SFLOAT, lightmap.offsetof),
+			VkVertexInputAttributeDescription(4, 0, VK_FORMAT_R32G32B32_SFLOAT, normal.offsetof)
 		];
 	}
 }
@@ -73,6 +75,23 @@ enum TextureMode : ubyte
 	WorldFullbright, // fullbright texels added on top (world surfaces: SRCALPHA / ONE or the lightmap pass's SRCALPHA / SRCCOLOR)
 }
 
+// how a batch is lit (object.vert / object.frag push constants)
+enum LightingKind
+{
+	PreLit, // the vertex colour is the light: sprites, particles, sky objects, shadows, ...
+	Model, // the vertex colour is d3d.ren's light ramp; the modern lighting uses the batch's ambient and directional
+	WorldPolies, // world models: lightmapped, or pre-lit plus the dynamic lights per vertex (classic) or pixel (modern)
+}
+
+// the model terms for the modern lighting, 0..1: ambient without the dynamic lights, and the light grid's directional
+// light (d3d.ren's light ramp before it's stepped)
+struct BatchLighting
+{
+	LightingKind kind;
+	float[3] ambient=[0f, 0f, 0f];
+	float[3] directional=[0f, 0f, 0f];
+}
+
 struct ObjectBatch
 {
 	VkDescriptorSet texture; // VK_NULL_ND_HANDLE: the renderer's dummy texture
@@ -81,6 +100,7 @@ struct ObjectBatch
 	TextureMode mode;
 	ObjectPipe pipe;
 	bool no_fog; // drawn with fog off whatever the group (model shadows)
+	BatchLighting lighting;
 }
 
 struct ObjectGeometry
@@ -92,6 +112,8 @@ struct ObjectGeometry
 	// these before drawing (DrawModel / DrawWorldModel only know whether they're translucent)
 	DrawGroup solid_group=DrawGroup.SolidModels, translucent_group=DrawGroup.TranslucentModels;
 	ObjectPipe solid_pipe=ObjectPipe.Opaque, translucent_pipe=ObjectPipe.Blend;
+	// how batches opened from now on are lit; models and world models set it while they draw
+	BatchLighting lighting;
 
 	void Clear()
 	{
@@ -121,7 +143,8 @@ struct ObjectGeometry
 
 	void Begin(VkDescriptorSet texture, DrawGroup group, ObjectPipe pipe, TextureMode mode, bool no_fog=false)
 	{
-		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe, no_fog: no_fog };
+		ObjectBatch batch={ texture: texture, first_vertex: cast(uint)vertices.length, vertex_count: 0, mode: mode, pipe: pipe, no_fog: no_fog,
+			lighting: lighting };
 		groups[group]~=batch;
 		_current=group;
 	}

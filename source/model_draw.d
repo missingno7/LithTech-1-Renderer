@@ -142,9 +142,10 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	debug DumpModelOnce(object, model, matrix_count);
 
-	//// light ramp
+	//// light ramp (and the same light unstepped, without the dynamic lights, for the modern lighting)
 	uint draw_flags;
-	float[4][16] ramp=LightRamp(object, scene, world, lights, draw_flags);
+	BatchLighting modern;
+	float[4][16] ramp=LightRamp(object, scene, world, lights, draw_flags, modern);
 
 	//// hidden nodes (d3d_model_core.cpp ApplyHiddenNodeList)
 	_node_visible[]=true;
@@ -193,7 +194,8 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 			ObjectVertex vertex={
 				pos: node.TransformPoint(source.pos),
 				colour: ramp[step],
-				uv: [face_uvs[face_index*6+corner*2], face_uvs[face_index*6+corner*2+1]]
+				uv: [face_uvs[face_index*6+corner*2], face_uvs[face_index*6+corner*2+1]],
+				normal: normal
 			};
 			_mesh~=vertex;
 
@@ -211,6 +213,9 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	const ObjectPipe pipe=translucent ? geometry.translucent_pipe : geometry.solid_pipe;
 	const TextureMode skin_mode=(skin && skin.fullbright) ? TextureMode.Fullbright : TextureMode.Normal;
 	const VkDescriptorSet skin_texture=skin ? skin.texture_descriptor : VkDescriptorSet.init;
+
+	geometry.lighting=modern;
+	scope(exit) geometry.lighting=BatchLighting.init;
 
 	if (chrome)
 	{
@@ -233,6 +238,7 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 	}
 
 	// FLAG_SHADOW, after the model hook (d3d.ren calls the shadow pass from the model backend when that bit is set)
+	geometry.lighting=BatchLighting.init;
 	if (draw_flags & ObjectFlag.Shadow)
 		g_ShadowStats[0]++;
 	if (shadows && (draw_flags & ObjectFlag.Shadow))
@@ -619,24 +625,36 @@ float CloudLight(const float[3] pos)
 	}
 }
 
-// d3d_model_frame_lighting.cpp ours_SetupModelFrameState + the 16-entry ramp of the vertex dispatch (0x10e7c)
+// d3d_model_frame_lighting.cpp ours_SetupModelFrameState + the 16-entry ramp of the vertex dispatch (0x10e7c).
+// `modern` gets the ramp's ambient and directional light for the modern lighting, which lights the model per pixel and
+// adds the dynamic lights there instead of in the ambient light.
 float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights,
-	out uint draw_flags)
+	out uint draw_flags, out BatchLighting modern)
 {
 	import gl3n.linalg: vec3;
 
 	// the object flags this draw uses: the model hook may change them for this frame only (FLAG_SHADOW etc.)
 	draw_flags=object.flags;
 
+	static float Clamp255(float value) { return value<0f ? 0f : value>255f ? 255f : value; }
+
 	const float[3] scale=scene.global_light_scale.vector;
 	float[3] ambient=[object.r, object.g, object.b];
 	ambient[]+=scene.model_light_add[];
+	float[3] static_ambient=ambient;
 	// the dynamic lights at the object (d3d_CalcLightAdd), unless FLAG_NOLIGHT
 	if (!(object.flags & ObjectFlag.NoLight))
 		ambient[]+=CalcLightAdd(object.pos, lights)[];
 	ambient[]*=scale[];
-	foreach(ref channel; ambient)
-		channel=channel<0f ? 0f : channel>255f ? 255f : channel;
+	static_ambient[]*=scale[];
+	foreach(i; 0..3)
+	{
+		ambient[i]=Clamp255(ambient[i]);
+		static_ambient[i]=Clamp255(static_ambient[i]);
+	}
+	// what the dynamic lights added (after the clamp), taken off the hook's result again for the modern lighting
+	float[3] dynamic_add;
+	dynamic_add[]=ambient[]-static_ambient[];
 
 	// the client shell may change the ambient light through the model hook
 	if (ModelHookFn hook=cast(ModelHookFn)scene.model_hook_fnc_ptr)
@@ -652,23 +670,42 @@ float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, con
 		draw_flags=cast(uint)data.object_flags;
 	}
 
-	float[3] directional;
+	float[3] modern_ambient;
 	foreach(i; 0..3)
-		directional[i]=(255f-ambient[i])*scale[i];
+		modern_ambient[i]=Clamp255(ambient[i]-dynamic_add[i]);
 
-	if (!(object.flags & ObjectFlag.NoLight))
+	const bool lit=!(object.flags & ObjectFlag.NoLight);
+	const float[3] grid=(lit && world) ? SampleLightGrid(world, object.pos) : [0f, 0f, 0f];
+	const float cloud=lit ? CloudLight(object.pos) : 1f;
+
+	// the light grid's directional light, capped so that ambient + directional stays within 255
+	float[3] Directional(const float[3] base_ambient)
 	{
-		const float[3] grid=world ? SampleLightGrid(world, object.pos) : [0f, 0f, 0f];
+		float[3] directional;
 		foreach(i; 0..3)
-		{
-			const float cap=directional[i];
-			directional[i]=(grid[i]+scene.model_dir_add[i])*scale[i];
-			if (directional[i]>cap)
-				directional[i]=cap;
-		}
+			directional[i]=(255f-base_ambient[i])*scale[i];
 
-		const float cloud=CloudLight(object.pos);
-		directional[]*=cloud;
+		if (lit)
+		{
+			foreach(i; 0..3)
+			{
+				const float cap=directional[i];
+				directional[i]=(grid[i]+scene.model_dir_add[i])*scale[i];
+				if (directional[i]>cap)
+					directional[i]=cap;
+			}
+			directional[]*=cloud;
+		}
+		return directional;
+	}
+	const float[3] directional=Directional(ambient);
+
+	modern.kind=LightingKind.Model;
+	const float[3] modern_directional=Directional(modern_ambient);
+	foreach(i; 0..3)
+	{
+		modern.ambient[i]=modern_ambient[i]/255f;
+		modern.directional[i]=modern_directional[i]/255f;
 	}
 
 	float[4][16] ramp;

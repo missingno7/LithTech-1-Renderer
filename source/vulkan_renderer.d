@@ -19,7 +19,7 @@ import RendererTypes;
 import Texture;
 import vk.Surface: ImageSurface;
 import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
-import SceneGeometry: ObjectGeometry;
+import SceneGeometry: ObjectGeometry, BatchLighting;
 import LTObjects: LTObject, DynamicLight;
 import EffectsDraw: EffectView;
 
@@ -62,19 +62,12 @@ VkResult VkCheck(VkResult result, string what)
 
 enum uint MaxLightCount=40;
 
+// lighting.glsl LightObj / LightList
 struct LightObj
 {
-	this(vec3 pos, vec3 colour, float radius, bool dont_light_backfacing)
-	{
-		this.pos=pos;
-		this.colour=colour;
-		this.radius=radius;
-		this.flags=dont_light_backfacing ? 1f : 0f;
-	}
-
 	vec3 pos;
-	float flags; // 1: FLAG_DONTLIGHTBACKFACING
-	vec3 colour;
+	float flags; // 1: FLAG_DONTLIGHTBACKFACING, 2: FLAG_ONLYLIGHTWORLD
+	vec3 colour; // 0..1
 	float radius;
 }
 
@@ -82,7 +75,10 @@ struct LightListUbo
 {
 	uint count;
 	float light_saturate=1f; // console LightSaturate, for the per-texel lightmap lights
-	private float[2] pad;
+	float modern_from_x=float.max; // the modern lighting from this framebuffer x on
+	float specular=0f;
+	float[4] camera; // eye position, falloff exponent
+	float[4] model_light; // towards the models' fixed light, specular exponent
 	LightObj[MaxLightCount] lights;
 }
 
@@ -421,6 +417,11 @@ public:
 	// surfaces (blood2_recon port_notes/world.md 4.1)
 	bool _saturate;
 	bool _debug_clear; // console "d_DebugClear": holes in the world in cornflower blue instead of black
+	// the modern lighting (lighting.glsl): console d_Lighting 1 lights per pixel with N.L and specular, d_Compare 1 draws
+	// the left half of the view the d3d.ren way for A/B comparisons; d_Specular and d_LightFalloff tune it
+	bool _modern_lighting, _compare;
+	float _specular=0.25f, _light_falloff=1f;
+	float _debug_light=0f; // console d_DebugLight, for the log
 	bool _widescreen=true; // console "d_Widescreen": Hor+ FOV correction (RenderScene)
 	float[2] _game_fov; // the scene's FOVs as the game gave them, for the log
 
@@ -493,19 +494,25 @@ public:
 		g_CloudLight=settings;
 	}
 
-	// shader.frag / object.frag push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
-	// 3 world fullbright), fog colour and switch, fog range, cloud panning
-	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World)
+	// world / object shader push constants: GlobalLightScale and texture mode (0 normal, 1 fullbright, 2 untextured,
+	// 3 world fullbright), fog colour and switch, fog range, cloud panning, and for objects how the batch is lit
+	enum uint PushConstantFloats=24;
+
+	void PushBatchConstants(VkCommandBuffer buffer, float texture_mode, FogKind fog=FogKind.World,
+		const BatchLighting lighting=BatchLighting.init)
 	{
 		const float[2] range=fog==FogKind.Sky ? _sky_fog_range : _fog_range;
 		const bool fog_on=_fog_enable && fog!=FogKind.None && range[0]!=range[1];
-		const float[16] constants=[
+		const float[PushConstantFloats] constants=[
 			_global_light_scale[0], _global_light_scale[1], _global_light_scale[2], texture_mode,
 			_fog_colour[0], _fog_colour[1], _fog_colour[2], fog_on ? 1f : 0f,
 			range[0], range[1], _fog_by_distance ? 1f : 0f, _saturate ? 1f : 0f,
-			_cloud_pan[0], _cloud_pan[1], _cloud_pan[2], _cloud_pan[3]
+			_cloud_pan[0], _cloud_pan[1], _cloud_pan[2], _cloud_pan[3],
+			lighting.ambient[0], lighting.ambient[1], lighting.ambient[2], cast(float)lighting.kind,
+			lighting.directional[0], lighting.directional[1], lighting.directional[2], 0f
 		];
-		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
+		vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+			constants.sizeof, constants.ptr);
 	}
 
 	void ReadFogSettings()
@@ -528,6 +535,12 @@ public:
 		_saturate=ConsoleFloat("Saturate", 0f)!=0f;
 		_debug_clear=ConsoleFloat("d_DebugClear", 0f)!=0f;
 		_widescreen=ConsoleFloat("d_Widescreen", 1f)!=0f;
+		_modern_lighting=ConsoleFloat("d_Lighting", 0f)!=0f;
+		_compare=ConsoleFloat("d_Compare", 0f)!=0f;
+		_specular=ConsoleFloat("d_Specular", 0.25f);
+		_light_falloff=ConsoleFloat("d_LightFalloff", 1f);
+		if (!(_light_falloff>0.1f && _light_falloff<8f))
+			_light_falloff=1f;
 	}
 
 	//// Window: borderless fullscreen on the window's monitor (3D at the monitor's resolution), or with the engine's
@@ -1416,9 +1429,11 @@ LAB_0004814b:
 			// polygrid, line system, container), object vertices
 			uint[9] objects_per_frame=_object_type_counts[1..$];
 			objects_per_frame[]/=_fps_frames;
-			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d fog: %s %s %s", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
+			test_out.writefln("fps: %.1f scenes: %.1f objects: %s vertices: %d sky objects: %d lights: %d fog: %s %s %s", _fps_frames/(elapsed.total!"usecs"/1_000_000.0),
 				cast(float)_scene_count/_fps_frames, objects_per_frame, _object_vertex_count/_fps_frames, _sky_object_count,
-				_fog_enable, _fog_range, _fog_colour);
+				_world_lights.length, _fog_enable, _fog_range, _fog_colour);
+			test_out.writefln("  lighting: %s, compare %s, specular %.2f, falloff %.2f, debug light %.0f", _modern_lighting ? "modern" : "d3d.ren",
+				_compare, _specular, _light_falloff, _debug_light);
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
 			if (_interval_count>0)
@@ -2059,6 +2074,8 @@ LAB_0004814b:
 		const float[3] up=[camera.m[0][1], camera.m[1][1], camera.m[2][1]];
 		const float[3] forward=[camera.m[0][2], camera.m[1][2], camera.m[2][2]];
 		const float[3] light_direction=Normalised([2f*up[0]-forward[0], 2f*up[1]-forward[1], 2f*up[2]-forward[2]]);
+		if (normal_mode)
+			_model_light_direction=light_direction;
 
 		RenderTexture ResolveTexture(SharedTexture* texture)
 		{
@@ -2080,11 +2097,23 @@ LAB_0004814b:
 						(object.flags & 0x80))
 						return;
 					const light=DynamicLight(object.pos, [cast(float)object.r, cast(float)object.g, cast(float)object.b],
-						At!float(object, LightRadiusOffset));
+						At!float(object, LightRadiusOffset), object.flags);
 					_world_lights~=light;
 					if (!(object.flags & 0x20) && _scene_lights.length<40)
 						_scene_lights~=light;
 				});
+
+			// diagnostic: console "d_DebugLight <radius>" adds a warm white light 40 units ahead of the camera, a steady
+			// dynamic light for checking the lighting anywhere
+			const float debug_radius=_debug_light=ConsoleFloat("d_DebugLight", 0f);
+			if (debug_radius>0f)
+			{
+				const float[3] position=[scene_desc.camera_position.x+forward[0]*40f, scene_desc.camera_position.y+forward[1]*40f,
+					scene_desc.camera_position.z+forward[2]*40f];
+				const light=DynamicLight(position, [255f, 235f, 210f], debug_radius, 0);
+				_world_lights=light~_world_lights;
+				_scene_lights=(light~_scene_lights)[0..($<40 ? $ : 40)];
+			}
 		}
 
 		import std.math: tan;
@@ -2151,7 +2180,7 @@ LAB_0004814b:
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
 					_objects.Route(DrawGroup.SolidWorldModels, ObjectPipe.Opaque, DrawGroup.TranslucentWorldModels, ObjectPipe.Blend);
-					DrawWorldModel(_objects, object, scene_desc, _world_lights, &ResolveTexture);
+					DrawWorldModel(_objects, object, scene_desc, &ResolveTexture);
 					break;
 				case ObjectType.Sprite:
 					if (draw_sprites)
@@ -2255,8 +2284,9 @@ LAB_0004814b:
 		_objects.End();
 	}
 
-	DynamicLight[] _scene_lights; // lights for objects
-	DynamicLight[] _world_lights; // lights for world model polies
+	DynamicLight[] _scene_lights; // lights for models (d3d.ren's CPU light ramp)
+	DynamicLight[] _world_lights; // every light, for the GPU's light list
+	float[3] _model_light_direction=[0f, 1f, 0f]; // towards the models' fixed light, of the last normal scene
 	int _sky_object_count; // of the last normal scene, for the log
 
 	// d3d.ren r_DrawSky / sky-object pass (port_notes/sky.md): the sky objects seen from a sky camera that moves through
@@ -2519,7 +2549,7 @@ LAB_0004814b:
 				// lines and the light-add poly are never fogged; the sky uses the sky fog range
 				const FogKind fog=batch.no_fog ? FogKind.None : group==DrawGroup.Sky ? FogKind.Sky :
 					(group==DrawGroup.LineSystems || group==DrawGroup.LightAdd) ? FogKind.None : FogKind.World;
-				PushBatchConstants(buffer, cast(float)batch.mode, fog);
+				PushBatchConstants(buffer, cast(float)batch.mode, fog, batch.lighting);
 				vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
 			}
 		}
@@ -3011,9 +3041,9 @@ private:
 		// per texture batch: GlobalLightScale and texture mode, fog colour, fog range, cloud panning (shader.frag /
 		// object.frag)
 		VkPushConstantRange push_constant_range={
-			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT,
+			stageFlags: VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 			offset: 0,
-			size: float.sizeof*16
+			size: float.sizeof*PushConstantFloats
 		};
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: pipeline_descriptor_layouts.length,
@@ -3210,10 +3240,7 @@ private:
 
 	void UpdateLightListUbo(uint image_index)
 	{
-		import Main: g_IsIn3D, g_RenderContext;
-		import Objects.BaseObject;
-		import Objects.Light;
-		import WorldBsp: WorldBsp;
+		import Main: g_RenderContext;
 
 		import Main: _renderer;
 
@@ -3224,47 +3251,28 @@ private:
 		}
 
 		// the lights d3d.ren links to world polies (d3d_world_light_add.cpp, 0x241d0): all visible lights but FogLight
-		// ones (flag 0x80), including FLAG_ONLYLIGHTWORLD ones; console DynamicLight 0 turns them off
+		// ones (flag 0x80), including FLAG_ONLYLIGHTWORLD ones, gathered by CollectObjects (console DynamicLight 0 turns
+		// them off there)
 		LightListUbo ubo;
 		ubo.light_saturate=ConsoleFloat("LightSaturate", 1f);
-		if (g_RenderContext !is null && ConsoleFloat("DynamicLight", 1f)!=0f)
-		{
-			debug(FrameTrace) test_out.writeln("--- Updating Light List");
-
-			WorldBsp* bsp=g_RenderContext.main_world.world_bsp;
-
-			void ProcessNodeLights(Node* node)
+		if (g_RenderContext !is null)
+			foreach(ref light; _world_lights)
 			{
-				if (node.objects!=null)
-				{
-					ObjectList* curr=node.objects.prev;
-
-					while(curr!=node.objects)
-					{
-						BaseObject* obj=curr.data;
-
-						if (obj.class_!=null) break;
-
-						if ((obj.flags & ObjectFlags.Visible) && !(obj.flags & ObjectFlags.SkyObject) && obj.type_id==ObjectType.Light)
-						{
-							if (ubo.count<MaxLightCount && !(obj.flags & ObjectFlags.FogLight))
-							{
-								ubo.lights[ubo.count++]=LightObj(obj.position, vec3(obj.colour[0]/255f, obj.colour[1]/255f, obj.colour[2]/255f),
-									obj.ToLight().radius, (obj.flags & ObjectFlags.DontLightBackfaces)!=0);
-							}
-						}
-						curr=curr.prev;
-					}
-				}
-
-				if (node.next[0].flags & 8)
-					ProcessNodeLights(node.next[0]);
-				if (node.next[1].flags & 8)
-					ProcessNodeLights(node.next[1]);
+				if (ubo.count>=MaxLightCount)
+					break;
+				const float flags=((light.flags & 0x40) ? 1f : 0f)+((light.flags & 0x20) ? 2f : 0f);
+				ubo.lights[ubo.count++]=LightObj(vec3(light.pos), flags, vec3(light.colour[0]/255f, light.colour[1]/255f,
+					light.colour[2]/255f), light.radius);
 			}
 
-			ProcessNodeLights(bsp.root_node);
-		}
+		// where the modern lighting applies: everywhere, nowhere, or the right half of the view (d_Compare)
+		if (_compare)
+			ubo.modern_from_x=_scene_viewport.x+_scene_viewport.width*0.5f;
+		else
+			ubo.modern_from_x=_modern_lighting ? -1f : float.max;
+		ubo.specular=_specular>0f ? _specular : 0f;
+		ubo.camera=[camera_pos.x, camera_pos.y, camera_pos.z, _light_falloff];
+		ubo.model_light=[_model_light_direction[0], _model_light_direction[1], _model_light_direction[2], 48f];
 
 		debug(FrameTrace) test_out.writeln(ubo);
 

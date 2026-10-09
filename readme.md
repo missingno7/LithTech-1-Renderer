@@ -88,6 +88,16 @@ two states of a modern game: with focus the cursor is hidden and held in the mid
 focus it's visible and free. The game also asks for the foreground when it starts. Alt+Tab is still handled by the
 engine, which unloads the renderer and loads it again on return.
 
+### Modern lighting
+`d_Lighting 1` replaces d3d.ren's dynamic-light formulas with per-pixel lighting. Muzzle flashes, explosions and the
+levels' light effects then light the world, world models and characters per pixel with the surface's orientation
+(N·L), with a smooth falloff and restrained specular highlights. Characters keep d3d.ren's light from the level's light
+grid but without its 16 visible steps. The baked lightmaps and pre-lit colours are unchanged, and so is everything with
+`d_Lighting 0` (the default for now). Lighting stays in gamma space like the original.
+
+For comparisons, `d_Compare 1` draws the left half of the view the d3d.ren way and the right half with the current
+settings. `d_DebugLight <radius>` adds a steady light just ahead of the camera, so the lighting can be checked anywhere.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
@@ -103,6 +113,11 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
 | `d_GPU` | 0 | Which Vulkan adapter to use, by its index in the device list at the top of `vk_test.txt`. |
+| `d_Lighting` | 0 | 1: per-pixel dynamic lights with N·L and specular (see *Modern lighting*). |
+| `d_Specular` | 0.25 | Specular strength of the modern lighting; 0 turns it off. |
+| `d_LightFalloff` | 1 | Exponent of the modern lighting's falloff `(1 - d²/r²)^n`; 1 is d3d.ren's lightmap curve, higher is softer. |
+| `d_Compare` | 0 | 1: left half of the view as d3d.ren, right half with the current settings. |
+| `d_DebugLight` | 0 | Radius of a test light ahead of the camera; 0 = none. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |
 | `DrawSky`, `DrawSprites`, `DrawParticles`, `DrawPolyGrids`, `DrawLineSystems`, `LightAddPoly` | 1 | Turn object types off. |
 

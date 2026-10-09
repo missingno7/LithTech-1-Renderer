@@ -313,6 +313,7 @@ struct DynamicLight
 	float[3] pos;
 	float[3] colour; // 0..255
 	float radius;
+	uint flags; // the light object's flags (FLAG_ONLYLIGHTWORLD 0x20, FLAG_DONTLIGHTBACKFACING 0x40)
 }
 
 // d3d_CalcLightAdd (recon common/3d_ops.cpp): (2c - 255) * 0.7 * (1 - d/r) per light, summed; 0..255 scale

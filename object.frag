@@ -4,12 +4,21 @@ layout(set=0, binding=1) uniform sampler tex_sampler;
 layout(set=0, binding=3) uniform texture2D lightmap_atlas;
 layout(set=1, binding=0) uniform texture2D tex;
 
+#define FRAGMENT_SHADER
+#extension GL_GOOGLE_include_directive: require
+#include "lighting.glsl"
+
 layout(push_constant) uniform PushConstants {
 	// w: 0 normal texture, 1 DTX_FULLBRITE texture on a model (DECAL pass), 2 untextured (lines, polygrids without a
 	// sprite, the light-add poly), 3 DTX_FULLBRITE texture on a world surface (added on top)
 	vec4 light_scale_mode;
 	vec4 fog_colour; // rgb 0..1, w: 1 = fog on (off for lines, fullbright passes and the light-add poly)
 	vec4 fog_range; // x: near, y: far
+	vec4 cloud; // world only
+	// the modern lighting: rgb the model's ambient light (0..1, no dynamic lights in it); w: lighting kind, 0 pre-lit,
+	// 1 model, 2 world polies
+	vec4 ambient;
+	vec4 directional; // rgb: the model's directional light (light grid), towards light_list.model_light
 } pc;
 
 layout(location=0) in vec4 colour_in;
@@ -17,39 +26,10 @@ layout(location=1) in vec2 uv_in; // normalised, like D3D TL vertices (model UVs
 layout(location=2) in vec3 lightmap_in;
 layout(location=3) in float eye_depth_in;
 layout(location=4) in vec3 world_position_in;
+layout(location=5) in vec3 normal_in;
+layout(location=6) in vec3 base_colour_in;
 
 layout(location=0) out vec4 colour_out;
-
-#define MAX_LIGHT_COUNT 40
-
-struct LightObj
-{
-	vec3 position; float flags;
-	vec3 colour;
-	float radius;
-};
-
-layout(set=0, binding=2) uniform LightList {
-	uint count; float light_saturate, pad1, pad2;
-	LightObj lights[MAX_LIGHT_COUNT];
-} light_list;
-
-// the per-texel dynamic lights of a lightmapped poly (shader.frag DynamicLightmap; blood2_recon port_notes/world.md
-// 5.2), for solid world models
-vec3 DynamicLightmap()
-{
-	vec3 light=vec3(0.0);
-	for(uint i=0; i<light_list.count; ++i)
-	{
-		LightObj obj=light_list.lights[i];
-		vec3 to_light=obj.position-world_position_in;
-		float d2=dot(to_light, to_light), r2=obj.radius*obj.radius;
-		if (d2>=r2) continue;
-		float k=floor((1.0-d2/r2)*63.0);
-		light+=(2.0*obj.colour-1.0)*min(1.0, light_list.light_saturate*k/63.0);
-	}
-	return light;
-}
 
 float FogFactor()
 {
@@ -80,13 +60,22 @@ void main()
 
 	vec4 texel=texture(sampler2D(tex, tex_sampler), uv_in);
 
+	// the modern lighting replaces the vertex / texel lights of lit geometry with per-pixel ones (lighting.glsl)
+	float kind=pc.ambient.w;
+	bool modern=kind>0.5 && dot(normal_in, normal_in)>1e-6 && Modern();
+	vec3 modern_diffuse=vec3(0.0), modern_specular=vec3(0.0);
+	vec3 normal=modern ? normalize(normal_in) : vec3(0.0);
+	if (modern)
+		ModernLights(world_position_in, normal, kind<1.5, modern_diffuse, modern_specular);
+
 	vec3 colour;
 	vec3 fullbright_add;
 	if (lightmap_in.z>0.5)
 	{
 		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
 		// the vertex colour is GlobalLightScale here
-		vec3 light=clamp(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb+DynamicLightmap(), 0.0, 1.0)*
+		vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false);
+		vec3 light=clamp(texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb+texel_light, 0.0, 1.0)*
 			colour_in.rgb;
 		vec3 fogged_texel=Fog(texel.rgb, fog);
 		colour=Fog(light, fog)*fogged_texel;
@@ -98,9 +87,19 @@ void main()
 	else
 	{
 		// D3D MODULATE(ALPHA): colour modulated by the texture
-		colour=Fog(colour_in.rgb*texel.rgb, fog);
+		vec3 light=colour_in.rgb;
+		if (modern && kind<1.5)
+		{
+			// a model: d3d.ren's 16-step ramp, ambient + directional * step / 16 with step = 8 + 7.94 (N.L), made smooth
+			float ramp=clamp(0.5+0.49609375*dot(normal, light_list.model_light.xyz), 0.0, 15.0/16.0);
+			light=clamp(pc.ambient.rgb+pc.directional.rgb*ramp+modern_diffuse, 0.0, 1.0);
+		}
+		else if (modern)
+			light=clamp(base_colour_in+modern_diffuse, 0.0, 1.0);
+		colour=Fog(light*texel.rgb, fog);
 		fullbright_add=texel.rgb*texel.a;
 	}
+	colour+=modern_specular*Gloss(texel.rgb)*fog;
 
 	if (mode>2.5)
 	{
