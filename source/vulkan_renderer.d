@@ -755,6 +755,35 @@ public:
 		+/
 	}
 
+	// The world file the single-player server loaded, e.g. "Worlds_steamtunnels.dat" (null if it can't be read):
+	// g_pServerMgr (CLIENT.EXE RVA 0x91728) +0x1a4 m_pWorldFile, a UsedFile whose first field is the hash element
+	// keyed by the file name, the key at +0x16 (blood2_recon servermgr_lt1.h, dhashtable.cpp HashElement). The world
+	// file has the level's static lights, which the engine never creates (tools/world_objects.py).
+	string LoadedWorldFile()
+	{
+		ubyte* exe=cast(ubyte*)GetModuleHandleA(null);
+		if (exe is null || IsBadReadPtr(exe+0x91728, 4))
+			return null;
+		ubyte* server=*cast(ubyte**)(exe+0x91728);
+		if (server is null || IsBadReadPtr(server+0x1a4, 4))
+			return null;
+		ubyte* used_file=*cast(ubyte**)(server+0x1a4);
+		if (used_file is null || IsBadReadPtr(used_file, 4))
+			return null;
+		ubyte* element=*cast(ubyte**)used_file;
+		if (element is null || IsBadReadPtr(element+0x14, 2))
+			return null;
+		const ushort length=*cast(ushort*)(element+0x14);
+		if (length==0 || length>260 || IsBadReadPtr(element+0x16, length))
+			return null;
+		// the key's length may or may not count a terminator
+		const(char)[] key=(cast(const(char)*)(element+0x16))[0..length];
+		foreach(i, c; key)
+			if (c==0)
+				return key[0..i].idup;
+		return key.idup;
+	}
+
 	//// Camera bookmarks, for repeatable tests: console "d_ViewSave <name>" stores the camera in d_ren_views.txt (in the
 	//// game folder, one "name x y z qx qy qz qw" line each), "d_View <name>" renders from that camera instead of the
 	//// player's until "d_View 0". d_ren draws the whole level every frame, so any viewpoint works without moving the
@@ -2060,6 +2089,7 @@ LAB_0004814b:
 		string json="{\n";
 		json~=format("  \"name\": %s, \"width\": %d, \"height\": %d, \"pixel_order\": %s,\n", JsonString(name), width, height,
 			JsonString(bgra ? "bgra" : "rgba"));
+		json~=format("  \"world\": %s,\n", JsonString(LoadedWorldFile()));
 		json~=format("  \"viewport\": %s,\n", JsonFloats([_scene_viewport.x, _scene_viewport.y, _scene_viewport.width, _scene_viewport.height]));
 		json~=format("  \"camera\": {\"position\": %s, \"rotation\": %s, \"fov\": %s, \"near\": 0.1, \"far\": 15000},\n",
 			JsonFloats(camera_pos.vector), JsonFloats([camera_view.x, camera_view.y, camera_view.z, camera_view.w]), JsonFloats([fov_x, fov_y]));
@@ -4865,6 +4895,7 @@ private:
 		FindAnimatedSurfaces(bsp, vert_buffer);
 
 		test_out.writeln("-- End create BSP, ", vert_buffer.length);
+		test_out.writeln("World file: ", LoadedWorldFile());
 	}
 
 	//// Surface effects (Pan, Rotate, Warble: the train's scrolling tunnel, ...). Each frame the engine moves the
