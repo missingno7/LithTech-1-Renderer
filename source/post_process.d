@@ -2,14 +2,15 @@ module PostProcess;
 
 /+
  + Post-processing: with any post effect on, the 3D scene renders into an offscreen colour image (scene_pass, compatible
- + with the main render pass, so every scene pipeline works in it). A second pass (present_pass) then draws post.frag
+ + with the main render pass, so every scene pipeline works in it). Bloom adds a float source attachment alongside
+ + that original UNORM colour, using its matching scene pipelines. A second pass (present_pass) then draws post.frag
  + over the whole swapchain image, sampling that image, and the 2D layer goes on top, so the HUD and menus are never
  + post-processed. With every effect off the renderer keeps drawing straight into the swapchain as before.
  +/
 
 import erupted;
 import Memory: g_Allocator, CreateAllocImage, DestroyAllocImage;
-import VulkanRender: g_Device, test_out, VkCheck, Shader;
+import VulkanRender: g_Device, g_PhysicalDevice, test_out, VkCheck, Shader;
 
 // post.frag's effects; the values are the console's d_AntiAliasing
 enum AntiAliasing { Off, Fxaa }
@@ -17,6 +18,7 @@ enum AntiAliasing { Off, Fxaa }
 struct PostProcess
 {
 	VkRenderPass scene_pass; // the main pass' attachments, colour left readable by the fragment shader
+	VkRenderPass hdr_pass, bloom_pass;
 	VkRenderPass present_pass; // the swapchain image only: post.frag, then the 2D layer
 
 	VkImage scene_image;
@@ -34,10 +36,28 @@ struct PostProcess
 	VkPipeline pipeline;
 	VkShaderModule vert_shader, frag_shader;
 	VkFormat colour_format;
+	enum HdrFormat=VK_FORMAT_R16G16B16A16_SFLOAT;
+	enum Levels=5;
+	struct Target { VkImage image; VkMappedMemoryRange memory; VkImageView view; VkFramebuffer framebuffer; VkExtent2D size; }
+	Target hdr;
+	Target[Levels] down;
+	Target[Levels-1] up;
+	VkDescriptorSet hdr_set;
+	VkDescriptorSet[Levels] down_sets;
+	VkDescriptorSet[Levels-1] up_sets;
+	VkPipeline bloom_pipeline;
+	bool bloom_supported;
+
 
 	void Create(VkFormat colour_format_, VkFormat depth_format)
 	{
 		colour_format=colour_format_;
+		VkFormatProperties properties;
+		vkGetPhysicalDeviceFormatProperties(g_PhysicalDevice, HdrFormat, &properties);
+		const VkFormatFeatureFlags required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+			VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+		bloom_supported=(properties.optimalTilingFeatures & required)==required;
+		if (!bloom_supported) test_out.writeln("Bloom unavailable: RGBA16F attachment/blend/linear sampling unsupported");
 		CreateRenderPasses(depth_format);
 
 		VkSamplerCreateInfo sampler_info={
@@ -57,18 +77,25 @@ struct PostProcess
 			descriptorCount: 1,
 			stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT
 		};
-		VkDescriptorSetLayoutCreateInfo layout_info={ bindingCount: 1, pBindings: &binding };
+		VkDescriptorSetLayoutBinding[2] bindings=[binding, binding];
+		bindings[1].binding=1;
+		VkDescriptorSetLayoutCreateInfo layout_info={ bindingCount: 2, pBindings: bindings.ptr };
 		VkCheck(vkCreateDescriptorSetLayout(g_Device, &layout_info, null, &set_layout), "vkCreateDescriptorSetLayout (post)");
 
-		VkDescriptorPoolSize pool_size={ type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: 1 };
-		VkDescriptorPoolCreateInfo pool_info={ poolSizeCount: 1, pPoolSizes: &pool_size, maxSets: 1 };
+		VkDescriptorPoolSize pool_size={ type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: 24 };
+		VkDescriptorPoolCreateInfo pool_info={ poolSizeCount: 1, pPoolSizes: &pool_size, maxSets: 12 };
 		VkCheck(vkCreateDescriptorPool(g_Device, &pool_info, null, &pool), "vkCreateDescriptorPool (post)");
 
 		VkDescriptorSetAllocateInfo alloc_info={ descriptorPool: pool, descriptorSetCount: 1, pSetLayouts: &set_layout };
 		VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &set), "vkAllocateDescriptorSets (post)");
 
+		alloc_info.pSetLayouts=&set_layout;
+		VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &hdr_set), "post HDR set");
+		foreach(ref d; down_sets) VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &d), "post down set");
+		foreach(ref d; up_sets) VkCheck(vkAllocateDescriptorSets(g_Device, &alloc_info, &d), "post up set");
+
 		// push constants: 1 / width, 1 / height, the anti-aliasing mode, where the effects start (x)
-		VkPushConstantRange push_range={ stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT, offset: 0, size: float.sizeof*4 };
+		VkPushConstantRange push_range={ stageFlags: VK_SHADER_STAGE_FRAGMENT_BIT, offset: 0, size: float.sizeof*8 };
 		VkPipelineLayoutCreateInfo pipeline_layout_info={
 			setLayoutCount: 1,
 			pSetLayouts: &set_layout,
@@ -80,11 +107,19 @@ struct PostProcess
 		vert_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("overlay_vert.spv")); // fullscreen triangle
 		frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("post_frag.spv"));
 		CreatePipeline();
+		VkRenderPass saved=present_pass;
+		present_pass=bloom_pass;
+		VkPipeline saved_pipeline=pipeline;
+		CreatePipeline();
+		bloom_pipeline=pipeline;
+		pipeline=saved_pipeline;
+		present_pass=saved;
 	}
 
 	void Destroy()
 	{
 		DestroyTargets();
+		vkDestroyPipeline(g_Device, bloom_pipeline, null);
 		vkDestroyPipeline(g_Device, pipeline, null);
 		vkDestroyPipelineLayout(g_Device, layout, null);
 		vkDestroyShaderModule(g_Device, vert_shader, null);
@@ -92,6 +127,8 @@ struct PostProcess
 		vkDestroyDescriptorPool(g_Device, pool, null);
 		vkDestroyDescriptorSetLayout(g_Device, set_layout, null);
 		vkDestroySampler(g_Device, sampler, null);
+		vkDestroyRenderPass(g_Device, hdr_pass, null);
+		vkDestroyRenderPass(g_Device, bloom_pass, null);
 		vkDestroyRenderPass(g_Device, scene_pass, null);
 		vkDestroyRenderPass(g_Device, present_pass, null);
 	}
@@ -161,10 +198,31 @@ struct PostProcess
 			pImageInfo: &image_descriptor
 		};
 		vkUpdateDescriptorSets(g_Device, 1, &write, 0, null);
+		WriteSet(set, scene_view, scene_view);
+	}
+
+	// Allocate the float scene and pyramid only when bloom is first enabled. The original
+	// path pays no extra image-memory cost; resize/destruction releases these with the other targets.
+	void EnsureBloomTargets(VkImageView depth_view)
+	{
+		if (hdr.image!=VK_NULL_ND_HANDLE) return;
+		CreateTarget(hdr, extent, hdr_pass, depth_view);
+		VkExtent2D size=extent;
+		foreach(i; 0..Levels) {
+			size=VkExtent2D(size.width>1 ? (size.width+1)/2 : 1, size.height>1 ? (size.height+1)/2 : 1);
+			CreateTarget(down[i], size, bloom_pass);
+			if (i<Levels-1) CreateTarget(up[i], size, bloom_pass);
+		}
+		WriteSet(hdr_set, scene_view, up[0].view);
+		foreach(i; 0..Levels) WriteSet(down_sets[i], i==0 ? hdr.view : down[i-1].view, hdr.view);
+		foreach(i; 0..Levels-1) WriteSet(up_sets[i], i==Levels-2 ? down[i+1].view : up[i+1].view, down[i].view);
 	}
 
 	void DestroyTargets()
 	{
+		DestroyTarget(hdr);
+		foreach(ref t; down) DestroyTarget(t);
+		foreach(ref t; up) DestroyTarget(t);
 		foreach(framebuffer; present_framebuffers)
 			vkDestroyFramebuffer(g_Device, framebuffer, null);
 		present_framebuffers.length=0;
@@ -180,22 +238,73 @@ struct PostProcess
 	}
 
 	// inside present_pass: post.frag over the whole swapchain image
-	void Record(VkCommandBuffer buffer, AntiAliasing anti_aliasing, float from_x)
+	void Record(VkCommandBuffer buffer, AntiAliasing anti_aliasing, float from_x, bool bloom, float intensity)
 	{
 		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 		VkViewport viewport=VkViewport(0f, 0f, extent.width, extent.height, 0f, 1f);
 		vkCmdSetViewport(buffer, 0, 1, &viewport);
 		VkRect2D scissor=VkRect2D(VkOffset2D(0, 0), extent);
 		vkCmdSetScissor(buffer, 0, 1, &scissor);
-		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, null);
-		const float[4] constants=[1f/extent.width, 1f/extent.height, cast(float)anti_aliasing, from_x];
+		VkDescriptorSet descriptor=bloom ? hdr_set : set;
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptor, 0, null);
+		const float[8] constants=[1f/extent.width, 1f/extent.height, cast(float)anti_aliasing, from_x, 0f, 0f, bloom ? intensity : 0f, 0f];
 		vkCmdPushConstants(buffer, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
 		vkCmdDraw(buffer, 3, 1, 0, 0);
+	}
+
+	void CreateTarget(ref Target t, VkExtent2D size, VkRenderPass pass, VkImageView depth=VK_NULL_ND_HANDLE) {
+		t.size=size;
+		VkImageCreateInfo info={ imageType: VK_IMAGE_TYPE_2D, extent: {size.width, size.height, 1}, mipLevels: 1,
+			arrayLayers: 1, format: HdrFormat, tiling: VK_IMAGE_TILING_OPTIMAL, usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			samples: VK_SAMPLE_COUNT_1_BIT, sharingMode: VK_SHARING_MODE_EXCLUSIVE };
+		CreateAllocImage(g_Allocator, info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, t.image, &t.memory, null);
+		VkImageViewCreateInfo view={ image: t.image, viewType: VK_IMAGE_VIEW_TYPE_2D, format: HdrFormat,
+			subresourceRange: {aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, levelCount: 1, layerCount: 1} };
+		VkCheck(vkCreateImageView(g_Device, &view, null, &t.view), "bloom image view");
+		VkImageView[] views=depth==VK_NULL_ND_HANDLE ? [t.view] : [scene_view,t.view,depth];
+		VkFramebufferCreateInfo fb={renderPass: pass, attachmentCount: cast(uint)views.length,
+			pAttachments: views.ptr, width: size.width, height: size.height, layers: 1};
+		VkCheck(vkCreateFramebuffer(g_Device, &fb, null, &t.framebuffer), "bloom framebuffer");
+	}
+	void DestroyTarget(ref Target t) {
+		if (t.image==VK_NULL_ND_HANDLE) return;
+		vkDestroyFramebuffer(g_Device, t.framebuffer, null);
+		vkDestroyImageView(g_Device, t.view, null);
+		DestroyAllocImage(g_Allocator, t.image);
+		t=Target.init;
+	}
+	void WriteSet(VkDescriptorSet dst, VkImageView a, VkImageView b) {
+		VkDescriptorImageInfo[2] images=[{sampler: sampler, imageView: a, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+			{sampler: sampler, imageView: b, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}];
+		VkWriteDescriptorSet[2] writes;
+		foreach(i; 0..2) writes[i]=VkWriteDescriptorSet.init;
+		foreach(i; 0..2) { writes[i].dstSet=dst; writes[i].dstBinding=i; writes[i].descriptorCount=1;
+			writes[i].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[i].pImageInfo=&images[i]; }
+		vkUpdateDescriptorSets(g_Device, 2, writes.ptr, 0, null);
+	}
+	// Outside the scene/present passes: thresholded quad extraction, four blurred reductions, then four tent upsample/merge passes.
+	void RecordBloom(VkCommandBuffer buffer, float threshold, float from_x) {
+		void Pass(ref Target t, VkDescriptorSet descriptor, VkExtent2D source, float mode) {
+			VkRenderPassBeginInfo begin={renderPass: bloom_pass, framebuffer: t.framebuffer, renderArea: {extent: t.size}};
+			vkCmdBeginRenderPass(buffer, &begin, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bloom_pipeline);
+			VkViewport vp=VkViewport(0, 0, t.size.width, t.size.height, 0, 1);
+			VkRect2D rect=VkRect2D(VkOffset2D(0, 0), t.size);
+			vkCmdSetViewport(buffer, 0, 1, &vp); vkCmdSetScissor(buffer, 0, 1, &rect);
+			vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptor, 0, null);
+			float[8] pc=[1f/source.width, 1f/source.height, 0f, from_x/extent.width, mode, threshold, 0f, 0f];
+			vkCmdPushConstants(buffer, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc.sizeof, pc.ptr);
+			vkCmdDraw(buffer, 3, 1, 0, 0); vkCmdEndRenderPass(buffer);
+		}
+		foreach(i; 0..Levels) Pass(down[i], down_sets[i], i==0 ? extent : down[i-1].size, i==0 ? 1f : 2f);
+		foreach_reverse(i; 0..Levels-1) Pass(up[i], up_sets[i], down[i+1].size, 3f);
 	}
 
 private:
 	void CreateRenderPasses(VkFormat depth_format)
 	{
+		hdr_pass=MakeScenePass(colour_format, depth_format, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, false, bloom_supported ? HdrFormat : colour_format);
+		bloom_pass=MakeColourPass(bloom_supported ? HdrFormat : colour_format, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		scene_pass=MakeScenePass(colour_format, depth_format, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, false);
 		present_pass=MakeColourPass(colour_format, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 	}
@@ -245,9 +354,9 @@ private:
 
 // A render pass with the main pass' attachments (so the scene pipelines work in it): colour cleared, ending in
 // colour_final; depth cleared, kept when store_depth.
-VkRenderPass MakeScenePass(VkFormat colour_format, VkFormat depth_format, VkImageLayout colour_final, bool store_depth)
+VkRenderPass MakeScenePass(VkFormat colour_format, VkFormat depth_format, VkImageLayout colour_final, bool store_depth, VkFormat bloom_format=VK_FORMAT_UNDEFINED)
 {
-	VkAttachmentDescription[2] attachments=[
+	VkAttachmentDescription[] attachments=[
 		{
 			format: colour_format,
 			samples: VK_SAMPLE_COUNT_1_BIT,
@@ -269,12 +378,18 @@ VkRenderPass MakeScenePass(VkFormat colour_format, VkFormat depth_format, VkImag
 			finalLayout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
 		}
 	];
-	VkAttachmentReference colour_ref={ attachment: 0, layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-	VkAttachmentReference depth_ref={ attachment: 1, layout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+	VkAttachmentReference[] colour_refs=[{ attachment: 0, layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }];
+	if (bloom_format!=VK_FORMAT_UNDEFINED) {
+		VkAttachmentDescription source=attachments[0];
+		source.format=bloom_format;
+		attachments=[attachments[0],source,attachments[1]];
+		colour_refs~=VkAttachmentReference(1,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	}
+	VkAttachmentReference depth_ref={ attachment: cast(uint)attachments.length-1, layout: VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 	VkSubpassDescription subpass={
 		pipelineBindPoint: VK_PIPELINE_BIND_POINT_GRAPHICS,
-		colorAttachmentCount: 1,
-		pColorAttachments: &colour_ref,
+		colorAttachmentCount: cast(uint)colour_refs.length,
+		pColorAttachments: colour_refs.ptr,
 		pDepthStencilAttachment: &depth_ref
 	};
 	VkSubpassDependency[2] dependencies=[
@@ -333,7 +448,7 @@ VkRenderPass MakeColourPass(VkFormat format, VkImageLayout final_layout)
 		{
 			srcSubpass: VK_SUBPASS_EXTERNAL,
 			dstSubpass: 0,
-			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			srcAccessMask: 0,
 			dstStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			dstAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
@@ -343,8 +458,8 @@ VkRenderPass MakeColourPass(VkFormat format, VkImageLayout final_layout)
 			dstSubpass: VK_SUBPASS_EXTERNAL,
 			srcStageMask: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			srcAccessMask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			dstStageMask: VK_PIPELINE_STAGE_TRANSFER_BIT,
-			dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT
+			dstStageMask: VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT
 		}
 	];
 	VkRenderPassCreateInfo info={

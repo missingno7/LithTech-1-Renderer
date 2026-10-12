@@ -31,6 +31,7 @@ layout(location=5) in vec3 normal_in;
 layout(location=6) in vec3 base_colour_in;
 
 layout(location=0) out vec4 colour_out;
+layout(location=1) out vec4 bloom_source_out;
 
 float FogFactor()
 {
@@ -51,6 +52,7 @@ void main()
 {
 	float mode=pc.light_scale_mode.w;
 	float fog=FogFactor();
+	bloom_source_out=vec4(0.0);
 
 	if (mode>1.5 && mode<2.5)
 	{
@@ -80,90 +82,105 @@ void main()
 	vec3 baked_world=lightmap_in.z>0.5 ? texture(sampler2D(lightmap_atlas, tex_sampler), lightmap_in.xy).rgb : base_colour_in;
 	vec3 shadow_loss=(kind>1.5 && ShadowsOn()) ? WorldShadowLoss(world_position_in, normal, baked_world, caster) : vec3(0.0);
 
-	vec3 colour;
-	vec3 fullbright_add;
-	vec3 debug_light, debug_dynamic; // for the debug views
-	if (lightmap_in.z>0.5)
-	{
-		// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
-		// the vertex colour is GlobalLightScale here
-		vec3 texel_light=modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false);
-		vec3 lightmap=Unshadowed(baked_world, shadow_loss);
-		vec3 light=clamp(lightmap+texel_light, 0.0, 1.0)*colour_in.rgb;
-		debug_light=light;
-		debug_dynamic=texel_light;
-		vec3 fogged_texel=Fog(texel.rgb, fog);
-		colour=Fog(light, fog)*fogged_texel;
-		fullbright_add=fogged_texel*texel.a;
-		// "Saturate": the texture pass is SRCBLEND DESTCOLOR, twice the product (not for fullbright textures' own batch)
-		if (mode<2.5 && pc.fog_range.w>0.5)
-			colour*=2.0;
-	}
-	else
-	{
-		// D3D MODULATE(ALPHA): colour modulated by the texture
-		vec3 light=colour_in.rgb;
-		// a model: d3d.ren's 16-step ramp, ambient + directional * step / 16 with step = 8 + 7.94 (N.L), made smooth
-		float ramp=clamp(0.5+0.49609375*dot(normal, light_list.model_light.xyz), 0.0, 15.0/16.0);
-		vec3 model_static=pc.ambient.rgb+pc.directional.rgb*ramp;
-		// the classic dynamic part: what d3d.ren's ramp or vertex lights added over the static light
-		debug_dynamic=kind<0.5 ? vec3(0.0) : colour_in.rgb-(kind<1.5 ? model_static : base_colour_in);
-		// with the level's lamps known, a model is lit by the actual lamps around it, each from its direction, shadowed
-		// where other models hide it; the light grid's light they don't account for stays as the camera-relative term
-		int lamp_set=int(pc.extra.x);
-		if (modern && kind<1.5 && lamp_set>=0 && static_lighting.counts.w!=0u && uint(lamp_set)<static_lighting.counts.y)
+	vec3 texel_dynamic=lightmap_in.z>0.5 ? (modern ? modern_diffuse : ClassicTexelLight(world_position_in, normal_in, false)) : vec3(0.0);
+	vec3 cached_model_static=vec3(0.0);
+	vec4 raw_shaded=vec4(0.0);
+	for(int pass=0; pass<3; ++pass) {
+		bool hdr=pass>0;
+		vec4 shaded;
+		vec3 colour;
+		vec3 fullbright_add;
+		vec3 debug_light, debug_dynamic; // for the debug views
+		if (lightmap_in.z>0.5)
 		{
-			vec3 lamps=static_lighting.models[lamp_set].residual_count.rgb*ramp;
-			uint count=uint(static_lighting.models[lamp_set].residual_count.w);
-			bool shadows=ShadowsOn();
-			for(uint i=0u; i<count; ++i)
-			{
-				StaticLamp lamp=static_lighting.models[lamp_set].lamps[i];
-				vec3 c=LampAt(lamp, world_position_in);
-				if (c==vec3(0.0))
-					continue;
-				float facing=clamp(0.5+0.49609375*dot(normal, normalize(lamp.pos_radius.xyz-world_position_in)), 0.0, 15.0/16.0);
-				float hidden=shadows ? ModelLampShadow(lamp, caster, world_position_in) : 0.0;
-				lamps+=c*facing*(1.0-hidden);
-				shadow_loss+=c*facing*hidden;
-			}
-			model_static=pc.ambient.rgb+lamps;
+			// solid world models are lightmapped like the world: LM * scale, then the texture over it, each fogged
+			// the vertex colour is GlobalLightScale here
+			vec3 texel_light=pass==2 ? vec3(0.0) : texel_dynamic;
+			vec3 lightmap=Unshadowed(baked_world, shadow_loss);
+			vec3 light=SceneLight(lightmap+texel_light, hdr)*colour_in.rgb;
+			debug_light=light;
+			debug_dynamic=texel_light;
+			vec3 fogged_texel=Fog(texel.rgb, fog);
+			colour=Fog(light, fog)*fogged_texel;
+			fullbright_add=fogged_texel*texel.a;
+			// "Saturate": the texture pass is SRCBLEND DESTCOLOR, twice the product (not for fullbright textures' own batch)
+			if (mode<2.5 && pc.fog_range.w>0.5)
+				colour*=2.0;
 		}
-		if (modern && kind<1.5)
-			light=clamp(model_static+modern_diffuse, 0.0, 1.0);
-		else if (modern)
-			light=clamp(Unshadowed(base_colour_in, shadow_loss)+modern_diffuse, 0.0, 1.0);
-		else if (kind>1.5)
-			light=Unshadowed(light, shadow_loss);
-		if (modern)
-			debug_dynamic=modern_diffuse;
-		debug_light=light;
-		colour=Fog(light*texel.rgb, fog);
-		fullbright_add=texel.rgb*texel.a;
-	}
-	vec3 specular=modern_specular*Gloss(texel.rgb);
-	colour+=specular*fog;
+		else
+		{
+			// D3D MODULATE(ALPHA): colour modulated by the texture
+			vec3 light=pass==2 && kind>1.5 ? base_colour_in : colour_in.rgb;
+			// a model: d3d.ren's 16-step ramp, ambient + directional * step / 16 with step = 8 + 7.94 (N.L), made smooth
+			float ramp=clamp(0.5+0.49609375*dot(normal, light_list.model_light.xyz), 0.0, 15.0/16.0);
+			vec3 model_static=pass==0 ? pc.ambient.rgb+pc.directional.rgb*ramp : cached_model_static;
+			// the classic dynamic part: what d3d.ren's ramp or vertex lights added over the static light
+			debug_dynamic=kind<0.5 ? vec3(0.0) : colour_in.rgb-(kind<1.5 ? model_static : base_colour_in);
+			// with the level's lamps known, a model is lit by the actual lamps around it, each from its direction, shadowed
+			// where other models hide it; the light grid's light they don't account for stays as the camera-relative term
+			int lamp_set=int(pc.extra.x);
+			if (pass==0 && modern && kind<1.5 && lamp_set>=0 && static_lighting.counts.w!=0u && uint(lamp_set)<static_lighting.counts.y)
+			{
+				vec3 lamps=static_lighting.models[lamp_set].residual_count.rgb*ramp;
+				uint count=uint(static_lighting.models[lamp_set].residual_count.w);
+				bool shadows=ShadowsOn();
+				for(uint i=0u; i<count; ++i)
+				{
+					StaticLamp lamp=static_lighting.models[lamp_set].lamps[i];
+					vec3 c=LampAt(lamp, world_position_in);
+					if (c==vec3(0.0))
+						continue;
+					float facing=clamp(0.5+0.49609375*dot(normal, normalize(lamp.pos_radius.xyz-world_position_in)), 0.0, 15.0/16.0);
+					float hidden=shadows ? ModelLampShadow(lamp, caster, world_position_in) : 0.0;
+					lamps+=c*facing*(1.0-hidden);
+					shadow_loss+=c*facing*hidden;
+				}
+				model_static=pc.ambient.rgb+lamps;
+			}
+			if (pass==0) cached_model_static=model_static;
+			if (modern && kind<1.5)
+				light=SceneLight(model_static+(pass==2 ? vec3(0.0) : modern_diffuse), hdr);
+			else if (modern)
+				light=SceneLight(Unshadowed(base_colour_in, shadow_loss)+(pass==2 ? vec3(0.0) : modern_diffuse), hdr);
+			else if (kind>1.5)
+				light=Unshadowed(light, shadow_loss);
+			if (modern)
+				debug_dynamic=modern_diffuse;
+			debug_light=light;
+			colour=Fog(light*texel.rgb, fog);
+			fullbright_add=texel.rgb*texel.a;
+		}
+		vec3 specular=pass==2 ? vec3(0.0) : modern_specular*Gloss(texel.rgb);
+		colour+=specular*fog;
 
-	if (mode>2.5)
-	{
-		// world fullbright: the fullbright texels are added (alpha marks them, so it isn't opacity)
-		colour_out=vec4(min(colour+fullbright_add, vec3(1.0)), colour_in.a);
-	}
-	else if (mode>0.5)
-	{
-		// model fullbright: d3d.ren draws the mesh again with DECAL + alpha blending and fog off, i.e. the fullbright
-		// texels at full texture colour (blood2_recon port_notes/model.md)
-		colour_out=vec4(mix(colour, texel.rgb, texel.a), colour_in.a);
-	}
-	else
-	{
-		colour_out=vec4(colour, colour_in.a*texel.a);
+		if (mode>2.5)
+		{
+			// world fullbright: the fullbright texels are added (alpha marks them, so it isn't opacity)
+			shaded=vec4((hdr ? colour+fullbright_add : min(colour+fullbright_add,vec3(1.0))), colour_in.a);
+		}
+		else if (mode>0.5)
+		{
+			// model fullbright: d3d.ren draws the mesh again with DECAL + alpha blending and fog off, i.e. the fullbright
+			// texels at full texture colour (blood2_recon port_notes/model.md)
+			shaded=vec4(mix(colour, texel.rgb, texel.a), colour_in.a);
+		}
+		else
+		{
+			shaded=vec4(colour, colour_in.a*texel.a);
+		}
+		if (light_list.debug_view!=DEBUG_VIEW_NONE) {
+			if (shaded.a<0.5) discard;
+			colour_out=DebugOutput(debug_light, debug_dynamic, normal, specular, shadow_loss, world_position_in, pc.directional.w);
+			return;
+		}
+		if (pass==0) {
+			colour_out=shaded;
+			if (!BloomOn()) return;
+		} else if (pass==1) raw_shaded=shaded;
+		else {
+			vec3 emission=(mode>2.5 || (mode>0.5 && mode<1.5)) ? texel.rgb*texel.a*0.75*fog : vec3(0.0);
+			bloom_source_out=vec4(max(clamp(shaded.rgb,0.0,1.0)+raw_shaded.rgb-shaded.rgb+emission,vec3(0.0)),shaded.a);
+		}
 	}
 
-	// debug views replace the colour; mostly transparent texels leave what's behind
-	if (light_list.debug_view!=DEBUG_VIEW_NONE)
-	{
-		if (colour_out.a<0.5) discard;
-		colour_out=DebugOutput(debug_light, debug_dynamic, normal, specular, shadow_loss, world_position_in, pc.directional.w);
-	}
 }

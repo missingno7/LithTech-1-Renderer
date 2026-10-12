@@ -70,7 +70,8 @@ void DrawWorldModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* sc
 			radius: sqrt(half[0]*half[0]+half[1]*half[1]+half[2]*half[2]),
 			directional: [0f, 0f, 0f],
 			solid: true, // see-through texels are left out of the shadow map instead
-			world_model: true
+			world_model: true,
+			half_extents: half
 		};
 		geometry.models~=record;
 	}

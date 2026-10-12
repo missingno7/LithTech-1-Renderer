@@ -10,3 +10,4 @@ d_ren.pdb
 d_ren.res
 *.spv
 test_texture.png
+__pycache__/

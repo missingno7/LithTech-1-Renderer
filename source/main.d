@@ -290,6 +290,11 @@ void RegisterRendererOptions()
 		["d_GPU", "0"],        // which Vulkan adapter, by its index in vk_test.txt's device list
 		["d_Lighting", "0"],   // 0: dynamic lights like d3d.ren; 1: per pixel with N.L and specular
 		["d_AntiAliasing", "0"], // 0: none; 1: FXAA
+		["d_DynamicShadows", "0"],
+		["d_DynamicShadowLights", "2"],
+		["d_Bloom", "0"],
+		["d_BloomIntensity", "0.15"],
+		["d_BloomThreshold", "1"],
 		["d_Shadows", "0"],    // 0: d3d.ren's flattened model shadows; 1: models cast shadows from the level's lamps
 		["d_ShadowPairs", "16"], // lamp shadow maps per frame (1..64)
 	];

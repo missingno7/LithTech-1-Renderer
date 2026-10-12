@@ -58,8 +58,12 @@ struct GpuStaticLighting
 	float[4] ambient; // rgb: the level's lightmap ambient; w: atlas texel size (1 / size)
 	GpuShadowPair[MaxShadowPairs] pairs;
 	GpuModelSet[MaxModelSets] models;
+	uint[4] dynamic_counts; // selected point lights, reserved
+	import DynamicShadows: GpuDynamicShadow, MaxDynamicShadows;
+	GpuDynamicShadow[MaxDynamicShadows] dynamic_shadows;
 }
 static assert(GpuLamp.sizeof==48 && GpuShadowPair.sizeof==128 && GpuModelSet.sizeof==208);
+static assert(GpuStaticLighting.dynamic_counts.offsetof==34848 && GpuStaticLighting.dynamic_shadows.offsetof==34864);
 
 // a level lamp, prepared
 struct Lamp
@@ -140,6 +144,7 @@ struct ModelRecord
 	float[3] directional; // the light grid's directional light (0..1) the modern lighting uses
 	bool solid; // casts shadows
 	bool world_model; // a door, crate, masked wall...: casts shadows, isn't lit by the lamps (it's lightmapped)
+	float[3] half_extents; // world-space AABB, from the emitted world-model vertices
 }
 
 // a shadow map to draw this frame
@@ -191,9 +196,10 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 			if (model.world_model)
 			{
 				// a world model's shadow shows only where the lamp still reaches past it: ranked by the lamp's light
-				// at the far side of its bounding sphere (a lamp under a grate lights the grate but nothing beyond it)
-				const float[3] far_point=distance>0.001f ? [model.centre[0]-to_lamp[0]/distance*model.radius,
-					model.centre[1]-to_lamp[1]/distance*model.radius, model.centre[2]-to_lamp[2]/distance*model.radius] : model.centre;
+				// at the far side of its actual bounds (a lamp under a grate can light nothing beyond it).
+				// The enclosing sphere greatly overestimates a fence's thickness and drops useful lamps.
+				import DynamicShadows: BoundsFarPoint;
+				const float[3] far_point=BoundsFarPoint(model.centre, model.half_extents, lamp.pos);
 				const float behind=Luminance(lamp.At(far_point));
 				if (behind>0.004f)
 					candidates~=Candidate(cast(uint)l, behind, lamp.At(model.centre));

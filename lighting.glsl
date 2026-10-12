@@ -26,7 +26,7 @@ layout(set=0, binding=2) uniform LightList {
 	vec4 model_light; // xyz: unit vector towards the models' fixed light; w: specular exponent
 	uint debug_view; // DEBUG_VIEW_*: the frame shows one lighting term instead of the colour (debug captures)
 	float effects_from_x; // the other modern effects (static lamp shadows) at and right of this x
-	float debug_pad1, debug_pad2;
+	float bloom_enabled, debug_pad2;
 	LightObj lights[MAX_LIGHT_COUNT];
 } light_list;
 
@@ -73,6 +73,11 @@ bool Modern()
 	return gl_FragCoord.x>=light_list.modern_from_x;
 }
 
+bool BloomOn() { return light_list.bloom_enabled>0.5 && gl_FragCoord.x>=light_list.effects_from_x; }
+// The original colour keeps every clamp; only the separate float bloom source retains overbright illumination.
+vec3 SceneLight(vec3 c, bool hdr) { return hdr ? max(c, vec3(0.0)) : clamp(c, 0.0, 1.0); }
+
+
 // The level's static lamps (static_lighting.d): per model the lamps that light it, and the shadow pairs, each a lamp
 // and a model drawn from it into a tile of the shadow atlas. Lamp terms are in lightmap units: the bake was ambient +
 // colour * BrightScale * (1 - d/r) * cone, one-sided.
@@ -96,11 +101,19 @@ struct ModelLamps
 	StaticLamp lamps[4];
 };
 
+struct DynamicShadow {
+	uvec4 info;
+	mat4 view_proj[6];
+	vec4 tile[6];
+};
+
 layout(std430, set=0, binding=4) readonly buffer StaticLighting {
 	uvec4 counts; // shadow pairs, model sets, 1 if shadows are on, 1 if models are lit by the lamps
 	vec4 ambient; // rgb: the level's lightmap ambient; w: one shadow atlas texel
 	ShadowPair pairs[64];
 	ModelLamps models[128];
+	uvec4 dynamic_counts;
+	DynamicShadow dynamic_shadows[4];
 } static_lighting;
 
 layout(set=0, binding=5) uniform sampler2DShadow shadow_atlas;
@@ -150,10 +163,79 @@ float PairShadow(uint k, vec3 p)
 	return 1.0-lit/9.0;
 }
 
+// Select by dominant axis, matching DynamicShadows.CubeFace. PCF directions cross face
+// boundaries by selecting/reprojecting each tap separately, never sampling a neighbouring atlas tile.
+uint CubeSide(vec3 d) {
+	vec3 a=abs(d);
+	if (a.x>=a.y && a.x>=a.z) return d.x>=0.0 ? 0u : 1u;
+	if (a.y>=a.z) return d.y>=0.0 ? 2u : 3u;
+	return d.z>=0.0 ? 4u : 5u;
+}
+const vec3 cube_axes[6]=vec3[](vec3(1,0,0),vec3(-1,0,0),vec3(0,1,0),vec3(0,-1,0),vec3(0,0,1),vec3(0,0,-1));
+float DynamicVisibility(uint light, vec3 p, vec3 normal) {
+	if (gl_FragCoord.x<light_list.effects_from_x) return 1.0;
+	for(uint k=0u; k<static_lighting.dynamic_counts.x; ++k) {
+		if (static_lighting.dynamic_shadows[k].info.x!=light) continue;
+		vec3 eye=light_list.lights[light].position;
+		vec3 to=p-eye;
+		float d=length(to);
+		if (d<0.001) return 1.0;
+		vec3 axis=to/d;
+		vec3 tangent=normalize(cross(abs(axis.y)>0.95 ? vec3(1,0,0) : vec3(0,1,0), axis));
+		vec3 bitangent=cross(axis,tangent);
+		float nl=max(dot(normal,-axis),0.0);
+		// World-space normal/slope offset; one radial D16 quantisation step is applied below.
+		float bias=max(0.08, min(0.6, light_list.lights[light].radius/1024.0))*(1.0-nl);
+		vec3 receiver=p+normal*bias-axis*0.04;
+		float lit=0.0;
+		for(int tap=0; tap<9; ++tap) {
+			vec3 q=receiver+(tangent*shadow_taps[tap].x+bitangent*shadow_taps[tap].y)*d*(2.0/256.0);
+			// Receiver-plane depth: each PCF ray intersects the receiver's plane. Comparing
+			// taps to one displaced point instead creates stripes on grazing walls/ceilings.
+			vec3 ray=q-eye;
+			float plane_dot=dot(normal,ray);
+			if (nl>0.05 && abs(plane_dot)>0.001)
+				q=eye+ray*(dot(normal,receiver-eye)/plane_dot);
+			uint face=CubeSide(q-eye);
+			vec4 tile=static_lighting.dynamic_shadows[k].tile[face];
+			vec3 forward=cube_axes[face];
+			vec3 right=cross(face==2u || face==3u ? vec3(0,0,1) : vec3(0,1,0),forward);
+			vec3 up=cross(forward,right);
+			vec3 local=q-eye;
+			float face_depth=dot(forward,local);
+			if (face_depth<=tile.w || face_depth>=light_list.lights[light].radius) { lit+=1.0; continue; }
+			// These cardinal axes are the same ones used to build the raster matrices.
+			// Analytic projection avoids fetching a 4x4 matrix for every PCF tap.
+			vec2 ndc=vec2(dot(right,local),dot(up,local))/face_depth;
+			float texel=static_lighting.ambient.w;
+			// Compare at the exact depth texel centre. Bilinear comparison at an arbitrary
+			// position compares one reference depth to four different sloped-surface depths,
+			// producing self-shadow bands even with receiver-plane corrected disk taps.
+			vec2 pixel=clamp(floor((ndc*0.5+0.5)*256.0),vec2(0),vec2(255));
+			vec2 uv=tile.xy+(pixel+0.5)*texel;
+			vec2 snapped=(pixel+0.5)*(2.0/256.0)-1.0;
+			vec3 direction=forward+right*snapped.x+up*snapped.y;
+			float radial=length(q-eye)/light_list.lights[light].radius;
+			float denominator=dot(normal,direction);
+			if (nl>0.001 && abs(denominator)>0.0001)
+				radial=length(direction)*dot(normal,receiver-eye)/denominator/light_list.lights[light].radius;
+			lit+=texture(shadow_atlas,vec3(uv,radial-1.0/65535.0));
+		}
+		return lit/9.0;
+	}
+	return 1.0;
+}
+
 // for the shadow debug view: (strongest raw pair shadow, 1 if any pair's frustum covers p)
-vec2 ShadowCoverage(vec3 p)
+vec2 ShadowCoverage(vec3 p, vec3 normal)
 {
 	float strongest=0.0, covered=0.0;
+	for(uint k=0u; k<static_lighting.dynamic_counts.x; ++k) {
+		uint i=static_lighting.dynamic_shadows[k].info.x;
+		if (distance(light_list.lights[i].position,p)>=light_list.lights[i].radius) continue;
+		covered=1.0;
+		strongest=max(strongest,1.0-DynamicVisibility(i,p,normal));
+	}
 	for(uint k=0u; k<static_lighting.counts.x; ++k)
 	{
 		vec4 clip=static_lighting.pairs[k].view_proj*vec4(p, 1.0);
@@ -230,6 +312,11 @@ void ModernLights(vec3 p, vec3 n, bool for_models, inout vec3 diffuse, inout vec
 		if (n_dot_l<=0.0) continue;
 
 		float attenuation=pow(1.0-d2/r2, light_list.camera.w)*n_dot_l;
+#ifdef FRAGMENT_SHADER
+		// Visibility belongs only to this additional light; baked lightmaps/ambient are unchanged.
+		attenuation*=DynamicVisibility(i, p, n);
+		if (attenuation<=0.0) continue; // fully blocked: no diffuse/specular work or undefined half-vector contribution
+#endif
 		vec3 colour=2.0*obj.colour-1.0;
 		diffuse+=colour*attenuation;
 		if (light_list.specular>0.0)
@@ -264,7 +351,7 @@ vec4 DebugOutput(vec3 light, vec3 dynamic, vec3 normal, vec3 specular, vec3 shad
 	uint view=light_list.debug_view;
 #ifdef FRAGMENT_SHADER
 	if (view==DEBUG_VIEW_SHADOW)
-		return vec4(clamp(dot(shadow, vec3(0.299, 0.587, 0.114)), 0.0, 1.0), ShadowCoverage(p), 1.0);
+		return vec4(clamp(dot(shadow, vec3(0.299, 0.587, 0.114)), 0.0, 1.0), ShadowCoverage(p, normal), 1.0);
 #endif
 	if (view==DEBUG_VIEW_LIGHT)
 		return vec4(clamp(light, 0.0, 1.0), 1.0);

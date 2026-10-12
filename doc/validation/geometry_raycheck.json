@@ -1,0 +1,10 @@
+{
+  "samples": 12929,
+  "centre_ray_blocked": 394,
+  "all_pcf_rays_static_blocked": 290,
+  "fully_suppressed": 290,
+  "blocked_median_residual": 0.0,
+  "no_dumped_blocker": 12492,
+  "unblocked_preserved": 11836,
+  "failures": []
+}

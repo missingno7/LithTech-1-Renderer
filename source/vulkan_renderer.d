@@ -9,6 +9,7 @@ import erupted;
 import vulkan_windows;
 
 import std.stdio;
+import std.algorithm: clamp;
 import core.sys.windows.windows;
 
 import gl3n.linalg;
@@ -20,10 +21,11 @@ import Texture;
 import vk.Surface: ImageSurface;
 import WorldBsp: WorldBsp, MainWorld, Node, SurfaceFlags, Polygon;
 import SceneGeometry: ObjectGeometry, BatchLighting;
-import LTObjects: LTObject, DynamicLight;
+import LTObjects: LTObject, DynamicLight, Dot;
 import EffectsDraw: EffectView;
 import PostProcess: PostProcess, AntiAliasing, MakeScenePass, MakeColourPass;
 import DebugCapture;
+import DynamicShadows;
 import StaticLighting: GpuStaticLighting, Lamp, ShadowPairDraw, PrepareLamps, SelectLamps, SelectionSettings,
 	ShadowAtlasTiles, MaxShadowPairs;
 
@@ -85,7 +87,8 @@ struct LightListUbo
 	float[4] model_light; // towards the models' fixed light, specular exponent
 	uint debug_view; // DebugView: one lighting term instead of the colour (debug captures)
 	float effects_from_x=float.max; // the other modern effects (lamp shadows) from this framebuffer x on
-	private float[2] debug_pad;
+	float bloom_enabled;
+	private float debug_pad;
 	LightObj[MaxLightCount] lights;
 }
 
@@ -247,6 +250,8 @@ private:
 	VkPipelineLayout _pipeline_layout;
 
 	VkPipeline _pipeline;
+	VkPipeline _hdr_pipeline, _hdr_depth_only;
+	bool _record_hdr;
 	VkPipeline _pipeline_depth_only; // sky portals: depth, no colour
 
 	VkSemaphore _is_image_available;
@@ -282,6 +287,8 @@ public:
 			vkDestroyFramebuffer(g_Device, buffer.framebuffer, null);
 
 		vkDestroyPipeline(g_Device, _pipeline, null);
+		vkDestroyPipeline(g_Device, _hdr_pipeline, null);
+		vkDestroyPipeline(g_Device, _hdr_depth_only, null);
 		vkDestroyPipeline(g_Device, _pipeline_depth_only, null);
 
 		vkDestroyPipelineLayout(g_Device, _pipeline_layout, null);
@@ -382,6 +389,7 @@ public:
 		CreateRenderPass();
 
 		//// Graphics Pipeline
+		_post.Create(_format, FindDepthFormat());
 		CreateGraphicsPipeline();
 
 		///
@@ -414,7 +422,6 @@ public:
 		CreateOverlay();
 		CreateObjectPipelines();
 		CreateGpuTimer();
-		_post.Create(_format, FindDepthFormat());
 		_post.CreateTargets(_extents, _depth_image_view, SwapchainViews());
 		_overlay_pipeline_present=CreateOverlayPipeline(_post.present_pass);
 
@@ -451,6 +458,8 @@ public:
 	float _debug_light=0f; // console d_DebugLight, for the log
 	// post-processing (post_process.d): console d_AntiAliasing 1 = FXAA
 	AntiAliasing _anti_aliasing;
+	bool _bloom;
+	float _bloom_intensity=0.15f, _bloom_threshold=1.0f;
 	bool _widescreen=true; // console "d_Widescreen": Hor+ FOV correction (RenderScene)
 	float[2] _game_fov; // the scene's FOVs as the game gave them, for the log
 
@@ -570,7 +579,12 @@ public:
 		_specular=ConsoleFloat("d_Specular", 0.25f);
 		_light_falloff=ConsoleFloat("d_LightFalloff", 1f);
 		_anti_aliasing=ConsoleFloat("d_AntiAliasing", 0f)>=1f ? AntiAliasing.Fxaa : AntiAliasing.Off;
+		_bloom=ConsoleFloat("d_Bloom", 0f)!=0f && _post.bloom_supported;
+		_bloom_intensity=clamp(ConsoleFloat("d_BloomIntensity", 0.15f), 0f, 2f);
+		_bloom_threshold=clamp(ConsoleFloat("d_BloomThreshold", 1f), 0.1f, 8f);
 		_shadows=ConsoleFloat("d_Shadows", 0f)!=0f;
+		_dynamic_shadows=ConsoleFloat("d_DynamicShadows", 0f)!=0f;
+		_dynamic_shadow_limit=cast(uint)clamp(ConsoleFloat("d_DynamicShadowLights", 2f), 0f, cast(float)MaxDynamicShadows);
 		{
 			const float pairs=ConsoleFloat("d_ShadowPairs", 16f);
 			_shadow_pair_limit=pairs<1f ? 1 : pairs>MaxShadowPairs ? MaxShadowPairs : cast(uint)pairs;
@@ -1257,10 +1271,13 @@ LAB_0004814b:
 
 		// with a post effect on, the scene goes to the offscreen image and the post pass draws it into the target; debug
 		// views are never post-processed
-		const bool post=_scene_rendered && _anti_aliasing!=AntiAliasing.Off && _debug_view==DebugView.Final;
+		const bool post=_scene_rendered && (_bloom || _anti_aliasing!=AntiAliasing.Off) && _debug_view==DebugView.Final;
+		if (post && _bloom) _post.EnsureBloomTargets(_depth_image_view);
+		_record_hdr=post && _bloom;
+		if (_record_hdr) clear_colour=[clear_colour[0],clear_colour[0],clear_colour[1]];
 		VkRenderPassBeginInfo render_pass_begin_info={
-			renderPass: post ? _post.scene_pass : target.scene_pass,
-			framebuffer: post ? _post.scene_framebuffer : target.scene_framebuffer,
+			renderPass: post ? (_bloom ? _post.hdr_pass : _post.scene_pass) : target.scene_pass,
+			framebuffer: post ? (_bloom ? _post.hdr.framebuffer : _post.scene_framebuffer) : target.scene_framebuffer,
 			renderArea: {
 				offset: { 0, 0 },
 				extent: _extents
@@ -1301,7 +1318,7 @@ LAB_0004814b:
 		// d3d.ren draws the sky before any world geometry, without depth (port_notes/sky.md)
 		RecordObjectDraws(buffer, image_index, true);
 
-		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+		vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _record_hdr ? _hdr_pipeline : _pipeline);
 		vkCmdSetLineWidth(buffer, 1f);
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &_texture_descriptor, 0, null);
@@ -1359,9 +1376,9 @@ LAB_0004814b:
 
 			// sky portals are never drawn in d3d.ren, so the sky shows through them; here they write depth only, which
 			// keeps world geometry behind them (that d3d.ren's visibility wouldn't draw) from covering the sky
-			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_depth_only);
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _record_hdr ? _hdr_depth_only : _pipeline_depth_only);
 			DrawPolygons(true);
-			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+			vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _record_hdr ? _hdr_pipeline : _pipeline);
 			DrawPolygons(false);
 		}
 		Stamp(buffer, GpuStamp.World);
@@ -1372,14 +1389,17 @@ LAB_0004814b:
 		if (post)
 		{
 			vkCmdEndRenderPass(buffer);
+			if (_bloom) _post.RecordBloom(buffer, _bloom_threshold, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f);
+			Stamp(buffer, GpuStamp.Bloom);
 			VkRenderPassBeginInfo present_begin_info={
 				renderPass: target.present_pass,
 				framebuffer: target.present_framebuffer,
 				renderArea: { offset: { 0, 0 }, extent: _extents }
 			};
 			vkCmdBeginRenderPass(buffer, &present_begin_info, VK_SUBPASS_CONTENTS_INLINE);
-			_post.Record(buffer, _anti_aliasing, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f);
+			_post.Record(buffer, _anti_aliasing, _compare ? _scene_viewport.x+_scene_viewport.width*0.5f : 0f, _bloom, _bloom_intensity);
 		}
+		if (!post) Stamp(buffer, GpuStamp.Bloom);
 		Stamp(buffer, GpuStamp.Post);
 		if (target.overlay)
 			RecordOverlayDraw(buffer, post ? _overlay_pipeline_present : _overlay_pipeline);
@@ -1791,7 +1811,9 @@ LAB_0004814b:
 			test_out.writefln("  lighting: %s, compare %s, specular %.2f, falloff %.2f, debug light %.0f; anti-aliasing %s; static lamps %d, shadows %s (pairs %.1f of %d, models %.1f)",
 				_modern_lighting ? "modern" : "d3d.ren", _compare, _specular, _light_falloff, _debug_light, _anti_aliasing,
 				_lamps.length, _shadows, cast(float)_shadow_pair_sum/_fps_frames, _shadow_pair_limit, cast(float)_model_set_sum/_fps_frames);
-			test_out.writefln("  shadow draw calls per frame %.1f", cast(float)_shadow_draw_calls/_fps_frames);
+			test_out.writefln("  shadow draw calls per frame %.1f; dynamic lights %.1f of %d, draws %.1f; bloom %s, intensity %.2f threshold %.2f", cast(float)_shadow_draw_calls/_fps_frames,
+				cast(float)_dynamic_shadow_sum/_fps_frames, _dynamic_shadow_limit, cast(float)_dynamic_shadow_draw_calls/_fps_frames, _bloom, _bloom_intensity, _bloom_threshold);
+			_dynamic_shadow_sum=_dynamic_shadow_draw_calls=0;
 			_shadow_pair_sum=_model_set_sum=_shadow_draw_calls=0;
 			test_out.writefln("  game fov %.4f x %.4f, drawn %.4f x %.4f, viewport %.0f x %.0f", _game_fov[0], _game_fov[1], fov_x, fov_y,
 				_scene_viewport.width, _scene_viewport.height);
@@ -1832,8 +1854,9 @@ LAB_0004814b:
 			if (_gpu_timer!=VK_NULL_ND_HANDLE)
 			{
 				double Ms(size_t stage) { return _gpu_time[stage]/1000.0/_fps_frames; }
-				test_out.writefln("  GPU ms per frame: sky + world %.3f, objects %.3f, post %.3f, 2D %.3f, total %.3f",
-					Ms(0), Ms(1), Ms(2), Ms(3), Ms(0)+Ms(1)+Ms(2)+Ms(3));
+				test_out.writefln("  GPU ms per frame: static shadows %.3f, dynamic shadows %.3f, sky + world %.3f, objects %.3f, bloom %.3f, post %.3f, 2D %.3f, total %.3f",
+					Ms(0), Ms(1), Ms(2), Ms(3), Ms(4), Ms(5), Ms(6),
+					Ms(0)+Ms(1)+Ms(2)+Ms(3)+Ms(4)+Ms(5)+Ms(6));
 				_gpu_time[]=0;
 			}
 			{
@@ -1870,6 +1893,7 @@ LAB_0004814b:
 	VkMappedMemoryRange _capture_colour_memory, _capture_depth_memory;
 	VkCommandBuffer _capture_command_buffer;
 	VkExtent2D _capture_extent;
+	bool _capture_active;
 
 	// the command file's lines run in order, one batch per frame up to a "wait <ms>"
 	string[] _command_queue;
@@ -2046,6 +2070,11 @@ LAB_0004814b:
 				case "falloff", "d_lightfalloff": _light_falloff=value.to!float; return true;
 				case "aa", "d_antialiasing": _anti_aliasing=value!="0" ? AntiAliasing.Fxaa : AntiAliasing.Off; return true;
 				case "compare", "d_compare": _compare=value!="0"; return true;
+				case "dynamicshadows", "d_dynamicshadows": _dynamic_shadows=value!="0"; return true;
+				case "dynamicshadowlights", "d_dynamicshadowlights": _dynamic_shadow_limit=cast(uint)clamp(value.to!int,0,cast(int)MaxDynamicShadows); return true;
+				case "bloom", "d_bloom": _bloom=value!="0" && _post.bloom_supported; return true;
+				case "bloomintensity", "d_bloomintensity": _bloom_intensity=value.to!float; return true;
+				case "bloomthreshold", "d_bloomthreshold": _bloom_threshold=value.to!float; return true;
 				case "shadows", "d_shadows": _shadows=value!="0"; return true;
 				default: return false;
 			}
@@ -2058,6 +2087,8 @@ LAB_0004814b:
 	{
 		import std.file: mkdirRecurse, write;
 		import std.format: format;
+		_capture_active=true;
+		scope(exit) _capture_active=false;
 
 		CaptureRequest request=*_capture_request;
 		_capture_request=null;
@@ -2080,10 +2111,19 @@ LAB_0004814b:
 		const bool saved_modern=_modern_lighting, saved_compare=_compare;
 		const float saved_specular=_specular, saved_falloff=_light_falloff;
 		const AntiAliasing saved_aa=_anti_aliasing;
-		const bool saved_shadows=_shadows;
+		const bool saved_shadows=_shadows, saved_bloom=_bloom, saved_dynamic_shadows=_dynamic_shadows;
+		const uint saved_dynamic_limit=_dynamic_shadow_limit;
+		const size_t[] saved_previous=_previous_shadow_lights.dup;
+		const float saved_bloom_intensity=_bloom_intensity, saved_bloom_threshold=_bloom_threshold;
 		scope(exit)
 		{
 			_shadows=saved_shadows;
+			_dynamic_shadows=saved_dynamic_shadows;
+			_dynamic_shadow_limit=saved_dynamic_limit;
+			_previous_shadow_lights=saved_previous.dup;
+			_bloom=saved_bloom;
+			_bloom_intensity=saved_bloom_intensity;
+			_bloom_threshold=saved_bloom_threshold;
 			_modern_lighting=saved_modern;
 			_compare=saved_compare;
 			_specular=saved_specular;
@@ -2105,6 +2145,12 @@ LAB_0004814b:
 			_light_falloff=saved_falloff;
 			_anti_aliasing=saved_aa;
 			_shadows=saved_shadows;
+			_dynamic_shadows=saved_dynamic_shadows;
+			_dynamic_shadow_limit=saved_dynamic_limit;
+			_previous_shadow_lights=saved_previous.dup;
+			_bloom=saved_bloom;
+			_bloom_intensity=saved_bloom_intensity;
+			_bloom_threshold=saved_bloom_threshold;
 			_compare=false;
 			string settings_json;
 			foreach(setting; variant.settings)
@@ -2117,7 +2163,7 @@ LAB_0004814b:
 			UpdateLightListUbo(image_index);
 			UpdateStaticLighting(image_index);
 
-			const bool post=_anti_aliasing!=AntiAliasing.Off && variant.view==DebugView.Final;
+			const bool post=(_bloom || _anti_aliasing!=AntiAliasing.Off) && variant.view==DebugView.Final;
 			FrameTarget target=FrameTarget(_capture_scene_pass, _capture_scene_framebuffer, _capture_present_pass,
 				_capture_present_framebuffer, variant.hud && variant.view==DebugView.Final, false);
 
@@ -2159,13 +2205,26 @@ LAB_0004814b:
 				depth_written=true;
 			}
 
-			variants_json~=format("%s\n    {\"label\": %s, \"view\": %s, \"file\": %s, \"settings\": {%s}, \"hud\": %s, \"post\": %s, \"gpu_ms\": {\"sky_world\": %.4f, \"objects\": %.4f, \"post\": %.4f, \"2d\": %.4f}}",
+			variants_json~=format("%s\n    {\"label\": %s, \"view\": %s, \"file\": %s, \"settings\": {%s}, \"hud\": %s, \"post\": %s, \"gpu_ms\": {\"sky_world\": %.4f, \"objects\": %.4f, \"post\": %.4f, \"2d\": %.4f, \"static_shadows\": %.4f, \"dynamic_shadows\": %.4f, \"bloom\": %.4f}}",
 				n ? "," : "", JsonString(variant.label), JsonString(ViewName(variant.view)), JsonString(file), settings_json,
-				target.overlay, post, stages[0]/1000, stages[1]/1000, stages[2]/1000, stages[3]/1000);
+				target.overlay, post, stages[GpuStamp.World-1]/1000, stages[GpuStamp.Objects-1]/1000, (stages[GpuStamp.Bloom-1]+stages[GpuStamp.Post-1])/1000, stages[GpuStamp.Overlay-1]/1000, stages[GpuStamp.StaticShadows-1]/1000, stages[GpuStamp.DynamicShadows-1]/1000, stages[GpuStamp.Bloom-1]/1000);
 		}
 
 		// the shadow pairs in the JSON are the game's own (a "shadows=0" variant leaves none)
 		_shadows=saved_shadows;
+		_dynamic_shadows=saved_dynamic_shadows;
+		_dynamic_shadow_limit=saved_dynamic_limit;
+		_previous_shadow_lights=saved_previous.dup;
+		_bloom=saved_bloom;
+		_bloom_intensity=saved_bloom_intensity;
+		_bloom_threshold=saved_bloom_threshold;
+		_modern_lighting=saved_modern;
+		_compare=saved_compare;
+		_specular=saved_specular;
+		_light_falloff=saved_falloff;
+		_anti_aliasing=saved_aa;
+		_debug_view=DebugView.Final;
+		UpdateLightListUbo(image_index);
 		UpdateStaticLighting(image_index);
 		try write(format("captures\\%s.json", request.name), CaptureJson(request.name, width, height, bgra,
 			depth_written ? format("%s_depth.f32", request.name) : null, variants_json, ids_wanted ? _capture_ids.Ids() : null));
@@ -2280,6 +2339,17 @@ LAB_0004814b:
 			_modern_lighting, _specular, _light_falloff, _anti_aliasing!=AntiAliasing.Off, _debug_light, _fog_enable,
 			JsonFloats(_fog_range), JsonFloats(_fog_colour), _fog_by_distance, _saturate, JsonFloats(_global_light_scale));
 
+
+		json~=format("  \"modern_effects\": {\"bloom\": %s, \"bloom_intensity\": %.3f, \"bloom_threshold\": %.3f, \"dynamic_shadows\": %s, \"dynamic_light_budget\": %d},\n",
+			_bloom, _bloom_intensity, _bloom_threshold, _dynamic_shadows, _dynamic_shadow_limit);
+		json~="  \"dynamic_shadow_lights\": [";
+		foreach(k, index; _dynamic_selected) {
+			ref point=_static_gpu.dynamic_shadows[k];
+			json~=format("%s{\"light\": %d, \"world_polygons\": %d, \"faces\": [", k ? "," : "", index, _dynamic_world_casters[k].length);
+			foreach(face; 0..6) json~=format("%s{\"tile\": %s, \"view_proj\": %s}", face ? "," : "", JsonFloats(point.tile[face]), JsonFloats(point.view_proj[face]));
+			json~="]}";
+		}
+		json~="],\n";
 		json~="  \"lights\": [";
 		foreach(i, ref light; _world_lights[0..(_world_lights.length<MaxLightCount ? $ : MaxLightCount)])
 			json~=format("%s\n    {\"index\": %d, \"position\": %s, \"colour\": %s, \"radius\": %.2f, \"flags\": \"0x%x\"}", i ? "," : "", i,
@@ -2382,12 +2452,23 @@ LAB_0004814b:
 	VkSampler _shadow_sampler;
 	VkRenderPass _shadow_pass;
 	VkFramebuffer _shadow_framebuffer;
-	VkPipeline _shadow_pipeline;
+	VkPipeline _shadow_pipeline, _world_shadow_pipeline;
+	bool _dynamic_shadows;
+	uint _dynamic_shadow_limit=2;
+	uint[] _dynamic_selected;
+	size_t[] _previous_shadow_lights;
+	ulong _dynamic_shadow_draw_calls, _dynamic_shadow_sum;
+	struct WorldCaster { uint first, count; float[3] low, high; Polygon* polygon; }
+	WorldCaster[] _world_casters;
+	uint[][MaxDynamicShadows] _dynamic_world_casters;
+
 	VkShaderModule _shadow_vert, _shadow_frag;
+	bool _shadow_atlas_initialised;
 
 	void CreateStaticLighting()
 	{
 		import SceneGeometry: ObjectVertex;
+		_shadow_atlas_initialised=false;
 
 		_static_buffers=new VkBuffer[_buffers.length];
 		_static_memory=new VkMappedMemoryRange[_buffers.length];
@@ -2439,7 +2520,7 @@ LAB_0004814b:
 			{
 				srcSubpass: 0,
 				dstSubpass: VK_SUBPASS_EXTERNAL,
-				srcStageMask: VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				srcStageMask: VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				srcAccessMask: VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 				dstStageMask: VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 				dstAccessMask: VK_ACCESS_SHADER_READ_BIT
@@ -2518,10 +2599,16 @@ LAB_0004814b:
 		};
 		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &_shadow_pipeline),
 			"vkCreateGraphicsPipelines (shadows)");
+		binding=Vertex.GetBindingDescription();
+		attributes=[VkVertexInputAttributeDescription(0,0,VK_FORMAT_R32G32B32_SFLOAT,Vertex.pos.offsetof),
+			VkVertexInputAttributeDescription(1,0,VK_FORMAT_R32G32B32_SFLOAT,Vertex.colour.offsetof),
+			VkVertexInputAttributeDescription(2,0,VK_FORMAT_R32G32_SFLOAT,Vertex.uv.offsetof)];
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &pipeline_info, null, &_world_shadow_pipeline), "world shadow pipeline");
 	}
 
 	void DestroyStaticLighting()
 	{
+		vkDestroyPipeline(g_Device, _world_shadow_pipeline, null);
 		vkDestroyPipeline(g_Device, _shadow_pipeline, null);
 		vkDestroyShaderModule(g_Device, _shadow_vert, null);
 		vkDestroyShaderModule(g_Device, _shadow_frag, null);
@@ -2543,12 +2630,36 @@ LAB_0004814b:
 		_shadow_draws.length=0;
 		_model_sets.length=0;
 		_static_gpu.counts=[0, 0, 0, 0];
+		_static_gpu.dynamic_counts[]=0;
+		_dynamic_selected=(_scene_rendered && (_modern_lighting || _compare) && _dynamic_shadows) ?
+			SelectDynamicLights(_world_lights, camera_pos.vector, _view_matrix, _proj_matrix, _dynamic_shadow_limit, _previous_shadow_lights) : null;
+		_previous_shadow_lights.length=0;
+		foreach(index; _dynamic_selected) _previous_shadow_lights~=_world_lights[index].identity;
+		// Four 256px point-light faces fit into one existing 512px lamp tile. Reserve only what is used.
+		const uint reserved=cast(uint)(_dynamic_selected.length*6+3)/4;
+		const uint static_budget=MaxShadowPairs-reserved;
+		foreach(k, index; _dynamic_selected) {
+			ref point=_static_gpu.dynamic_shadows[k];
+			point.info=[index,0,0,0];
+			foreach(face; 0..6) {
+				point.view_proj[face]=CubeFace(_world_lights[index].pos, _world_lights[index].radius, face);
+				uint unit=cast(uint)k*6+face, cell=static_budget+unit/4, quadrant=unit%4;
+				point.tile[face]=[(cell%8*2+quadrant%2)/16f, (cell/8*2+quadrant/2)/16f, 1f/16f, NearPlane(_world_lights[index].radius)];
+			}
+			_dynamic_world_casters[k].length=0;
+			foreach(c, ref caster; _world_casters)
+				if (InRadius(caster.low, caster.high, _world_lights[index].pos, _world_lights[index].radius))
+					_dynamic_world_casters[k]~=cast(uint)c;
+		}
+		_static_gpu.dynamic_counts[0]=cast(uint)_dynamic_selected.length;
+		if (!_capture_active) _dynamic_shadow_sum+=_dynamic_selected.length;
+
 		const bool light_models=_modern_lighting || _compare;
 		if (_scene_rendered && _lamps.length && (_shadows || light_models))
 		{
 			SelectionSettings settings={
 				camera: [camera_pos.x, camera_pos.y, camera_pos.z],
-				max_pairs: _shadows ? _shadow_pair_limit : 0,
+				max_pairs: _shadows ? (_shadow_pair_limit<static_budget ? _shadow_pair_limit : static_budget) : 0,
 				light_models: light_models,
 				bsp: (g_RenderContext && g_RenderContext.main_world) ? g_RenderContext.main_world.world_bsp : null
 			};
@@ -2557,11 +2668,14 @@ LAB_0004814b:
 			_static_gpu.counts[3]=light_models ? 1 : 0;
 		}
 		_static_gpu.ambient=[_level_ambient[0], _level_ambient[1], _level_ambient[2], 1f/ShadowAtlasSize];
-		_shadow_pair_sum+=_shadow_draws.length;
-		_model_set_sum+=_static_gpu.counts[1];
+		if (!_capture_active)
+		{
+			_shadow_pair_sum+=_shadow_draws.length;
+			_model_set_sum+=_static_gpu.counts[1];
+		}
 
 		// only the used part
-		const size_t bytes=GpuStaticLighting.models.offsetof+_static_gpu.counts[1]*_static_gpu.models[0].sizeof;
+		const size_t bytes=GpuStaticLighting.sizeof;
 		void* data;
 		vmaMapMemory(_static_memory[image_index], &data);
 		memcpy(data, &_static_gpu, bytes);
@@ -2573,6 +2687,15 @@ LAB_0004814b:
 	void RecordShadowAtlas(VkCommandBuffer buffer, uint image_index)
 	{
 		import SceneGeometry: DrawGroup, TextureMode, ObjectPipe;
+		// Keep descriptors valid after the first clear, but avoid clearing 4096² depth
+		// every frame when no light uses it. Shadow diagnostics request an explicit clear.
+		if (_shadow_atlas_initialised && !_shadow_draws.length && !_dynamic_selected.length && _debug_view!=DebugView.Shadow)
+		{
+			Stamp(buffer, GpuStamp.StaticShadows);
+			Stamp(buffer, GpuStamp.DynamicShadows);
+			return;
+		}
+		_shadow_atlas_initialised=true;
 
 		VkClearValue clear={ depthStencil: { 1f, 0 } };
 		VkRenderPassBeginInfo begin_info={
@@ -2606,7 +2729,8 @@ LAB_0004814b:
 						// translucent world models (bars, grates) leave out their see-through texels; a fullbright
 						// texture's alpha marks its fullbright texels, never opacity
 						const bool masked=group==DrawGroup.TranslucentWorldModels && batch.mode==TextureMode.Normal;
-						float[20] constants;
+						float[24] constants;
+						constants[20..24]=0f; // initialize the shared shader's point-light eye even on the static path
 						constants[0..16]=draw.view_proj[];
 						constants[16..20]=[masked ? 1f : 0f, 0f, 0f, 0f];
 						vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -2618,17 +2742,82 @@ LAB_0004814b:
 							bound_texture=texture;
 						}
 						vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
-						_shadow_draw_calls++;
+						if (!_capture_active) _shadow_draw_calls++;
 					}
 			}
 		}
+		Stamp(buffer, GpuStamp.StaticShadows);
+		RecordDynamicShadowFaces(buffer, image_index);
+		Stamp(buffer, GpuStamp.DynamicShadows);
 		vkCmdEndRenderPass(buffer);
+	}
+
+
+	// Uses the scene's level buffers directly. Bounds are cached once per level; all nearby polygons
+	// cast regardless of the camera frustum. Hardware clip planes cull individual cube faces.
+	void RecordDynamicShadowFaces(VkCommandBuffer buffer, uint image_index) {
+		import SceneGeometry: DrawGroup, TextureMode, LightingKind;
+		if (!_dynamic_selected.length) return;
+		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
+		VkDeviceSize offset=0;
+		foreach(k, index; _dynamic_selected) {
+			ref light=_world_lights[index];
+			ref point=_static_gpu.dynamic_shadows[k];
+			foreach(face; 0..6) {
+				ref tile=point.tile[face];
+				const VkViewport viewport=VkViewport(tile[0]*ShadowAtlasSize, tile[1]*ShadowAtlasSize, 256, 256, 0, 1);
+				SetViewport(buffer, viewport);
+				float[24] constants;
+				constants[0..16]=point.view_proj[face][];
+				constants[20..24]=[light.pos[0], light.pos[1], light.pos[2], 0f];
+				if (_vertex_buffer!=VK_NULL_ND_HANDLE && _world_casters.length) {
+					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _world_shadow_pipeline);
+					vkCmdBindVertexBuffers(buffer, 0, 1, &_vertex_buffer, &offset);
+					vkCmdBindIndexBuffer(buffer, _vertex_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+					foreach(c; _dynamic_world_casters[k]) {
+						ref caster=_world_casters[c];
+						if (!InFace(point.view_proj[face], caster.low, caster.high)) continue;
+						SharedTexture* shared_tex=caster.polygon.surface.shared_texture;
+						RenderTexture texture=shared_tex ? cast(RenderTexture)shared_tex.render_data : null;
+						VkDescriptorSet descriptor=texture ? texture.texture_descriptor : _texture_descriptor;
+						vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &descriptor, 0, null);
+						bool masked=(caster.polygon.surface.flags & SurfaceFlags.Transparent)!=0 && !(texture && texture.fullbright);
+						constants[16..20]=[masked ? 1f : 0f, 1f, 1f/light.radius, 0f]; // world UVs are in texels
+						vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
+						vkCmdDrawIndexed(buffer, caster.count, 1, caster.first, 0, 0);
+						if (!_capture_active) _dynamic_shadow_draw_calls++;
+					}
+				}
+				if (_object_vertex_buffer==VK_NULL_ND_HANDLE || !_objects.vertices.length) continue;
+				vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _shadow_pipeline);
+				vkCmdBindVertexBuffers(buffer, 0, 1, &_object_vertex_buffer, &offset);
+				foreach(group; [DrawGroup.SolidModels, DrawGroup.SolidWorldModels, DrawGroup.TranslucentModels, DrawGroup.TranslucentWorldModels])
+					foreach(ref batch; _objects.groups[group]) {
+						if (batch.model<0 || batch.mode==TextureMode.Untextured) continue;
+						ref model=_objects.models[batch.model];
+						import LTObjects: ObjectFlag;
+						LTObject* source=cast(LTObject*)model.object;
+						if (source && (source.flags & ObjectFlag.ReallyClose)) continue;
+						if (!model.solid || batch.mode==TextureMode.Fullbright || batch.lighting.kind==LightingKind.PreLit) continue; // skip the model's duplicate emissive pass
+						float[3] delta=[model.centre[0]-light.pos[0],model.centre[1]-light.pos[1],model.centre[2]-light.pos[2]];
+						float reach=light.radius+model.radius;
+						if (Dot(delta,delta)>reach*reach) continue;
+						bool masked=group==DrawGroup.TranslucentWorldModels && batch.mode==TextureMode.Normal;
+						constants[16..20]=[masked ? 1f : 0f, 0f, 1f/light.radius, 0f];
+						VkDescriptorSet descriptor=batch.texture!=VK_NULL_ND_HANDLE ? batch.texture : _texture_descriptor;
+						vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 1, 1, &descriptor, 0, null);
+						vkCmdPushConstants(buffer, _pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, constants.sizeof, constants.ptr);
+						vkCmdDraw(buffer, batch.vertex_count, 1, batch.first_vertex, 0);
+						if (!_capture_active) _dynamic_shadow_draw_calls++;
+					}
+			}
+		}
 	}
 
 	//// GPU timing: timestamps around the frame's passes, read back after the frame's GPU wait and logged once a second
 	//// with the CPU timings (per-pass costs of the effects)
 
-	enum GpuStamp { Start, World, Objects, Post, Overlay }
+	enum GpuStamp { Start, StaticShadows, DynamicShadows, World, Objects, Bloom, Post, Overlay }
 	VkQueryPool _gpu_timer; // VK_NULL_ND_HANDLE: the queue has no timestamps
 	double _gpu_tick_ns; // nanoseconds per timestamp tick
 	double[GpuStamp.max] _gpu_time=0.0; // microseconds per stage, summed over the log interval
@@ -3169,7 +3358,7 @@ LAB_0004814b:
 	size_t _object_vertex_count;
 
 	import SceneGeometry: ObjectPipe;
-	VkPipeline[ObjectPipe.max+1] _object_pipelines;
+	VkPipeline[ObjectPipe.max+1] _object_pipelines, _hdr_object_pipelines;
 	VkShaderModule _object_vert_shader;
 	VkShaderModule _object_frag_shader;
 
@@ -3253,7 +3442,7 @@ LAB_0004814b:
 						(object.flags & 0x80))
 						return;
 					const light=DynamicLight(object.pos, [cast(float)object.r, cast(float)object.g, cast(float)object.b],
-						At!float(object, LightRadiusOffset), object.flags);
+						At!float(object, LightRadiusOffset), object.flags, cast(size_t)object);
 					_world_lights~=light;
 					if (!(object.flags & 0x20) && _scene_lights.length<40)
 						_scene_lights~=light;
@@ -3266,7 +3455,7 @@ LAB_0004814b:
 			{
 				const float[3] position=[scene_desc.camera_position.x+forward[0]*40f, scene_desc.camera_position.y+forward[1]*40f,
 					scene_desc.camera_position.z+forward[2]*40f];
-				const light=DynamicLight(position, [255f, 235f, 210f], debug_radius, 0);
+				const light=DynamicLight(position, [255f, 235f, 210f], debug_radius, 0, size_t.max);
 				_world_lights=light~_world_lights;
 				_scene_lights=(light~_scene_lights)[0..($<40 ? $ : 40)];
 			}
@@ -3519,10 +3708,13 @@ LAB_0004814b:
 		_object_frag_shader=Shader.CreateShaderModule(g_Device, Shader.ReadShader("object_frag.spv"));
 
 		foreach(pipe; 0..ObjectPipe.max+1)
-			_object_pipelines[pipe]=CreateObjectPipeline(cast(ObjectPipe)pipe);
+		{
+			_object_pipelines[pipe]=CreateObjectPipeline(cast(ObjectPipe)pipe, _render_pass);
+			_hdr_object_pipelines[pipe]=CreateObjectPipeline(cast(ObjectPipe)pipe, _post.hdr_pass);
+		}
 	}
 
-	VkPipeline CreateObjectPipeline(ObjectPipe pipe)
+	VkPipeline CreateObjectPipeline(ObjectPipe pipe, VkRenderPass pass)
 	{
 		import SceneGeometry: ObjectVertex;
 
@@ -3586,9 +3778,10 @@ LAB_0004814b:
 			colorWriteMask: VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
 		};
 
+		VkPipelineColorBlendAttachmentState[2] blend_attachments=[colour_blend_attachment,colour_blend_attachment];
 		VkPipelineColorBlendStateCreateInfo colour_blend_info={
-			attachmentCount: 1,
-			pAttachments: &colour_blend_attachment
+			attachmentCount: pass==_post.hdr_pass ? 2u : 1u,
+			pAttachments: blend_attachments.ptr
 		};
 
 		VkDynamicState[] dynamic_states=[ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR ];
@@ -3610,7 +3803,7 @@ LAB_0004814b:
 			pColorBlendState: &colour_blend_info,
 			pDynamicState: &dynamic_state_info,
 			layout: _pipeline_layout,
-			renderPass: _render_pass,
+			renderPass: pass,
 			basePipelineIndex: -1
 		};
 
@@ -3623,6 +3816,8 @@ LAB_0004814b:
 	void DestroyObjectRendering()
 	{
 		foreach(pipeline; _object_pipelines)
+			vkDestroyPipeline(g_Device, pipeline, null);
+		foreach(pipeline; _hdr_object_pipelines)
 			vkDestroyPipeline(g_Device, pipeline, null);
 		vkDestroyShaderModule(g_Device, _object_vert_shader, null);
 		vkDestroyShaderModule(g_Device, _object_frag_shader, null);
@@ -3706,7 +3901,7 @@ LAB_0004814b:
 			{
 				if (!pipe_bound || batch.pipe!=bound_pipe)
 				{
-					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _object_pipelines[batch.pipe]);
+					vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, (_record_hdr ? _hdr_object_pipelines[batch.pipe] : _object_pipelines[batch.pipe]));
 					if (!pipe_bound)
 						vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 0, 1, &_descriptor_sets[image_index], 0, null);
 					bound_pipe=batch.pipe;
@@ -4261,12 +4456,25 @@ private:
 
 		vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_pipeline);
 		test_out.writeln("Graphics Pipeline created.");
+		graphics_pipe_info.renderPass=_post.hdr_pass;
+		VkPipelineColorBlendAttachmentState[2] hdr_blends=[colour_blend_attachment,colour_blend_attachment];
+		colour_blend_info.attachmentCount=2;
+		colour_blend_info.pAttachments=hdr_blends.ptr;
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_hdr_pipeline), "HDR world pipeline");
+		graphics_pipe_info.renderPass=_render_pass;
+		colour_blend_info.attachmentCount=1;
+		colour_blend_info.pAttachments=&colour_blend_attachment;
 
 		// the same with colour writes off and both faces, for the sky portals
 		colour_blend_attachment.colorWriteMask=0;
 		rasterizer_info.cullMode=VK_CULL_MODE_NONE;
 		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_pipeline_depth_only),
 			"vkCreateGraphicsPipelines (sky portals)");
+		graphics_pipe_info.renderPass=_post.hdr_pass;
+		hdr_blends[]=[colour_blend_attachment,colour_blend_attachment];
+		colour_blend_info.attachmentCount=2;
+		colour_blend_info.pAttachments=hdr_blends.ptr;
+		VkCheck(vkCreateGraphicsPipelines(g_Device, VK_NULL_ND_HANDLE, 1, &graphics_pipe_info, null, &_hdr_depth_only), "HDR sky pipeline");
 	}
 
 	void CreateFramebuffers()
@@ -4449,6 +4657,7 @@ private:
 		ubo.camera=[camera_pos.x, camera_pos.y, camera_pos.z, _light_falloff];
 		ubo.model_light=[_model_light_direction[0], _model_light_direction[1], _model_light_direction[2], 48f];
 		ubo.debug_view=_debug_view;
+		ubo.bloom_enabled=_bloom && _scene_rendered && _debug_view==DebugView.Final ? 1f : 0f;
 		ubo.effects_from_x=_compare ? _scene_viewport.x+_scene_viewport.width*0.5f : -1f;
 
 		debug(FrameTrace) test_out.writeln(ubo);
@@ -5309,6 +5518,8 @@ private:
 		_vertex_buffer=VK_NULL_ND_HANDLE;
 		_vertex_index_buffer=VK_NULL_ND_HANDLE;
 		index_count=0;
+		_world_casters.length=0;
+		_previous_shadow_lights.length=0;
 		_animated_polygons.length=0; // the level's polygons are about to go away
 		_cloud_intensity_texture=null; // the next level's cloud texture may reuse the address
 
@@ -5363,6 +5574,16 @@ private:
 			if (polygon.surface.flags & SurfaceFlags.Invisible)
 				continue;
 
+			WorldCaster caster;
+			caster.first=cast(uint)indices.length;
+			caster.polygon=polygon;
+			caster.low=polygon.DiskVerts()[0].vertex_data.xyz.vector;
+			caster.high=caster.low;
+			foreach(ref v; polygon.DiskVerts()) foreach(c; 0..3) {
+				float x=v.vertex_data.xyz.vector[c];
+				if (x<caster.low[c]) caster.low[c]=x;
+				if (x>caster.high[c]) caster.high[c]=x;
+			}
 			const uint[2]* lightmap_origin=polygon in lightmap_origins;
 
 			foreach(j, vertex; polygon.DiskVerts())
@@ -5401,6 +5622,8 @@ private:
 
 				indices~=cast(uint)(vert_count+j);
 			}
+			caster.count=cast(uint)indices.length-caster.first;
+			if (!(polygon.surface.flags & (SurfaceFlags.Sky | SurfaceFlags.NonExistant | SurfaceFlags.Hullmaker))) _world_casters~=caster;
 		}
 
 		bool DoNode(Node* node, out Vertex[] verts_out, out uint[] indices_out)
@@ -5567,4 +5790,4 @@ class Shader
 
 		return shader_module;
 	}
-}
+}

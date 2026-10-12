@@ -1,0 +1,26 @@
+{
+  "name": "release_igpu", "width": 1280, "height": 720, "pixel_order": "rgba",
+  "world": "Worlds\\01_SubwayA.dat",
+  "viewport": [0, 0, 1279, 719],
+  "camera": {"position": [-32, 180, -3180], "rotation": [0, 0, 0, 1], "fov": [1.82454, 1.25664], "near": 0.1, "far": 15000},
+  "matrices": {"layout": "column-major, clip = proj * view * world", "view": [1, -0, -0, 0, 0, -1, -0, 0, 0, -0, -1, 0, 32, 180, -3180, 1], "proj": [0.773745, 0, 0, 0, 0, 1.37638, 0, 0, 0, 0, -1.00001, -1, 0, 0, -0.200001, 0]},
+  "depth": {"file": "release_igpu_depth.f32", "format": "float32 device depth 0..1, rows top to bottom"},
+  "settings": {"lighting": true, "specular": 0.250, "falloff": 1.000, "aa": false, "debug_light": 400.0, "fog": true, "fog_range": [700, 2000], "fog_colour": [0, 0, 0], "fog_by_distance": false, "saturate": true, "global_light_scale": [1, 1, 1]},
+  "modern_effects": {"bloom": false, "bloom_intensity": 0.150, "bloom_threshold": 1.000, "dynamic_shadows": true, "dynamic_light_budget": 2},
+  "dynamic_shadow_lights": [{"light": 0, "world_polygons": 347, "faces": [{"tile": [0.75, 0.875, 0.0625, 0.8], "view_proj": [0, -0, 1.002, 1, 0, 1, 0, 0, -1, 0, 0, 0, -3140, -180, 31.2625, 32]},{"tile": [0.8125, 0.875, 0.0625, 0.8], "view_proj": [0, 0, -1.002, -1, -0, 1, 0, 0, 1, 0, 0, 0, 3140, -180, -32.8657, -32]},{"tile": [0.75, 0.9375, 0.0625, 0.8], "view_proj": [-1, 0, 0, 0, 0, -0, 1.002, 1, 0, 1, 0, 0, -32, 3140, -181.162, -180]},{"tile": [0.8125, 0.9375, 0.0625, 0.8], "view_proj": [1, 0, 0, 0, 0, 0, -1.002, -1, -0, 1, 0, 0, 32, 3140, 179.559, 180]},{"tile": [0.875, 0.875, 0.0625, 0.8], "view_proj": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.002, 1, 32, -180, 3145.49, 3140]},{"tile": [0.9375, 0.875, 0.0625, 0.8], "view_proj": [-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1.002, -1, -32, -180, -3147.09, -3140]}]}],
+  "lights": [
+    {"index": 0, "position": [-32, 180, -3140], "colour": [255, 235, 210], "radius": 400.00, "flags": "0x0"}
+  ],
+  "variants": [
+    {"label": "off", "view": "final", "file": "release_igpu_off.png", "settings": {"dynamicshadows": "0", "bloom": "0"}, "hud": false, "post": false, "gpu_ms": {"sky_world": 1.2606, "objects": 0.0284, "post": 0.0001, "2d": 0.0000, "static_shadows": 0.0004, "dynamic_shadows": 0.0001, "bloom": 0.0000}},
+    {"label": "on", "view": "final", "file": "release_igpu_on.png", "settings": {"dynamicshadows": "1", "bloom": "0"}, "hud": false, "post": false, "gpu_ms": {"sky_world": 5.8824, "objects": 0.0298, "post": 0.0001, "2d": 0.0000, "static_shadows": 0.2739, "dynamic_shadows": 0.4930, "bloom": 0.0000}},
+    {"label": "zero", "view": "final", "file": "release_igpu_zero.png", "settings": {"dynamicshadows": "1", "bloom": "1", "bloomintensity": "0"}, "hud": false, "post": true, "gpu_ms": {"sky_world": 6.5624, "objects": 0.0330, "post": 0.7036, "2d": 0.0001, "static_shadows": 0.2730, "dynamic_shadows": 0.9350, "bloom": 0.5998}},
+    {"label": "bloom", "view": "final", "file": "release_igpu_bloom.png", "settings": {"dynamicshadows": "1", "bloom": "1"}, "hud": false, "post": true, "gpu_ms": {"sky_world": 6.5550, "objects": 0.0406, "post": 0.7507, "2d": 0.0001, "static_shadows": 0.2730, "dynamic_shadows": 0.6562, "bloom": 0.5734}},
+    {"label": "aa", "view": "final", "file": "release_igpu_aa.png", "settings": {"dynamicshadows": "1", "bloom": "1", "aa": "1"}, "hud": false, "post": true, "gpu_ms": {"sky_world": 6.5539, "objects": 0.0412, "post": 1.3412, "2d": 0.0001, "static_shadows": 0.2719, "dynamic_shadows": 0.9964, "bloom": 0.5741}}
+  ],
+  "level_ambient": [0, 0, 0],
+  "shadow_pairs": [
+  ],
+  "ids": {
+  }
+}

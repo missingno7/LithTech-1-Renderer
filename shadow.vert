@@ -13,10 +13,12 @@ layout(location=2) in vec2 uv_in;
 
 layout(location=0) out vec2 uv_out;
 layout(location=1) out float alpha_out;
+layout(location=2) out vec3 world_out;
 
 void main()
 {
 	gl_Position=pc.view_proj*vec4(position_in, 1.0);
 	uv_out=uv_in;
 	alpha_out=colour_in.a;
+	world_out=position_in;
 }

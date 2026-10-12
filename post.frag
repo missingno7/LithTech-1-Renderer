@@ -6,11 +6,13 @@
 // its FXAA_GATHER4 path, and less sub-pixel blending than its default so the low-resolution textures stay sharp.
 
 layout(set=0, binding=0) uniform sampler2D scene;
+layout(set=0, binding=1) uniform sampler2D bloom_tex;
 
 layout(push_constant) uniform PushConstants {
 	vec2 texel; // 1 / size
 	float anti_aliasing; // 0 off, 1 FXAA
 	float from_x; // the effects apply at and right of this x (d_Compare draws the left half without them)
+	float mode, threshold, intensity, pad;
 } pc;
 
 layout(location=0) in vec2 uv_in;
@@ -136,9 +138,47 @@ vec3 Fxaa(vec2 uv)
 	return textureLod(scene, final_uv, 0.0).rgb;
 }
 
-void main()
-{
-	bool effects=gl_FragCoord.x>=pc.from_x;
-	vec3 colour=(effects && pc.anti_aliasing>0.5) ? Fxaa(uv_in) : texelFetch(scene, ivec2(gl_FragCoord.xy), 0).rgb;
-	colour_out=vec4(colour, 1.0);
+// Threshold full-resolution texels before the first reduction so tiny bright texels survive.
+vec3 Threshold(vec3 c) {
+	c=max(c, vec3(0.0));
+	float peak=max(c.r, max(c.g, c.b));
+	float knee=max(pc.threshold*0.25, 0.01);
+	float soft=clamp(peak-pc.threshold+knee, 0.0, 2.0*knee);
+	soft=soft*soft/(4.0*knee);
+	return c*max(peak-pc.threshold, soft)/max(peak, 0.0001);
+}
+vec3 ExtractQuad() {
+	ivec2 size=textureSize(scene,0);
+	ivec2 base=ivec2(gl_FragCoord.xy)*2;
+	vec3 sum=vec3(0.0);
+	for(int y=0; y<2; ++y) for(int x=0; x<2; ++x) {
+		ivec2 pixel=min(base+ivec2(x,y),size-1);
+		if ((float(pixel.x)+0.5)/float(size.x)>=pc.from_x)
+			sum+=Threshold(texelFetch(scene,pixel,0).rgb);
+	}
+	return sum*0.25;
+}
+vec3 BloomSample(vec2 uv) {
+	if (uv.x<pc.from_x) return vec3(0.0);
+	return max(textureLod(scene, uv, 0.0).rgb, vec3(0.0));
+}
+vec3 BloomFilter(vec2 uv) {
+	vec3 sum=vec3(0.0);
+	for(int y=-1; y<=1; ++y) for(int x=-1; x<=1; ++x) {
+		float w=float((x==0 ? 2 : 1)*(y==0 ? 2 : 1))/16.0;
+		sum+=BloomSample(uv+vec2(x,y)*pc.texel)*w;
+	}
+	return sum;
+}
+void main() {
+	if (pc.mode>0.5) {
+		if (pc.mode<1.5) { colour_out=vec4(ExtractQuad(),1.0); return; }
+		vec3 c=BloomFilter(uv_in);
+		if (pc.mode>2.5) c=mix(textureLod(bloom_tex, uv_in, 0.0).rgb, c, 0.5);
+		colour_out=vec4(c, 1.0); return;
+	}
+	vec3 base=gl_FragCoord.x>=pc.from_x && pc.anti_aliasing>0.5 ? Fxaa(uv_in) : texelFetch(scene, ivec2(gl_FragCoord.xy), 0).rgb;
+	base=clamp(base, 0.0, 1.0); // preserve the original gamma-space base; no exposure or tone-map shift
+	if (gl_FragCoord.x>=pc.from_x && pc.intensity>0.0) base+=textureLod(bloom_tex, uv_in, 0.0).rgb*pc.intensity;
+	colour_out=vec4(base, 1.0);
 }

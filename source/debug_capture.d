@@ -16,7 +16,9 @@ module DebugCapture;
  + and id views.
  +
  + Variant keys: view (final, light, dynamic, normal, id, specular, lights), lighting, specular, falloff, aa,
- + compare, hud (final views only). tools/analyze_capture.py decodes the views.
+ + compare, bloom, bloomintensity, bloomthreshold, dynamicshadows, dynamicshadowlights, shadows,
+ + hud (final views only). tools/analyze_capture.py decodes the views. Shadow views include point-light visibility;
+ + captures record selected point lights, cached world-caster counts, face matrices/tiles and separate GPU stages.
  +/
 
 import std.conv: to;
@@ -60,7 +62,8 @@ CaptureRequest* ParseCapture(string line)
 		// the frame as shown (with the 2D layer), d3d.ren's lighting against the modern one, the light term and the ids;
 		// other views on request
 		request.variants~=CaptureVariant("shown", DebugView.Final, null, true);
-		request.variants~=CaptureVariant("classic", DebugView.Final, [["lighting", "0"], ["aa", "0"]], false);
+		request.variants~=CaptureVariant("classic", DebugView.Final, [["lighting", "0"], ["aa", "0"], ["bloom", "0"],
+			["shadows", "0"], ["dynamicshadows", "0"]], false);
 		request.variants~=CaptureVariant("modern", DebugView.Final, [["lighting", "1"]], false);
 		foreach(view; [DebugView.Light, DebugView.Id])
 			request.variants~=CaptureVariant(ViewName(view), view, null, false);

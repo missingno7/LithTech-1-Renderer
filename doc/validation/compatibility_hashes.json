@@ -1,0 +1,30 @@
+{
+  "original_head": "29c38330d4151eb8c758a6f11823e7e995e55243",
+  "original_fragment_shaders_same_frame": [
+    {
+      "capture": "final_compat",
+      "width": 1280,
+      "height": 720,
+      "identical": true,
+      "current_sha256": "98d4e8950c107e6e7251cfd9cf8df7bc5c3e55f762c6c035e6b89f6df4b0b0b0",
+      "original_sha256": "98d4e8950c107e6e7251cfd9cf8df7bc5c3e55f762c6c035e6b89f6df4b0b0b0"
+    },
+    {
+      "capture": "final_compat_lights",
+      "width": 1280,
+      "height": 720,
+      "identical": true,
+      "current_sha256": "44c40d788a0367b864da076bed04e22de319de0597b699290203388837f8d5bd",
+      "original_sha256": "44c40d788a0367b864da076bed04e22de319de0597b699290203388837f8d5bd"
+    },
+    {
+      "capture": "final_compat_modern",
+      "width": 1280,
+      "height": 720,
+      "identical": true,
+      "current_sha256": "0b4796ada055be30fdbfd72ecff8a7433f20f333f6c3b77f9575ded45618d6ae",
+      "original_sha256": "0b4796ada055be30fdbfd72ecff8a7433f20f333f6c3b77f9575ded45618d6ae"
+    }
+  ],
+  "bloom_zero_intensity_same_as_off": true
+}

@@ -1,0 +1,22 @@
+{
+  "name": "final_compat", "width": 1280, "height": 720, "pixel_order": "bgra",
+  "world": "Worlds\\01_SubwayA.dat",
+  "viewport": [0, 0, 1279, 719],
+  "camera": {"position": [-32, 180, -3180], "rotation": [0, 0, 0, 1], "fov": [1.82454, 1.25664], "near": 0.1, "far": 15000},
+  "matrices": {"layout": "column-major, clip = proj * view * world", "view": [1, -0, -0, 0, 0, -1, -0, 0, 0, -0, -1, 0, 32, 180, -3180, 1], "proj": [0.773745, 0, 0, 0, 0, 1.37638, 0, 0, 0, 0, -1.00001, -1, 0, 0, -0.200001, 0]},
+  "depth": {"file": "final_compat_depth.f32", "format": "float32 device depth 0..1, rows top to bottom"},
+  "settings": {"lighting": false, "specular": 0.250, "falloff": 1.000, "aa": false, "debug_light": 0.0, "fog": true, "fog_range": [700, 2000], "fog_colour": [0, 0, 0], "fog_by_distance": false, "saturate": true, "global_light_scale": [1, 1, 1]},
+  "modern_effects": {"bloom": false, "bloom_intensity": 0.150, "bloom_threshold": 1.000, "dynamic_shadows": true, "dynamic_light_budget": 2},
+  "dynamic_shadow_lights": [],
+  "lights": [
+  ],
+  "variants": [
+    {"label": "current", "view": "final", "file": "final_compat_current.png", "settings": {"lighting": "0", "bloom": "0", "dynamicshadows": "0"}, "hud": false, "post": false, "gpu_ms": {"sky_world": 0.2309, "objects": 0.0348, "post": 0.0000, "2d": 0.0000, "static_shadows": 0.0002, "dynamic_shadows": 0.0001, "bloom": 0.0000}},
+    {"label": "original", "view": "final", "file": "final_compat_original.png", "settings": {"lighting": "0", "bloom": "0", "dynamicshadows": "0", "originalshader": "1"}, "hud": false, "post": false, "gpu_ms": {"sky_world": 0.2603, "objects": 0.0338, "post": 0.0000, "2d": 0.0000, "static_shadows": 0.0001, "dynamic_shadows": 0.0001, "bloom": 0.0000}}
+  ],
+  "level_ambient": [0, 0, 0],
+  "shadow_pairs": [
+  ],
+  "ids": {
+  }
+}

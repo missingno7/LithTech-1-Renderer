@@ -115,6 +115,16 @@ original light grid gave them.
 the 2D layer goes on top, so the HUD, menus and console stay sharp. With every post effect off, d_ren draws straight
 into the swapchain as before.
 
+`d_Bloom 1` adds a restrained glow from fullbright texture regions and overbright lighting through a floating-point
+bloom-source target and a five-level pyramid. The original colour is preserved alongside it. `d_BloomIntensity`
+(0.15) and `d_BloomThreshold` (1) control it. Lighting
+stays in the original gamma space. It works with FXAA, and the 2D layer remains outside the effect.
+
+With `d_Lighting 1`, `d_DynamicShadows 1` lets the actual level geometry, models and world models block dynamic lights.
+Up to `d_DynamicShadowLights` lights (default 2, maximum 4) render six small shadow views each, sharing the lamp shadow
+atlas. Only that light's additional contribution is shadowed; the original baked lightmaps remain intact. Both new
+effects default off. See [implementation and validation notes](doc/modernisation.md) for budgets and limitations.
+
 ### Console variables
 d_ren's options are engine console variables. On first run they're created with their defaults and marked to be
 saved, so after the game exits they appear in `autoexec.cfg`, where they can be edited. In the console, `name value`
@@ -134,8 +144,13 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_Specular` | 0.25 | Specular strength of the modern lighting; 0 turns it off. |
 | `d_LightFalloff` | 1 | Exponent of the modern lighting's falloff `(1 - d²/r²)^n`; 1 is d3d.ren's lightmap curve, higher is softer. |
 | `d_AntiAliasing` | 0 | 1: FXAA on the 3D scene (not the 2D layer). |
+| `d_Bloom` | 0 | 1: thresholded bloom from fullbright texels and overbright scene lighting. |
+| `d_BloomIntensity` | 0.15 | Bloom strength, 0..2. |
+| `d_BloomThreshold` | 1 | Extraction threshold in gamma-space intensity units, 0.1..8. |
+| `d_DynamicShadows` | 0 | 1: geometry shadows for selected dynamic lights with `d_Lighting 1`. |
+| `d_DynamicShadowLights` | 2 | Maximum selected shadow lights, 0..4; use 1 initially on the iGPU. |
 | `d_Shadows` | 0 | 1: models cast soft shadows from the level's lamps (see *Lamp shadows*); 0: d3d.ren's flattened shadows. |
-| `d_ShadowPairs` | 16 | How many lamp/caster shadow maps per frame (1..64). |
+| `d_ShadowPairs` | 16 | Lamp/caster budget (1..64); point lights reserve 2/3/5/6 atlas tiles for 1/2/3/4 selected lights. |
 | `d_Compare` | 0 | 1: left half of the view as d3d.ren with no post effects, right half with the current settings. |
 | `d_DebugLight` | 0 | Radius of a test light ahead of the camera; 0 = none. |
 | `d_ModelFlip`, `d_ModelVertexAnim` | 1 | Model diagnostics: the handedness flip and per-vertex animation. |
@@ -173,6 +188,11 @@ For testing renderer changes without driving the game window by hand:
 - `tools/analyze_capture.py <captures folder> <name>` reads a capture: what's at the crosshair or a pixel (`--at X Y`)
   and which lights reach it, coverage and light terms per surface (`--surfaces`), and per-surface changes between two
   variants (`--diff A B`).
+
+- New capture keys: `bloom`, `bloomintensity`, `bloomthreshold`, `dynamicshadows`, `dynamicshadowlights` and `shadows`.
+  `view=shadow` also shows point-light visibility. JSON records selected light faces and separate shadow/bloom GPU
+  stages. `tools/shadow_tests.d` tests projection/selection; `tools/validate_shadows.py` checks captured point-light
+  visibility against dumped static geometry (see the modernisation document).
 
 ## Building
 LithTech 1 is 32-bit only, so the renderer must be built as 32-bit. A 64-bit build fails one of the static asserts that
