@@ -11,10 +11,11 @@ module ModelDraw;
 
 import LTObjects;
 import SceneGeometry;
-import RendererTypes: SceneDesc, ModelHookData;
+import RendererTypes: SceneDesc, ModelHookData, ModelHookFlags;
 import Texture: SharedTexture, RenderTexture;
 import WorldBsp: MainWorld, WorldBsp, Node, SurfaceFlags;
 import erupted: VkDescriptorSet;
+import RendererCompat: ModelWarble;
 
 // ModelInstance, port ABI 4.2 (offsets from the object)
 enum : size_t
@@ -113,7 +114,7 @@ __gshared CloudLightSettings g_CloudLight;
 // d3d.ren draws every model through this; geometry goes into `geometry` in world space
 void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, MainWorld* world,
 	const float[3] light_direction, const DynamicLight[] lights, const ModelShadowSettings* shadows,
-	const ModelEnvSettings* env, scope RenderTexture delegate(SharedTexture*) resolve_texture)
+	const ModelEnvSettings* env, const ModelWarble* warble, scope RenderTexture delegate(SharedTexture*) resolve_texture)
 {
 	void* model=At!(void*)(object, ModelDataOffset);
 	void* prev_anim=At!(void*)(object, ModelPrevAnimOffset);
@@ -144,8 +145,9 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	//// light ramp (and the same light unstepped, without the dynamic lights, for the modern lighting)
 	uint draw_flags;
+	bool use_texture;
 	BatchLighting modern;
-	float[4][16] ramp=LightRamp(object, scene, world, lights, draw_flags, modern);
+	float[4][16] ramp=LightRamp(object, scene, world, lights, draw_flags, use_texture, modern);
 
 	//// hidden nodes (d3d_model_core.cpp ApplyHiddenNodeList)
 	_node_visible[]=true;
@@ -164,8 +166,8 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	// solid iff the object is fully opaque (d3d_ProcessModel)
 	const bool translucent=object.a!=0xFF;
-	RenderTexture skin=resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset));
-	const bool chrome=env && env.texture && env.enable && (env.all || (object.flags & ObjectFlag.EnvironmentMap));
+	RenderTexture skin=use_texture ? resolve_texture(At!(SharedTexture*)(object, ModelSkinOffset)) : null;
+	const bool chrome=use_texture && env && env.texture && env.enable && (env.all || (draw_flags & ObjectFlag.EnvironmentMap));
 
 	_mesh.length=0;
 	_mesh.assumeSafeAppend();
@@ -191,8 +193,12 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 			if (step<0) step=0;
 			else if (step>15) step=15;
 
+			float[3] position=source.pos;
+			// Native transforms each source vertex once, before face expansion: shared
+			// corners and hidden faces must not advance the warble index independently.
+			if (warble) position[]*=warble.Scale(face.vertex[corner]);
 			ObjectVertex vertex={
-				pos: node.TransformPoint(source.pos),
+				pos: node.TransformPoint(position),
 				colour: ramp[step],
 				uv: [face_uvs[face_index*6+corner*2], face_uvs[face_index*6+corner*2+1]],
 				normal: normal
@@ -211,7 +217,8 @@ void DrawModel(ref ObjectGeometry geometry, LTObject* object, SceneDesc* scene, 
 
 	const DrawGroup group=translucent ? geometry.translucent_group : geometry.solid_group;
 	const ObjectPipe pipe=translucent ? geometry.translucent_pipe : geometry.solid_pipe;
-	const TextureMode skin_mode=(skin && skin.fullbright) ? TextureMode.Fullbright : TextureMode.Normal;
+	const TextureMode skin_mode=!use_texture ? TextureMode.Untextured :
+		(skin && skin.fullbright) ? TextureMode.Fullbright : TextureMode.Normal;
 	const VkDescriptorSet skin_texture=skin ? skin.texture_descriptor : VkDescriptorSet.init;
 
 	geometry.lighting=modern;
@@ -655,12 +662,13 @@ float CloudLight(const float[3] pos)
 // `modern` gets the ramp's ambient and directional light for the modern lighting, which lights the model per pixel and
 // adds the dynamic lights there instead of in the ambient light.
 float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, const DynamicLight[] lights,
-	out uint draw_flags, out BatchLighting modern)
+	out uint draw_flags, out bool use_texture, out BatchLighting modern)
 {
 	import gl3n.linalg: vec3;
 
 	// the object flags this draw uses: the model hook may change them for this frame only (FLAG_SHADOW etc.)
 	draw_flags=object.flags;
+	use_texture=true;
 
 	static float Clamp255(float value) { return value<0f ? 0f : value>255f ? 255f : value; }
 
@@ -694,6 +702,7 @@ float[4][16] LightRamp(LTObject* object, SceneDesc* scene, MainWorld* world, con
 		hook(&data, scene.model_hook_user);
 		ambient=light_add.vector;
 		draw_flags=cast(uint)data.object_flags;
+		use_texture=(data.flags & ModelHookFlags.UseTexture)!=0;
 	}
 
 	float[3] modern_ambient;

@@ -23,22 +23,7 @@ struct RenderStructInit
 	static assert(this.sizeof==424);
 }
 
-struct Mode // RMode_t from basedefs
-{
-align(1):
-	byte is_hardware;
-
-	char[200] filename; // What DLL this comes from.
-	char[100] driver_name; // This is what the DLLs use to identify a card.
-	char[100] display_name; // This is a 'friendly' string describing the card.
-
-align(4): // 3 align bytes here
-	int width, height;
-	uint depth;
-	Mode* next;
-
-	static assert(this.sizeof==420);
-}
+public import RendererCompat: Mode;
 
 struct RenderContextInit
 {

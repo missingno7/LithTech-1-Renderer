@@ -54,7 +54,8 @@ void main()
 	float fog=FogFactor();
 	bloom_source_out=vec4(0.0);
 
-	if (mode>1.5 && mode<2.5)
+	bool untextured=mode>1.5 && mode<2.5;
+	if (untextured && pc.ambient.w<0.5)
 	{
 		// no texture bound: the diffuse colour alone
 		colour_out=vec4(Fog(colour_in.rgb, fog), colour_in.a);
@@ -67,7 +68,7 @@ void main()
 		return;
 	}
 
-	vec4 texel=texture(sampler2D(tex, tex_sampler), uv_in);
+	vec4 texel=untextured ? vec4(1.0) : texture(sampler2D(tex, tex_sampler), uv_in);
 
 	// the modern lighting replaces the vertex / texel lights of lit geometry with per-pixel ones (lighting.glsl)
 	float kind=pc.ambient.w;
@@ -158,7 +159,7 @@ void main()
 			// world fullbright: the fullbright texels are added (alpha marks them, so it isn't opacity)
 			shaded=vec4((hdr ? colour+fullbright_add : min(colour+fullbright_add,vec3(1.0))), colour_in.a);
 		}
-		else if (mode>0.5)
+		else if (mode>0.5 && mode<1.5)
 		{
 			// model fullbright: d3d.ren draws the mesh again with DECAL + alpha blending and fog off, i.e. the fullbright
 			// texels at full texture colour (blood2_recon port_notes/model.md)

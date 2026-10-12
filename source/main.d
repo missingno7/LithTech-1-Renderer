@@ -16,6 +16,8 @@ import WorldBsp: WorldBsp, MainWorld, Node;
 import Texture;
 import Objects.BaseObject;
 
+// CPU integration tests provide their own executable entry point.
+version(RendererCpuTests) {} else
 extern(Windows)
 BOOL DllMain(HINSTANCE hInstance, ULONG ulReason, LPVOID pvReserved)
 {
@@ -288,6 +290,11 @@ void RegisterRendererOptions()
 		["d_FogMode", "0"],    // 0: fog like d3d.ren (device depth); 1: by eye distance
 		["d_DebugClear", "0"], // 1: holes in the world shown in blue
 		["d_GPU", "0"],        // which Vulkan adapter, by its index in vk_test.txt's device list
+		["DrawEnable", "1"],
+		["DrawModels", "1"],
+		["ModelWarble", "0"],
+		["WarbleScale", "0.92"],
+		["WarbleSpeed", "25"],
 		["d_Lighting", "0"],   // 0: dynamic lights like d3d.ren; 1: per pixel with N.L and specular
 		["d_AntiAliasing", "0"], // 0: none; 1: FXAA
 		["d_DynamicShadows", "0"],
@@ -1106,8 +1113,10 @@ void BlitToScreen(BlitRequest* blit_request)
 
 void MakeScreenShot(const char* screenshot_filename)
 {
-	test();
-	writeln(screenshot_filename);
+	import std.string: fromStringz;
+	if (screenshot_filename is null || _renderer_inst is null) return;
+	try _renderer_inst.MakeScreenShot(screenshot_filename.fromStringz.idup);
+	catch (Throwable t) ReportThrowable("MakeScreenShot", t);
 }
 
 void ReadConsoleVariables()

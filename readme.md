@@ -32,7 +32,7 @@ them by default (see *Fog* below).
 - Objects are drawn in the order of d3d.ren's object queues.
 
 ## Not done yet
-- Model LOD (models are always drawn at full detail), the multiplayer skin tint pass, CoolFog, the screenshot key.
+- Model LOD (models are always drawn at full detail), the multiplayer skin tint pass, CoolFog.
 - Line systems are implemented but haven't been checked in-game yet.
 - There is no visibility culling: the whole level is drawn every frame. It is still fast.
 
@@ -159,6 +159,12 @@ changes an option for the current session only; `+name value` also saves it.
 The renderer also reads the game's own `FogEnable`, `FogNearZ`/`FogFarZ`, `FogR/G/B`, `SkyFogNearZ`/`SkyFogFarZ` and
 `Saturate`, the same way d3d.ren does.
 
+`DrawEnable 0` disables the whole 3D scene while keeping the 2D interface; `DrawModels 0` disables models.
+Model hooks can disable skin/environment textures with `MHF_USETEXTURE`, retaining the model's lighting and shadows.
+`ModelWarble 1` enables the original animated model-vertex scaling (`WarbleScale 0.92`, `WarbleSpeed 25` by default).
+The normal screenshot key writes a 24-bit BMP to the engine-requested filename, including post effects and the HUD,
+on the next presented frame. This uses the renderer's own offscreen readback image.
+
 Logs: `vk_test.txt` (Vulkan setup; once a second: fps, object statistics, a per-stage frame time breakdown on the CPU
 and per pass on the GPU, frame pacing, how often the camera moved, and the game speed) and `test.txt` (engine calls, a
 once-a-second heartbeat, and any exception thrown inside the renderer). Both are in the game folder.
@@ -205,6 +211,7 @@ Vulkan SDK's `glslangValidator`). `build.ps1` finds them under `-Toolchains` (de
 .\build.ps1                                     # debug build
 .\build.ps1 -Release -GameDir D:\Games\Blood2   # release build, deployed to the game folder
 .\build.ps1 -Package                            # release build -> dist\d_ren-<version>.zip (renderer + install notes)
+.\tools\test_renderer.ps1                      # CPU-only ABI, model hook/render gates, warble, BMP and shadow tests
 ```
 By hand: compile the six shaders (`shader`, `object` and `overlay`, `.vert`/`.frag`) to `vert.spv`/`frag.spv`,
 `object_vert.spv`/`object_frag.spv` and `overlay_vert.spv`/`overlay_frag.spv` in the repository root (they're

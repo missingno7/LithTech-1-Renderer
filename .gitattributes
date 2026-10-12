@@ -2,3 +2,5 @@
 source/vulkan_renderer.d -text whitespace=cr-at-eol
 shader.frag -text whitespace=cr-at-eol
 readme.md -text whitespace=cr-at-eol
+source/renderer.d -text whitespace=cr-at-eol
+source/renderer_interface.d -text whitespace=cr-at-eol

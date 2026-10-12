@@ -47,6 +47,12 @@ public:
 		SDL_RenderClear(_renderer);
 	}
 
+	void MakeScreenShot(string filename)
+	{
+		import std.string: toStringz;
+		SDL_SaveBMP(_surface_main, filename.toStringz);
+	}
+
 	void Destroy()
 	{
 		SDL_FreeSurface(_surface_main);

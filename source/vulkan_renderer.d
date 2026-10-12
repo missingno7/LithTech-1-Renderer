@@ -708,8 +708,28 @@ public:
 	vec3 camera_pos;
 	quat camera_view=quat.identity;
 	float fov_x=1.5708f, fov_y=1.2f; // radians, from the scene
+	import RendererCompat: ModelWarble;
+	ModelWarble _model_warble;
+	bool _model_warble_enabled;
 	override void RenderScene(SceneDesc* scene_desc) // vkCmd*
 	{
+		import Main: _renderer;
+		float ConsoleFloat(const(char)* name, float fallback)
+		{
+			void* variable=_renderer ? _renderer.GetConsoleVar(name) : null;
+			return variable ? _renderer.GetVarValueFloat(variable) : fallback;
+		}
+		if (scene_desc is null) return;
+		_model_warble_enabled=ConsoleFloat("ModelWarble", 0f)!=0f;
+		scope(exit) _model_warble.EndScene(scene_desc.frame_delta, ConsoleFloat("WarbleSpeed", 25f), ConsoleFloat("WarbleScale", 0.92f));
+		// d3d_RenderScene (0x19970): DrawEnable gates the complete scene,
+		// including the world, object list, sky and camera light-add quad.
+		if (ConsoleFloat("DrawEnable", 1f)==0f)
+		{
+			_scene_rendered=false;
+			_objects.Clear();
+			return;
+		}
 		if (!ApplyViewBookmark(scene_desc))
 			return;
 		_scene_rendered=true;
@@ -1218,6 +1238,8 @@ LAB_0004814b:
 		vkQueueWaitIdle(_graphics_queue);
 		Mark(Timing.GpuWait);
 		ReadGpuTimer();
+		if (_screenshot_requests.length && res!=VK_ERROR_OUT_OF_DATE_KHR && res!=VK_ERROR_SURFACE_LOST_KHR)
+			RunScreenShots(image_index);
 
 		// the command file, and a requested capture of this frame (its geometry is still here)
 		PollCommands();
@@ -1326,7 +1348,7 @@ LAB_0004814b:
 		vkCmdBindDescriptorSets(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline_layout, 2, 1, &cloud_texture, 0, null);
 		PushBatchConstants(buffer, 0f);
 
-		if (g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
+		if (_scene_rendered && !_objects.object_list && g_RenderContext !is null && _vertex_buffer!=VK_NULL_ND_HANDLE)
 		{
 			VkBuffer[] vertex_buffers=[ _vertex_buffer ];
 			VkDeviceSize[] offsets=[ 0 ];
@@ -1894,6 +1916,46 @@ LAB_0004814b:
 	VkCommandBuffer _capture_command_buffer;
 	VkExtent2D _capture_extent;
 	bool _capture_active;
+	string[] _screenshot_requests;
+
+	override void MakeScreenShot(string filename)
+	{
+		if (filename.length) _screenshot_requests~=filename.idup;
+	}
+
+	// The engine requests a screenshot before SwapBuffers. Read the composed
+	// frame through our owned capture image, never a presentation-owned image.
+	void RunScreenShots(uint image_index)
+	{
+		import RendererCompat: EncodeScreenshot;
+		const string[] requests=_screenshot_requests;
+		_screenshot_requests=null;
+		_capture_active=true;
+		scope(exit) _capture_active=false;
+		try
+		{
+			if (!EnsureCaptureTarget()) throw new Exception("no screenshot image");
+			FrameTarget target=FrameTarget(_capture_scene_pass, _capture_scene_framebuffer, _capture_present_pass,
+				_capture_present_framebuffer, true, false);
+			vkResetCommandBuffer(_capture_command_buffer, 0);
+			RecordFrameForCapture(_capture_command_buffer, image_index, target, false, _extents.width, _extents.height);
+			VkSubmitInfo submit={ commandBufferCount: 1, pCommandBuffers: &_capture_command_buffer };
+			VkCheck(vkQueueSubmit(_graphics_queue, 1, &submit, VK_NULL_ND_HANDLE), "screenshot submit");
+			VkCheck(vkQueueWaitIdle(_graphics_queue), "screenshot readback wait");
+			void* data;
+			VkCheck(vmaMapMemory(_capture_colour_memory, &data), "screenshot map");
+			scope(exit) vmaUnmapMemory(_capture_colour_memory);
+			const bool bgra=_format==VK_FORMAT_B8G8R8A8_UNORM || _format==VK_FORMAT_B8G8R8A8_SRGB;
+			auto bmp=EncodeScreenshot(_extents.width, _extents.height,
+				(cast(const(ubyte)*)data)[0..cast(size_t)_extents.width*_extents.height*4], bgra);
+			foreach(filename; requests)
+			{
+				try { auto file=File(filename, "wb"); file.rawWrite(bmp); file.close(); }
+				catch (Exception e) test_out.writeln("screenshot ", filename, ": ", e.msg);
+			}
+		}
+		catch (Exception e) test_out.writeln("screenshot: ", e.msg);
+	}
 
 	// the command file's lines run in order, one batch per frame up to a "wait <ms>"
 	string[] _command_queue;
@@ -2686,7 +2748,7 @@ LAB_0004814b:
 	// keeps the atlas in the layout the scene's descriptors expect)
 	void RecordShadowAtlas(VkCommandBuffer buffer, uint image_index)
 	{
-		import SceneGeometry: DrawGroup, TextureMode, ObjectPipe;
+		import SceneGeometry: DrawGroup, TextureMode, ObjectPipe, LightingKind;
 		// Keep descriptors valid after the first clear, but avoid clearing 4096² depth
 		// every frame when no light uses it. Shadow diagnostics request an explicit clear.
 		if (_shadow_atlas_initialised && !_shadow_draws.length && !_dynamic_selected.length && _debug_view!=DebugView.Shadow)
@@ -2724,7 +2786,7 @@ LAB_0004814b:
 				foreach(group; caster_groups)
 					foreach(ref batch; _objects.groups[group])
 					{
-						if (batch.model!=cast(int)draw.model || batch.mode==TextureMode.Untextured)
+						if (batch.model!=cast(int)draw.model || (batch.mode==TextureMode.Untextured && batch.lighting.kind!=LightingKind.Model))
 							continue;
 						// translucent world models (bars, grates) leave out their see-through texels; a fullbright
 						// texture's alpha marks its fullbright texels, never opacity
@@ -2793,7 +2855,7 @@ LAB_0004814b:
 				vkCmdBindVertexBuffers(buffer, 0, 1, &_object_vertex_buffer, &offset);
 				foreach(group; [DrawGroup.SolidModels, DrawGroup.SolidWorldModels, DrawGroup.TranslucentModels, DrawGroup.TranslucentWorldModels])
 					foreach(ref batch; _objects.groups[group]) {
-						if (batch.model<0 || batch.mode==TextureMode.Untextured) continue;
+						if (batch.model<0) continue;
 						ref model=_objects.models[batch.model];
 						import LTObjects: ObjectFlag;
 						LTObject* source=cast(LTObject*)model.object;
@@ -3476,6 +3538,7 @@ LAB_0004814b:
 		};
 
 		const bool draw_sprites=ConsoleFloat("DrawSprites", 1f)!=0f;
+		const bool draw_models=ConsoleFloat("DrawModels", 1f)!=0f;
 		const bool draw_particles=ConsoleFloat("DrawParticles", 1f)!=0f;
 		const bool draw_polygrids=ConsoleFloat("DrawPolyGrids", 1f)!=0f;
 		const bool draw_line_systems=ConsoleFloat("DrawLineSystems", 1f)!=0f;
@@ -3521,9 +3584,10 @@ LAB_0004814b:
 			switch(object.type)
 			{
 				case ObjectType.Model:
+					if (!draw_models) break;
 					_objects.Route(DrawGroup.SolidModels, ObjectPipe.Opaque, DrawGroup.TranslucentModels, ObjectPipe.Blend);
 					DrawModel(_objects, object, scene_desc, world, light_direction, _scene_lights, &model_shadows, &model_env,
-						&ResolveTexture);
+						_model_warble_enabled ? &_model_warble : null, &ResolveTexture);
 					break;
 				case ObjectType.WorldModel:
 				case ObjectType.Container: // d3d.ren handles both with d3d_ProcessWorldModel
