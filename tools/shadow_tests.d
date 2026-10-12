@@ -50,6 +50,29 @@ void main() {
 	assert(BoundsFarPoint([0f,0f,0f],[2f,3f,4f],[-10f,0f,0f])==[2f,0f,0f]);
 	assert(BoundsFarPoint([0f,0f,0f],[2f,3f,0f],[0f,0f,10f])==[0f,0f,0f]);
 	assert(BoundsFarPoint(fence,half,fence)==fence);
+	// Museum fence: the nearby lamp is inside the padded enclosing sphere,
+	// but outside the thin wall. Every real corner must fit the shadow view.
+	float[16] bounds_projection;
+	struct BoundsCase { float[3] centre,half,eye; }
+	foreach(test; [
+		BoundsCase([-320f,96f,-2204f],[64f,96f,4f],[-320f,64f,-2080f]),
+		BoundsCase(fence,half,lamp),
+		BoundsCase([0f,0f,0f],[200f,10f,2f],[0f,0f,10f]),
+		BoundsCase([0f,0f,0f],[10f,10f,1f],[11f,11f,0f]),
+		BoundsCase([0f,0f,0f],[2f,3f,0f],[0f,0f,10f])
+	]) {
+		assert(BoundsShadowFrustum(test.eye,1000f,test.centre,test.half,bounds_projection));
+		foreach(corner; 0..8) {
+			float[3] p;
+			foreach(c; 0..3) p[c]=test.centre[c]+((corner & (1<<c)) ? test.half[c] : -test.half[c]);
+			auto projected=Clip(bounds_projection,p);
+			assert(projected[3]>0f && abs(projected[0]/projected[3])<=1.0001f && abs(projected[1]/projected[3])<=1.0001f);
+			assert(projected[2]/projected[3]>=0f && projected[2]/projected[3]<=1.0001f);
+		}
+	}
+	assert(!BoundsShadowFrustum(fence,1000f,fence,half,bounds_projection));
+	assert(!BoundsShadowFrustum([0f,0f,20f],10f,[0f,0f,0f],[1f,1f,1f],bounds_projection));
+	assert(!BoundsShadowFrustum([0f,0f,float.nan],1000f,fence,half,bounds_projection));
 	float[16] identity=[1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,1f];
 	assert(InView(identity,CubeFace([0f,0f,0f],400,4),[0f,0f,100f],10));
 	assert(!InView(identity,CubeFace([0f,0f,0f],400,4),[0f,0f,-100f],10));

@@ -347,12 +347,13 @@ public:
 			_screen_height=(_renderer && _renderer.screen_height>0) ? _renderer.screen_height : Height;
 			SetupWindow(cast(HWND)window);
 			InstallCursorGuard(cast(HWND)window);
-			InstallFocusFilter(cast(HWND)window);
 			// a background test run (d_Background 1) mustn't take the foreground; the engine only runs its client after a
 			// WM_ACTIVATEAPP(TRUE), which a window that never had focus doesn't get, so it's told it's active instead
-			if (_renderer && _renderer.GetConsoleVar("d_Background") && _renderer.GetVarValueFloat(_renderer.GetConsoleVar("d_Background"))!=0f)
+			const bool background=_renderer && _renderer.GetConsoleVar("d_Background") &&
+				_renderer.GetVarValueFloat(_renderer.GetConsoleVar("d_Background"))!=0f;
+			UpdateFocusFilter(background);
+			if (background)
 			{
-				_keep_running=true;
 				PostMessageA(cast(HWND)window, WM_ACTIVATEAPP, TRUE, 0);
 			}
 			else
@@ -445,7 +446,7 @@ public:
 	float[2] _fog_range=[0f, 2000f], _sky_fog_range=[0f, 2000f];
 	// d3d.ren draws pre-transformed vertices, so D3D table fog compares the ranges with the device depth (0..1), not world
 	// units, and Blood II's ranges (e.g. 700..2000) fog nothing; verified against d3d.ren under dgVoodoo (the opening train
-	// level is unfogged). Console "d_FogMode 1" fogs by eye distance instead, as the ranges suggest was meant.
+	// level is unfogged). Distance fog is the default; "d_FogMode 0" restores the original device-depth behaviour.
 	bool _fog_by_distance;
 	// console "Saturate" (Blood II's autoexec sets 1): the lightmap pass B blends SRCBLEND DESTCOLOR, doubling lightmapped
 	// surfaces (blood2_recon port_notes/world.md 4.1)
@@ -570,7 +571,7 @@ public:
 		_sky_fog_range=[ConsoleFloat("SkyFogNearZ", 0f), ConsoleFloat("SkyFogFarZ", 2000f)];
 		if (_fog_range[0]==_fog_range[1])
 			_fog_enable=false;
-		_fog_by_distance=ConsoleFloat("d_FogMode", 0f)!=0f;
+		_fog_by_distance=ConsoleFloat("d_FogMode", 1f)!=0f;
 		_saturate=ConsoleFloat("Saturate", 0f)!=0f;
 		_debug_clear=ConsoleFloat("d_DebugClear", 0f)!=0f;
 		_widescreen=ConsoleFloat("d_Widescreen", 1f)!=0f;
@@ -1448,7 +1449,7 @@ LAB_0004814b:
 			return variable ? _renderer.GetVarValueFloat(variable) : default_value;
 		}
 		_vsync=ConsoleFloat("d_VSync", 1f)!=0f;
-		_keep_running=ConsoleFloat("d_Background", 0f)!=0f;
+		UpdateFocusFilter(ConsoleFloat("d_Background", 0f)!=0f);
 		const float max_fps=ConsoleFloat("d_MaxFPS", 0f);
 		_max_fps=max_fps>=1f ? cast(int)max_fps : 0;
 
@@ -1648,9 +1649,18 @@ LAB_0004814b:
 
 	static extern(Windows) LRESULT FocusFilterProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) nothrow
 	{
-		if (message==WM_ACTIVATEAPP && !wparam && _keep_running)
+		// Installed only in background mode. Forwarding focus loss can make
+		// r_TermRender unload this DLL before CallWindowProc returns to us.
+		if (message==WM_ACTIVATEAPP && !wparam)
 			return 0;
 		return CallWindowProcA(_engine_window_proc, window, message, wparam, lparam);
+	}
+
+	void UpdateFocusFilter(bool background)
+	{
+		_keep_running=background;
+		if (background && _game_window) InstallFocusFilter(_game_window);
+		else RemoveFocusFilter();
 	}
 
 	void InstallFocusFilter(HWND window)

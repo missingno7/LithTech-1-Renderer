@@ -3,15 +3,15 @@ module RendererCompat;
 // Released RMode and exact-matched d3d_EnumModesCallback (0x15d10).
 struct Mode
 {
-	int is_hardware;
+	byte is_hardware; // released DBOOL is char; native 0x15d36 writes one byte
 	char[200] filename;
 	char[100] driver_name;
 	char[100] display_name;
 	int width, height;
 	uint depth;
 	Mode* next;
-	static assert(is_hardware.sizeof==4 && filename.offsetof==4);
-	static assert(driver_name.offsetof==0xcc && display_name.offsetof==0x130);
+	static assert(is_hardware.sizeof==1 && filename.offsetof==1);
+	static assert(driver_name.offsetof==0xc9 && display_name.offsetof==0x12d);
 	static assert(width.offsetof==0x194 && height.offsetof==0x198 && depth.offsetof==0x19c);
 	static assert(next.offsetof==0x1a0 && Mode.sizeof==0x1a4);
 }

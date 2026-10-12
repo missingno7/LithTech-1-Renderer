@@ -9,8 +9,8 @@ It started as a reverse-engineering prototype of the renderer interface. It now 
 levels load, and the world, characters, weapons, effects and the 2D interface all draw. It runs at 100+ fps at 4K.
 
 Behaviour is ported from, and checked against, the original Blood II `d3d.ren`. The reference is a reconstruction of its
-source plus side-by-side captures of the original running under dgVoodoo2. Where d3d.ren has quirks, d_ren reproduces
-them by default (see *Fog* below).
+source plus side-by-side captures of the original running under dgVoodoo2. Most d3d.ren quirks are reproduced; fog uses distance by default
+(see *Fog* below).
 
 ## What it renders
 - **World:** lightmaps (two-pass, including Blood II's `Saturate 1` doubling), pre-lit Gouraud surfaces, fullbright
@@ -62,8 +62,8 @@ images such as the loading screen before the renderer sees them, so those need g
 
 ### Fog
 Blood II levels turn fog on with ranges in world units (e.g. 700 to 2000). d3d.ren draws pre-transformed vertices, so
-Direct3D compares those ranges with the 0..1 device depth, and in practice nothing gets fogged. d_ren matches that by
-default. `d_FogMode 1` fogs by distance instead, as the level settings suggest was intended.
+Direct3D compares those ranges with the 0..1 device depth, and in practice nothing gets fogged. d_ren can match that with
+`d_FogMode 0`. The default, `d_FogMode 1`, fogs by distance as the level settings suggest was intended.
 
 ### Game speed
 LithTech 1 steps the game simulation once per rendered frame, but never by less than 10 ms of game time
@@ -137,7 +137,7 @@ changes an option for the current session only; `+name value` also saves it.
 | `d_GameSpeedFix` | 1 | Keeps the game at normal speed above 100 fps (see *Game speed* above). |
 | `d_MouseFix` | 1 | Smooth mouse look above ~64 fps (see *Mouse look* above). |
 | `d_Widescreen` | 1 | Hor+ FOV correction; 0 projects the game's FOV as given, like d3d.ren. |
-| `d_FogMode` | 0 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
+| `d_FogMode` | 1 | 0: fog like d3d.ren (device depth); 1: fog by eye distance. |
 | `d_DebugClear` | 0 | 1 shows holes in the world in cornflower blue instead of black. |
 | `d_GPU` | 0 | Which Vulkan adapter to use, by its index in the device list at the top of `vk_test.txt`. |
 | `d_Lighting` | 0 | 1: per-pixel dynamic lights with N·L and specular (see *Modern lighting*). |

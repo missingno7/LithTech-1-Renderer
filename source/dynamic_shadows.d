@@ -94,6 +94,57 @@ float[3] BoundsFarPoint(const float[3] centre, const float[3] half, const float[
 	return [centre[0]+to[0]*scale, centre[1]+to[1]*scale, centre[2]+to[2]*scale];
 }
 
+// Fit a single static-lamp shadow view to a world model's actual bounds.
+// A lamp beside a thin fence may lie inside its enclosing sphere while all
+// fence vertices are still in front of the lamp and can cast a useful shadow.
+bool BoundsShadowFrustum(const float[3] eye, float radius, const float[3] centre,
+	const float[3] half, out float[16] matrix)
+{
+	float[3] forward;
+	float distance2=0f, outside=0f;
+	uint separating_axis;
+	foreach(c; 0..3) {
+		if (!isFinite(eye[c]) || !isFinite(centre[c]) || !isFinite(half[c]) || half[c]<0f) return false;
+		forward[c]=centre[c]-eye[c]; distance2+=forward[c]*forward[c];
+		const float gap=abs(forward[c])-half[c];
+		if (gap>outside) { outside=gap; separating_axis=cast(uint)c; }
+	}
+	if (!isFinite(radius) || radius<=0f || outside<=0.001f) return false;
+	const float distance=sqrt(distance2);
+	forward[]/=distance;
+	float min_depth=distance;
+	foreach(c; 0..3) min_depth-=abs(forward[c])*half[c];
+	if (min_depth<=0.001f) {
+		// At an oblique corner the centre-facing view may put some corners
+		// behind the eye. An axis separating the lamp and box keeps all in front.
+		forward[]=0f;
+		forward[separating_axis]=centre[separating_axis]>eye[separating_axis] ? 1f : -1f;
+		min_depth=outside;
+	}
+	if (min_depth>=radius) return false;
+	const float[3] hint=abs(forward[1])>0.95f ? [1f,0f,0f] : [0f,1f,0f];
+	float[3] right=Cross(hint,forward);
+	right[]/=sqrt(Dot(right,right));
+	const float[3] up=Cross(forward,right);
+	float slope=0f;
+	foreach(corner; 0..8) {
+		float[3] point;
+		foreach(c; 0..3) point[c]=centre[c]+((corner & (1<<c)) ? half[c] : -half[c])-eye[c];
+		const float depth=Dot(forward,point);
+		if (depth<=0f) return false;
+		slope=max(slope,max(abs(Dot(right,point)),abs(Dot(up,point)))/depth);
+	}
+	const float scale=1f/max(slope*1.05f,0.001f);
+	const float near=min(1f,min_depth*0.9f), a=radius/(radius-near), b=-radius*near/(radius-near);
+	foreach(c; 0..3) {
+		matrix[c*4]=right[c]*scale; matrix[c*4+1]=up[c]*scale;
+		matrix[c*4+2]=forward[c]*a; matrix[c*4+3]=forward[c];
+	}
+	matrix[12]=-Dot(right,eye)*scale; matrix[13]=-Dot(up,eye)*scale;
+	matrix[14]=-Dot(forward,eye)*a+b; matrix[15]=-Dot(forward,eye);
+	return true;
+}
+
 // Conservative per-face AABB clip test, performed on cached world bounds before issuing draws.
 bool InFace(const float[16] m, const float[3] low, const float[3] high)
 {

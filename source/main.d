@@ -287,7 +287,7 @@ void RegisterRendererOptions()
 		["d_GameSpeedFix", "1"], // lets the game run at its normal speed above 100 fps (Server.dll frame-time floor)
 		["d_MouseFix", "1"],   // smooth mouse look above ~64 fps (1 ms engine input clock)
 		["d_Widescreen", "1"], // Hor+ FOV correction
-		["d_FogMode", "0"],    // 0: fog like d3d.ren (device depth); 1: by eye distance
+		["d_FogMode", "1"],    // 0: fog like d3d.ren (device depth); 1: by eye distance
 		["d_DebugClear", "0"], // 1: holes in the world shown in blue
 		["d_GPU", "0"],        // which Vulkan adapter, by its index in vk_test.txt's device list
 		["DrawEnable", "1"],

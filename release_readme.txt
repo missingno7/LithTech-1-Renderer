@@ -42,7 +42,7 @@ Console variables. They are written to autoexec.cfg after the first run and can 
   d_GameSpeedFix 1  Normal game speed above 100 fps (the engine runs the game too fast there).
   d_MouseFix 1      Smooth mouse look above ~64 fps.
   d_Widescreen 1    Widescreen field of view. 0: the original stretched view.
-  d_FogMode 0       0: fog as the original renderer shows it. 1: fog by distance.
+  d_FogMode 1       1: fog by distance (default). 0: fog as the original renderer shows it.
   d_DebugClear 0    1: show holes in the level in blue.
 
 

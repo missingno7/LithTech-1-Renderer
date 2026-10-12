@@ -11,6 +11,70 @@ import VulkanRender: VulkanRenderer;
 import Main;
 import std.math: abs;
 import std.stdio: writeln;
+import core.sys.windows.windows;
+
+// An invisible message-only window exercises actual hook installation and
+// routing. No game, display surface, SDL or Vulkan device is created.
+uint native_focus_losses;
+extern(Windows) LRESULT TestWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) nothrow
+{
+	if (message==WM_ACTIVATEAPP && !wparam) ++native_focus_losses;
+	return DefWindowProcA(window,message,wparam,lparam);
+}
+
+void TestFocusFilter()
+{
+	import core.sys.windows.windows;
+	HINSTANCE instance=GetModuleHandleA(null);
+	const char* name="RendererCpuFocusTest";
+	WNDCLASSA cls;
+	cls.lpfnWndProc=&TestWindowProc; cls.hInstance=instance; cls.lpszClassName=name;
+	assert(RegisterClassA(&cls));
+	HWND window=CreateWindowExA(0,name,"",0,0,0,0,0,HWND_MESSAGE,null,instance,null);
+	assert(window !is null);
+	auto renderer=new VulkanRenderer;
+	VulkanRenderer._game_window=window;
+	scope(exit) {
+		renderer.UpdateFocusFilter(false);
+		DestroyWindow(window); UnregisterClassA(name,instance);
+		VulkanRenderer._game_window=null;
+	}
+	const LONG native_proc=GetWindowLongA(window,GWL_WNDPROC);
+	renderer.UpdateFocusFilter(false);
+	assert(GetWindowLongA(window,GWL_WNDPROC)==native_proc);
+	SendMessageA(window,WM_ACTIVATEAPP,FALSE,0);
+	assert(native_focus_losses==1);
+	renderer.UpdateFocusFilter(true);
+	assert(GetWindowLongA(window,GWL_WNDPROC)!=native_proc);
+	SendMessageA(window,WM_ACTIVATEAPP,FALSE,0);
+	assert(native_focus_losses==1); // native shutdown is blocked in background mode
+	renderer.UpdateFocusFilter(false);
+	assert(GetWindowLongA(window,GWL_WNDPROC)==native_proc);
+	SendMessageA(window,WM_ACTIVATEAPP,FALSE,0);
+	assert(native_focus_losses==2); // normal mode routes directly to the engine
+}
+
+void TestFenceShadowSelection()
+{
+	import StaticLighting;
+	import std.math: sqrt;
+	ModelRecord fence={ centre:[-320f,96f,-2204f], half_extents:[64f,96f,4f],
+		radius:sqrt(64f*64f+96f*96f+4f*4f), solid:true, world_model:true };
+	Lamp inside={ pos:fence.centre, radius:500f, colour:[1f,1f,1f], clip:true, index:0 };
+	Lamp near={ pos:[-320f,64f,-2080f], radius:500f, colour:[0.336f,0.224f,0.076f], clip:true, index:1 };
+	Lamp far={ pos:[-320f,64f,-2464f], radius:500f, colour:[0.168f,0.112f,0.038f], clip:true, index:2 };
+	float[16] old_projection;
+	assert(!ShadowFrustum(near.pos,near.radius,fence.centre,fence.radius,old_projection));
+	SelectionSettings settings={ camera:[-320f,96f,-2080f], max_pairs:64 };
+	GpuStaticLighting gpu;
+	ShadowPairDraw[] draws; int[] sets;
+	SelectLamps([inside,near,far],[fence],settings,gpu,draws,sets);
+	assert(draws.length==2 && gpu.counts[0]==2);
+	assert(gpu.pairs[0].lamp.colour_index[3]==1f && gpu.pairs[1].lamp.colour_index[3]==2f);
+	settings.max_pairs=1;
+	SelectLamps([inside,near,far],[fence],settings,gpu,draws,sets);
+	assert(draws.length==1 && gpu.pairs[0].lamp.colour_index[3]==1f);
+}
 
 uint hooks;
 extern(C) void NoTexture(ModelHookData* data, void*)
@@ -31,6 +95,8 @@ extern(C) float GetFloat(void* variable) { return variable==cast(void*)2 && enab
 
 void main()
 {
+	TestFocusFilter();
+	TestFenceShadowSelection();
 	ubyte[0x180] object_storage=0;
 	ubyte[0xd0] model=0;
 	ubyte[0x74] anim=0;
@@ -101,5 +167,5 @@ void main()
 	enable=false;
 	scene.obj_list_head=cast(void**)1; // DrawEnable=0 must not inspect any supplied objects
 	renderer.RenderScene(&scene);
-	writeln("model integration: hook flags/light, untextured lit batches, shared warble vertices and render gates passed");
+	writeln("model integration: focus-hook lifecycle, two-light fence shadows, hook flags/light, warble vertices and render gates passed");
 }

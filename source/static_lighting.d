@@ -226,12 +226,17 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 		if (model.world_model)
 		{
 			uint pairs=0;
-			foreach(ref candidate; candidates[0..min($, 6)])
+			foreach(ref candidate; candidates)
 			{
 				if (pairs>=2 || !casts)
 					break;
 				const Lamp* lamp=&lamps[candidate.lamp];
 				if (!lamp.clip || (settings.bsp && settings.bsp.root_node && WorldModelLampHidden(settings.bsp, model, lamp.pos)))
+					continue;
+				// Failed projections must not consume either of the two slots.
+				import DynamicShadows: BoundsShadowFrustum;
+				float[16] projection;
+				if (!BoundsShadowFrustum(lamp.pos, lamp.radius, model.centre, model.half_extents, projection))
 					continue;
 				pair_candidates~=PairCandidate(cast(uint)m, candidate.lamp, candidate.strength*near);
 				pairs++;
@@ -281,7 +286,11 @@ void SelectLamps(const Lamp[] lamps, const ModelRecord[] models, ref SelectionSe
 		const ModelRecord* model=&models[candidate.model];
 		const Lamp* lamp=&lamps[candidate.lamp];
 		float[16] view_proj;
-		if (!ShadowFrustum(lamp.pos, lamp.radius, model.centre, model.radius, view_proj))
+		import DynamicShadows: BoundsShadowFrustum;
+		const bool fits=model.world_model ?
+			BoundsShadowFrustum(lamp.pos, lamp.radius, model.centre, model.half_extents, view_proj) :
+			ShadowFrustum(lamp.pos, lamp.radius, model.centre, model.radius, view_proj);
+		if (!fits)
 			continue;
 		const uint k=cast(uint)draws.length;
 		GpuShadowPair* pair=&gpu.pairs[k];
